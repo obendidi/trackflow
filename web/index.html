@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Trackflow — Zero-Install WebGPU People Tracking Playground</title>
+<style>
+  :root {
+    --bg: #080c18; --panel: #11182c; --border: #233154;
+    --text: #e6eefc; --muted: #8ea1c4; --accent: #34d399; --sky: #38bdf8;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 24px 20px 48px; }
+  header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
+  h1 { margin: 0; font-size: 24px; }
+  .badge { font-size: 12px; background: #0d3b2e; color: var(--accent); padding: 4px 10px; border-radius: 999px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 14px; margin: 6px 0 0; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px; margin-bottom: 16px; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  button, select, label.file-btn { background: #1a294d; border: 1px solid #2e457a; color: var(--text); padding: 8px 13px; border-radius: 9px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  button.primary { background: #059669; border-color: #10b981; }
+  input[type=file] { display: none; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin: 14px 0; }
+  .stat { background: #0b1222; border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+  .stat .k { font-size: 11px; color: var(--muted); text-transform: uppercase; }
+  .stat .v { font-size: 22px; font-weight: 700; color: var(--sky); margin-top: 2px; }
+  canvas { width: 100%; background: #050811; border-radius: 10px; border: 1px solid var(--border); display: block; }
+  video { display: none; }
+  .status { font-size: 13px; color: var(--muted); margin-top: 10px; }
+  code { color: #bae6fd; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Trackflow WebGPU Playground</h1>
+      <p class="sub">100% local in-browser people tracking (Apache-2.0 ONNX + ByteTrack). Zero video ever leaves your device.</p>
+    </div>
+    <span class="badge">WebGPU · Zero Install · Privacy-First</span>
+  </header>
+
+  <div class="panel">
+    <div class="controls">
+      <button id="webcamBtn" class="primary">Start Webcam</button>
+      <label class="file-btn">Load Video File <input id="videoFile" type="file" accept="video/*" /></label>
+      <button id="stopBtn">Stop</button>
+      <select id="modelSelect" title="Detector model">
+        <option value="onnx-community/rtdetr_v2_r18vd-ONNX" selected>RT-DETRv2 R18 (~81 MB, recommended)</option>
+        <option value="onnx-community/dfine_n_coco-ONNX">D-FINE Nano (~15 MB, ultra-light)</option>
+      </select>
+      <select id="privacySelect" title="Privacy anonymization mode">
+        <option value="none" selected>Privacy: Off</option>
+        <option value="face-blur">Privacy: Face Blur</option>
+        <option value="blur">Privacy: Full Blur</option>
+        <option value="skeleton">Privacy: Skeleton-Only (Zero PII)</option>
+      </select>
+      <label style="font-size:13px; color:var(--muted);">
+        <input id="peopleOnly" type="checkbox" checked /> People only
+      </label>
+      <label style="font-size:13px; color:var(--muted);">
+        Conf <input id="threshSlider" type="range" min="0.2" max="0.85" step="0.05" value="0.45" />
+        <span id="threshVal">0.45</span>
+      </label>
+      <button id="exportBtn">Export JSONL</button>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="k">Speed (FPS)</div><div class="v" id="fpsVal">—</div></div>
+      <div class="stat"><div class="k">Active Tracks</div><div class="v" id="activeVal">0</div></div>
+      <div class="stat"><div class="k">Unique IDs</div><div class="v" id="uniqueVal">0</div></div>
+      <div class="stat"><div class="k">Runtime</div><div class="v" id="deviceVal">READY</div></div>
+    </div>
+
+    <video id="video" playsinline muted loop></video>
+    <canvas id="canvas" width="960" height="540"></canvas>
+    <div class="status" id="status">Choose Webcam or Load Video File to begin. Want CLI + NL Search + Floorplan Homography? Run <code>uvx trackflow-cv run video.mp4</code>.</div>
+  </div>
+</div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

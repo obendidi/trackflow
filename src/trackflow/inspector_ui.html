@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Trackflow Inspector — Visual Track Debugger & Floorplan Studio</title>
+<style>
+  :root {
+    --bg: #090d1a; --panel: #11182c; --panel-2: #16203a; --border: #253358;
+    --text: #e8effc; --muted: #8ea1c4; --accent: #34d399; --sky: #38bdf8;
+    --warn: #fbbf24; --danger: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
+  header { display: flex; align-items: center; justify-content: space-between; padding: 14px 22px; background: var(--panel); border-bottom: 1px solid var(--border); }
+  .brand { font-weight: 700; font-size: 17px; display: flex; align-items: center; gap: 10px; }
+  .brand span.pill { font-size: 11px; background: #0d3b2e; color: var(--accent); padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+  nav { display: flex; gap: 8px; }
+  nav button { background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 7px 14px; border-radius: 8px; cursor: pointer; font-weight: 600; }
+  nav button.active { background: var(--panel-2); color: var(--text); border-color: var(--sky); }
+  main { max-width: 1280px; margin: 0 auto; padding: 18px 22px 40px; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+  .kpi .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+  .kpi .val { font-size: 22px; font-weight: 700; margin-top: 3px; color: var(--accent); }
+  .grid-2 { display: grid; grid-template-columns: 1.45fr 1fr; gap: 16px; }
+  @media (max-width: 960px) { .grid-2 { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { margin: 0 0 12px; font-size: 15px; display: flex; justify-content: space-between; align-items: center; }
+  canvas { width: 100%; background: #060912; border-radius: 8px; border: 1px solid var(--border); display: block; }
+  .controls { display: flex; align-items: center; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+  .controls input[type=range] { flex: 1; min-width: 180px; }
+  button.btn { background: #1c2c52; border: 1px solid #30477d; color: var(--text); padding: 7px 12px; border-radius: 8px; cursor: pointer; font-size: 13px; font-weight: 600; }
+  button.btn.primary { background: #059669; border-color: #10b981; color: #fff; }
+  input[type=text], input[type=number] { background: #0c1222; border: 1px solid var(--border); color: var(--text); padding: 8px 10px; border-radius: 8px; font-size: 13px; }
+  .markers { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 8px; max-height: 70px; overflow-y: auto; }
+  .marker { font-size: 11px; padding: 2px 7px; border-radius: 6px; cursor: pointer; border: 1px solid transparent; }
+  .marker.switch { background: rgba(248,113,113,.15); color: var(--danger); border-color: rgba(248,113,113,.4); }
+  .marker.merge { background: rgba(52,211,153,.15); color: var(--accent); border-color: rgba(52,211,153,.4); }
+  .marker.rec { background: rgba(251,191,36,.15); color: var(--warn); border-color: rgba(251,191,36,.4); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(195px, 1fr)); gap: 10px; max-height: 540px; overflow-y: auto; }
+  .card { background: #0c1324; border: 1px solid var(--border); border-radius: 9px; padding: 8px; display: flex; gap: 9px; cursor: pointer; transition: border-color .15s; }
+  .card:hover, .card.selected { border-color: var(--sky); }
+  .card img { width: 52px; height: 68px; object-fit: cover; border-radius: 6px; background: #17223d; flex-shrink: 0; }
+  .card .meta { font-size: 11px; color: var(--muted); line-height: 1.4; }
+  .tab { display: none; }
+  .tab.active { display: block; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); }
+  .hint { font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    Trackflow Inspector
+    <span class="pill" id="metaPill">Loading…</span>
+  </div>
+  <nav>
+    <button class="active" data-tab="debugger">Track Debugger</button>
+    <button data-tab="floorplan">4-Point Floorplan</button>
+    <button data-tab="compare">Tracker Compare</button>
+  </nav>
+</header>
+
+<main>
+  <div class="kpis" id="kpis"></div>
+
+  <!-- TAB 1: VISUAL TRACK DEBUGGER -->
+  <section id="tab-debugger" class="tab active">
+    <div class="grid-2">
+      <div class="panel">
+        <h2>
+          <span>Frame Canvas & Timeline Scrubber</span>
+          <span class="hint" id="frameInfo">Frame 0</span>
+        </h2>
+        <canvas id="trackCanvas" width="800" height="450"></canvas>
+        <div class="controls">
+          <button class="btn primary" id="playBtn">Play</button>
+          <input type="range" id="scrubber" min="0" max="0" value="0" />
+          <label class="hint"><input type="checkbox" id="showTrails" checked /> Trails</label>
+        </div>
+        <div class="hint" style="margin-top:10px;">Diagnostic Event Markers (click to jump):</div>
+        <div class="markers" id="eventMarkers"></div>
+      </div>
+
+      <div class="panel">
+        <h2>
+          <span>Track Cards & Natural-Language Search</span>
+          <span class="hint" id="cardCount"></span>
+        </h2>
+        <div class="controls" style="margin-top:0; margin-bottom:12px;">
+          <input type="text" id="nlQuery" placeholder='e.g. "person in red jacket"' style="flex:1;" />
+          <button class="btn primary" id="nlSearchBtn">Search</button>
+          <button class="btn" id="nlResetBtn">Reset</button>
+        </div>
+        <div id="searchStatus" class="hint" style="margin-bottom:8px;"></div>
+        <div class="cards" id="cardGrid"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 2: 4-POINT FLOORPLAN HOMOGRAPHY -->
+  <section id="tab-floorplan" class="tab">
+    <div class="grid-2">
+      <div class="panel">
+        <h2>
+          <span>1. Click 4 Ground Corners (TL → TR → BR → BL)</span>
+          <button class="btn" id="resetPtsBtn">Clear Points</button>
+        </h2>
+        <canvas id="calibCanvas" width="760" height="430" style="cursor:crosshair;"></canvas>
+        <div class="controls">
+          <label class="hint">Width (m): <input type="number" id="worldW" value="10" step="0.5" style="width:74px;" /></label>
+          <label class="hint">Height (m): <input type="number" id="worldH" value="8" step="0.5" style="width:74px;" /></label>
+          <button class="btn primary" id="projectBtn">Project to Bird's-Eye</button>
+        </div>
+        <div id="calibStatus" class="hint" style="margin-top:8px;">Click 4 ground-plane points to calibrate perspective homography.</div>
+      </div>
+      <div class="panel">
+        <h2><span>2. Bird's-Eye Trajectories & Heatmap</span></h2>
+        <canvas id="floorCanvas" width="600" height="480"></canvas>
+        <div id="zoneSummary" class="hint" style="margin-top:10px;"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- TAB 3: SIDE-BY-SIDE TRACKER COMPARISON -->
+  <section id="tab-compare" class="tab">
+    <div class="panel">
+      <h2>Side-by-Side Tracker Comparison</h2>
+      <div id="compareContent" class="hint">Launch with <code>trackflow inspect run_a --compare run_b</code> to compare trackers side-by-side.</div>
+    </div>
+  </section>
+</main>
+
+<script>
+const PALETTE = ['#34d399','#38bdf8','#a78bfa','#fbbf24','#f472b6','#60a5fa','#4ade80','#fb7185'];
+let DATA = null;
+let frameIdxPos = 0;
+let playing = false;
+let playTimer = null;
+let selectedTrackId = null;
+let calibPoints = [];
+
+function colorFor(id) { return PALETTE[id % PALETTE.length]; }
+
+document.querySelectorAll('nav button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'floorplan') drawCalibCanvas();
+  });
+});
+
+async function init() {
+  const res = await fetch('/api/run');
+  DATA = await res.json();
+  const s = DATA.summary;
+  document.getElementById('metaPill').textContent = `${s.model || 'model'} · ${s.tracker || 'tracker'} · ${s.device || 'cpu'}`;
+  renderKpis();
+  renderMarkers();
+  renderCards(DATA.cards);
+  renderCompare();
+
+  const scrubber = document.getElementById('scrubber');
+  scrubber.max = Math.max(0, DATA.frames.length - 1);
+  scrubber.addEventListener('input', e => { frameIdxPos = Number(e.target.value); drawFrame(); });
+  document.getElementById('showTrails').addEventListener('change', drawFrame);
+
+  if (DATA.homography && DATA.homography.image_points) {
+    calibPoints = DATA.homography.image_points.map(p => [...p]);
+    document.getElementById('worldW').value = DATA.homography.width_m || 10;
+    document.getElementById('worldH').value = DATA.homography.height_m || 8;
+  }
+  drawFrame();
+  drawCalibCanvas();
+}
+
+function renderKpis() {
+  const s = DATA.summary, d = DATA.diagnostics;
+  const items = [
+    ['Unique Tracks', s.unique_tracks ?? DATA.cards.length],
+    ['Avg FPS', (s.avg_fps ?? 0).toFixed(1)],
+    ['Frames', s.processed_frames ?? DATA.frames.length],
+    ['Possible ID Switches', d.possible_id_switches],
+    ['Recoveries / Re-ID', `${d.recoveries} / ${d.reid_merges}`],
+    ['Re-ID Backend', DATA.reid_backend || 'none'],
+  ];
+  document.getElementById('kpis').innerHTML = items.map(([l,v]) =>
+    `<div class="kpi"><div class="lbl">${l}</div><div class="val">${v}</div></div>`
+  ).join('');
+}
+
+function renderMarkers() {
+  const wrap = document.getElementById('eventMarkers');
+  const interesting = DATA.events.filter(e =>
+    ['possible_id_switch','reid_cross_exit_merge','track_recovered'].includes(e.type)
+  );
+  if (!interesting.length) { wrap.innerHTML = '<span class="hint">No ID switches or merges flagged.</span>'; return; }
+  wrap.innerHTML = interesting.slice(0, 80).map(e => {
+    const cls = e.type === 'possible_id_switch' ? 'switch' : (e.type === 'reid_cross_exit_merge' ? 'merge' : 'rec');
+    const lbl = e.type === 'possible_id_switch'
+      ? `F${e.frame_idx} Switch #${e.previous_track_id}→#${e.new_track_id}`
+      : e.type === 'reid_cross_exit_merge'
+      ? `F${e.frame_idx} Re-ID #${e.raw_track_id}→#${e.canonical_track_id}`
+      : `F${e.frame_idx} Recovered #${e.track_id}`;
+    return `<span class="marker ${cls}" onclick="jumpToFrame(${e.frame_idx})">${lbl}</span>`;
+  }).join('');
+}
+
+function jumpToFrame(targetFrameIdx) {
+  const pos = DATA.frames.findIndex(f => f.frame_idx >= targetFrameIdx);
+  if (pos >= 0) {
+    frameIdxPos = pos;
+    document.getElementById('scrubber').value = pos;
+    drawFrame();
+  }
+}
+
+function renderCards(cards) {
+  document.getElementById('cardCount').textContent = `${cards.length} cards`;
+  const grid = document.getElementById('cardGrid');
+  grid.innerHTML = cards.map(c => {
+    const score = c.search_score !== undefined ? `<div>Match: <b>${c.search_score.toFixed(3)}</b></div>`
+      : (c.query_score !== null && c.query_score !== undefined ? `<div>Query: <b>${c.query_score.toFixed(3)}</b></div>` : '');
+    const thumb = c.thumbnail ? `<img src="/${c.thumbnail}" alt="Track #${c.track_id}" />` : '';
+    return `<div class="card ${selectedTrackId === c.track_id ? 'selected' : ''}" onclick="selectTrack(${c.track_id}, ${c.best_frame})">
+      ${thumb}
+      <div class="meta">
+        <div style="color:#fff;font-weight:700;">#${c.track_id} · ${c.class_name}</div>
+        <div>F${c.first_frame}–F${c.last_frame} (${c.duration_s}s)</div>
+        <div>Conf ${c.best_confidence}</div>
+        ${score}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+function selectTrack(tid, bestFrame) {
+  selectedTrackId = selectedTrackId === tid ? null : tid;
+  jumpToFrame(bestFrame);
+  renderCards(DATA.cards);
+}
+
+function drawFrame() {
+  const canvas = document.getElementById('trackCanvas');
+  const ctx = canvas.getContext('2d');
+  const fw = DATA.summary.frame_width || 800;
+  const fh = DATA.summary.frame_height || 450;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Subtle coordinate grid
+  ctx.strokeStyle = '#141d36';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < canvas.width; x += 64) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke(); }
+  for (let y = 0; y < canvas.height; y += 64) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke(); }
+
+  if (!DATA.frames.length) return;
+  const frame = DATA.frames[frameIdxPos];
+  document.getElementById('frameInfo').textContent = `Frame ${frame.frame_idx} · ${frame.tracks.length} tracks`;
+
+  const sx = canvas.width / fw;
+  const sy = canvas.height / fh;
+
+  if (document.getElementById('showTrails').checked) {
+    const start = Math.max(0, frameIdxPos - 30);
+    const paths = {};
+    for (let i = start; i <= frameIdxPos; i++) {
+      for (const tr of DATA.frames[i].tracks) {
+        (paths[tr.track_id] ||= []).push([(tr.x1 + tr.x2) * 0.5 * sx, tr.y2 * sy]);
+      }
+    }
+    for (const [tid, pts] of Object.entries(paths)) {
+      if (pts.length < 2) continue;
+      ctx.strokeStyle = colorFor(Number(tid));
+      ctx.globalAlpha = selectedTrackId && Number(tid) !== selectedTrackId ? 0.2 : 0.75;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      pts.forEach(([x,y], idx) => idx ? ctx.lineTo(x,y) : ctx.moveTo(x,y));
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  for (const tr of frame.tracks) {
+    const dim = selectedTrackId && tr.track_id !== selectedTrackId;
+    const col = colorFor(tr.track_id);
+    ctx.globalAlpha = dim ? 0.22 : 1;
+    ctx.strokeStyle = col;
+    ctx.lineWidth = tr.track_id === selectedTrackId ? 3.5 : 2;
+    const x = tr.x1 * sx, y = tr.y1 * sy, w = tr.width * sx, h = tr.height * sy;
+    ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = col;
+    const lbl = `#${tr.track_id} ${tr.class_name} ${(tr.confidence).toFixed(2)}`;
+    ctx.font = '12px ui-monospace, monospace';
+    const tw = ctx.measureText(lbl).width + 8;
+    ctx.fillRect(x, Math.max(0, y - 18), tw, 18);
+    ctx.fillStyle = '#090d1a';
+    ctx.fillText(lbl, x + 4, Math.max(13, y - 5));
+  }
+  ctx.globalAlpha = 1;
+}
+
+document.getElementById('playBtn').addEventListener('click', () => {
+  playing = !playing;
+  document.getElementById('playBtn').textContent = playing ? 'Pause' : 'Play';
+  if (playing) {
+    playTimer = setInterval(() => {
+      frameIdxPos = (frameIdxPos + 1) % Math.max(1, DATA.frames.length);
+      document.getElementById('scrubber').value = frameIdxPos;
+      drawFrame();
+    }, 66);
+  } else {
+    clearInterval(playTimer);
+  }
+});
+
+document.getElementById('nlSearchBtn').addEventListener('click', async () => {
+  const q = document.getElementById('nlQuery').value.trim();
+  if (!q) return;
+  const st = document.getElementById('searchStatus');
+  st.textContent = `Searching Track Cards for "${q}"…`;
+  const res = await fetch('/api/search', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ query: q, top_k: 20 })
+  });
+  const body = await res.json();
+  if (!res.ok) { st.textContent = `Error: ${body.error}`; return; }
+  st.textContent = `Ranked ${body.results.length} Track Cards for "${q}".`;
+  renderCards(body.results);
+});
+document.getElementById('nlResetBtn').addEventListener('click', () => {
+  document.getElementById('nlQuery').value = '';
+  document.getElementById('searchStatus').textContent = '';
+  renderCards(DATA.cards);
+});
+
+// 4-Point Homography Calibration Studio
+const calibCanvas = document.getElementById('calibCanvas');
+calibCanvas.addEventListener('click', e => {
+  if (!DATA || calibPoints.length >= 4) return;
+  const rect = calibCanvas.getBoundingClientRect();
+  const fw = DATA.summary.frame_width || 800;
+  const fh = DATA.summary.frame_height || 450;
+  const x = ((e.clientX - rect.left) / rect.width) * fw;
+  const y = ((e.clientY - rect.top) / rect.height) * fh;
+  calibPoints.push([x, y]);
+  drawCalibCanvas();
+});
+document.getElementById('resetPtsBtn').addEventListener('click', () => { calibPoints = []; drawCalibCanvas(); });
+
+function drawCalibCanvas() {
+  if (!DATA) return;
+  const ctx = calibCanvas.getContext('2d');
+  const fw = DATA.summary.frame_width || 800;
+  const fh = DATA.summary.frame_height || 450;
+  const sx = calibCanvas.width / fw, sy = calibCanvas.height / fh;
+  ctx.clearRect(0, 0, calibCanvas.width, calibCanvas.height);
+
+  // Draw all foot points in image space as spatial reference
+  ctx.fillStyle = 'rgba(56, 189, 248, 0.28)';
+  for (const f of DATA.frames) {
+    for (const tr of f.tracks) {
+      ctx.fillRect(((tr.x1 + tr.x2) * 0.5) * sx - 1.5, tr.y2 * sy - 1.5, 3, 3);
+    }
+  }
+
+  if (calibPoints.length) {
+    ctx.strokeStyle = '#34d399'; ctx.lineWidth = 2;
+    ctx.beginPath();
+    calibPoints.forEach(([x,y], i) => i ? ctx.lineTo(x*sx, y*sy) : ctx.moveTo(x*sx, y*sy));
+    if (calibPoints.length === 4) ctx.closePath();
+    ctx.stroke();
+    calibPoints.forEach(([x,y], i) => {
+      ctx.fillStyle = '#fbbf24';
+      ctx.beginPath(); ctx.arc(x*sx, y*sy, 6, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#090d1a'; ctx.font = 'bold 11px sans-serif';
+      ctx.fillText(String(i+1), x*sx - 3, y*sy + 4);
+    });
+  }
+  document.getElementById('calibStatus').textContent = `${calibPoints.length}/4 corners selected.`;
+}
+
+document.getElementById('projectBtn').addEventListener('click', async () => {
+  if (calibPoints.length !== 4) {
+    document.getElementById('calibStatus').textContent = 'Please click exactly 4 ground points first.';
+    return;
+  }
+  const width_m = Number(document.getElementById('worldW').value) || 10;
+  const height_m = Number(document.getElementById('worldH').value) || 8;
+  const res = await fetch('/api/homography', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ image_points: calibPoints, width_m, height_m })
+  });
+  const out = await res.json();
+  if (!res.ok) { document.getElementById('calibStatus').textContent = out.error; return; }
+  drawFloorplan(out.trajectories, width_m, height_m);
+  document.getElementById('calibStatus').textContent = 'Projected & saved homography.json + floorplan.png.';
+});
+
+function drawFloorplan(trajectories, wm, hm) {
+  const c = document.getElementById('floorCanvas');
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.strokeStyle = '#192440'; ctx.lineWidth = 1;
+  for (let i = 0; i <= Math.ceil(wm); i++) {
+    const x = (i / wm) * c.width; ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, c.height); ctx.stroke();
+  }
+  for (let j = 0; j <= Math.ceil(hm); j++) {
+    const y = (j / hm) * c.height; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(c.width, y); ctx.stroke();
+  }
+  for (const [tid, pts] of Object.entries(trajectories)) {
+    if (pts.length < 2) continue;
+    ctx.strokeStyle = colorFor(Number(tid));
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    pts.forEach(([wx, wy], idx) => {
+      const px = (wx / wm) * c.width, py = (wy / hm) * c.height;
+      idx ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    });
+    ctx.stroke();
+  }
+}
+
+function renderCompare() {
+  if (!DATA.compare) return;
+  const a = DATA, b = DATA.compare;
+  const rows = [
+    ['Tracker', a.summary.tracker, b.summary.tracker],
+    ['Model', a.summary.model, b.summary.model],
+    ['Avg FPS', a.summary.avg_fps?.toFixed(1), b.summary.avg_fps?.toFixed(1)],
+    ['Unique Tracks (lower = less fragmentation)', a.summary.unique_tracks, b.summary.unique_tracks],
+    ['Possible ID Switches', a.diagnostics.possible_id_switches, b.diagnostics.possible_id_switches],
+    ['Track Recoveries', a.diagnostics.recoveries, b.diagnostics.recoveries],
+    ['Cross-Exit Re-ID Merges', a.diagnostics.reid_merges, b.diagnostics.reid_merges],
+    ['Total Observations', a.diagnostics.total_observations, b.diagnostics.total_observations],
+  ];
+  document.getElementById('compareContent').innerHTML = `
+    <table>
+      <thead><tr><th>Metric</th><th>Run A (${a.summary.tracker})</th><th>Run B (${b.summary.tracker})</th></tr></thead>
+      <tbody>${rows.map(([m,va,vb]) => `<tr><td>${m}</td><td><b>${va}</b></td><td><b>${vb}</b></td></tr>`).join('')}</tbody>
+    </table>`;
+}
+
+init();
+</script>
+</body>
+</html>

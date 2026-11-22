@@ -1,0 +1,90 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trackflow-cv"
+version = "0.1.0"
+description = "Modern real-time people & object tracking toolkit — ONNX RT-DETRv2/RF-DETR/D-FINE + ByteTrack/BoT-SORT, natural-language search, visual debugger, floorplan homography & privacy-first anonymization."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [
+  { name = "Ouail Bendidi" },
+]
+keywords = [
+  "object-tracking",
+  "people-tracking",
+  "multi-object-tracking",
+  "mot",
+  "bytetrack",
+  "rtdetr",
+  "rf-detr",
+  "d-fine",
+  "onnxruntime",
+  "computer-vision",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Multimedia :: Video",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Scientific/Engineering :: Image Recognition",
+]
+dependencies = [
+  "huggingface-hub>=0.24",
+  "numpy>=1.26",
+  "onnxruntime>=1.17",
+  "opencv-python-headless>=4.9",
+  "pyarrow>=15.0",
+  "rich>=13.7",
+  "scipy>=1.11",
+  "tokenizers>=0.19",
+  "typer>=0.12",
+]
+
+[project.optional-dependencies]
+cuda = [
+  "onnxruntime-gpu>=1.17",
+]
+display = [
+  "opencv-python>=4.9",
+]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+trackflow = "trackflow.cli:app"
+trackflow-cv = "trackflow.cli:app"
+
+[project.urls]
+Homepage = "https://obendidi.github.io/trackflow/"
+Repository = "https://github.com/obendidi/trackflow"
+Issues = "https://github.com/obendidi/trackflow/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trackflow"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

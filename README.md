@@ -1,130 +1,134 @@
-## Intro
+# Trackflow
 
-The purpose of this little project is to add object tracking to yolov2 and achieve real-time multiple object tracking.
+**Real-time people & object tracking that goes beyond boxes and IDs.**
 
-The current architecture is set to only track one type of objects, but it should be easy to generalise over all objects.
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](pyproject.toml)
 
-Currently support people tracking (as the provided weights for deep_sort were trained on people tracking)
+> **Looking for the original 2017 `Tracking-with-darkflow` (YOLOv2 + DeepSORT + TensorFlow 1.0)?**  
+> It is preserved untouched on the [`legacy-2017`](https://github.com/obendidi/trackflow/tree/legacy-2017) branch and [`v1.0-legacy-2017`](https://github.com/obendidi/trackflow/releases/tag/v1.0-legacy-2017) tag under GPL-3.0.
 
-## Dependencies
+---
 
-    python
-    numpy
-    opencv 3
-    tensorflow 1.0
-    Cython.
-    sklean.
+## Why Trackflow?
 
-for using sort :
+In July 2017, this repository wired YOLOv2 (`darkflow`) to DeepSORT using TensorFlow 1.0, OpenCV 3, Cython builds, 3 git submodules, and manual Google Drive weight downloads (~14 FPS on a GTX 1080).
 
-[`scikit-learn`](http://scikit-learn.org/stable/)
+Plain `YOLO + ByteTrack` is now commoditized. **Trackflow v2** is a clean-room **Apache-2.0** toolkit built for everything that happens **above** raw bounding boxes:
 
-[`scikit-image`](http://scikit-image.org/download)
+1. **Zero-Friction Modern Core:** One command (`uvx trackflow run video.mp4`), Apache-2.0 end-to-end transformers (**D-FINE**, **RT-DETRv2**, **RF-DETR**), **ByteTrack & BoT-SORT**, ONNX Runtime (**Apple Silicon CoreML / NVIDIA CUDA / CPU**), and data-first exports (**Parquet / JSONL / CSV / HTML report**).
+2. **Natural-Language Querying & Track Cards:** Prompt-to-track (`--query "person in red jacket with a backpack"` via ONNX CLIP / SigLIP), persistent **Track Cards** with **cross-exit long-term Re-ID**, and post-run `trackflow search`.
+3. **Visual Track Debugger & 4-Point Floorplan Homography:** Launch `trackflow inspect` to scrub timelines, flag ID switches, compare trackers side-by-side, and click 4 ground corners to project 2D tracks onto bird's-eye trajectories, heatmaps, and dwell zones.
+4. **Privacy-First Mode & Zero-Install WebGPU Playground:** Built-in `--anonymize` (`face-blur`, `blur`, `pixelate`, or zero-PII `skeleton`-only rendering) plus a 100% local in-browser [**WebGPU Playground**](https://obendidi.github.io/trackflow/).
+5. **2017 vs. 2026 Benchmark Suite:** Built-in `trackflow benchmark --split-screen` harness celebrating 9 years of real-time tracking progress.
 
-[`FilterPy`](https://github.com/rlabbe/filterpy)
+---
 
+## Quickstart
 
-### Setup
+```bash
+# Run immediately with uvx (no manual weight downloads or Cython builds)
+uvx trackflow-cv run street.mp4
 
-1 - Clone this repository : `git clone https://github.com/bendidi/Tracking-with-darkflow.git`
+# Or install via pip / uv (provides the `trackflow` CLI and `import trackflow`)
+pip install trackflow-cv
+trackflow run street.mp4
+```
 
-2 - Initialize all submodules: `git submodule update --init --recursive`
+### 1. Real-Time Tracking + Structured Exports
+```bash
+trackflow run crowd.mp4 \
+  --model dfine-n \
+  --tracker botsort \
+  --classes person \
+  --export parquet,jsonl,csv,html
+```
+Query the Parquet output directly with DuckDB:
+```sql
+SELECT track_id, COUNT(*) AS frames, AVG(confidence) AS avg_conf
+FROM 'runs/latest/tracks.parquet'
+GROUP BY track_id ORDER BY frames DESC;
+```
 
-3 - Go to darkflow directory and do in place build: `python3 setup.py build_ext --inplace`
+### 2. Natural-Language Prompt-to-Track & Post-Run Search
+```bash
+# Highlight matching people live + build persistent Track Cards with cross-exit Re-ID
+trackflow run mall.mp4 --reid clip --query "person in red jacket with a backpack"
 
-## Getting started
+# Search the completed run again anytime without re-running detection
+trackflow search runs/latest "person carrying a suitcase"
+```
 
-Download the weights :
+### 3. Visual Track Debugger, Tracker Comparison & 4-Point Floorplan
+```bash
+# Compare ByteTrack vs BoT-SORT side-by-side on the same video
+trackflow compare crowd.mp4 --trackers bytetrack,botsort --inspect
 
-Read more about YOLO (in darknet) and download weight files [here](http://pjreddie.com/darknet/yolo/),In case the weight file cannot be found, [thtrieu](https://github.com/thtrieu) has uploaded some of his [here](https://drive.google.com/drive/folders/0B1tW_VtY7onidEwyQ2FtQVplWEU), which include `yolo-full` and `yolo-tiny` of v1.0, `tiny-yolo-v1.1` of v1.1 and `yolo`, `tiny-yolo-voc` of v2.
+# Or open the Visual Track Debugger & 4-Point Homography Studio on any run
+trackflow inspect runs/latest
+```
 
-The artchitecture I used/tested in this project is `cfg/yolo.cfg` with the weights `bin/yolo.weights`.
+### 4. Privacy-First Anonymization
+```bash
+# Blur faces/heads only
+trackflow run lobby.mp4 --anonymize face-blur
 
-~~Next you need to download the deep_sort weights [here](https://owncloud.uni-koblenz.de/owncloud/s/f9JB0Jr7f3zzqs8?path=%2Fresources) (networks folder), provided by [nwojke](https://github.com/nwojke)~~
+# Zero-PII pose-skeleton-only analytics (no raw video pixels saved)
+trackflow run lobby.mp4 --anonymize skeleton
+```
 
-The deep_sort weights provided by [nwojke](https://github.com/nwojke) has been cancelled. you can get them from [here](https://drive.google.com/open?id=1eXm0EB8r4BywqHJzaorXTSOkIfFdTq59) instead ( thanks to [@louxy126](https://github.com/louxy126) )
+### 5. Reproducible 2017 vs. 2026 Benchmark
+```bash
+trackflow benchmark crowd.mp4 --models dfine-n,rtdetr-v2-r18 --trackers bytetrack,botsort --split-screen
+```
 
-extract the folder and copy it to `deep_sort/resources`
+---
 
-Edit Flags in `run.py` following your configuration :
+## Zero-Install WebGPU Browser Playground
 
-- `demo` : path to video file to use, set to "camera" if you wish to use your camera
-- `model` : what model configuration to use for YOLO, you can get more information and .cfg files in [here](http://pjreddie.com/darknet/yolo/)(put them in darkflow/cfg/ folder)
-- `load` : The  corresponding weights to use with the chosen model (put them in darkflow/bin/) more info in [here](http://pjreddie.com/darknet/yolo/)
-- `threshold` : the confidance threshold of the YOLO detections
-- `gpu` : How much GPU to use, 0 means use cpu
-- `track` : to activate tracking or Not
-- `trackObj`: which objects to track as a list (notice that deep_sort's encoder was only trained on people , so you need train your own encoder, more information in [here](https://github.com/nwojke/deep_sort/issues/7))
-- `saveVideo` : whether to save video or not
-- `BK_MOG` : add opencv's MOG background subtraction module, only useful when YOLO can't detect people in a video (low quality, ...) use it to detect boxes around moving objects
-- `tracker` : which tracker to use : "deep_sort" or "sort"
+Try Trackflow immediately in your browser at **[obendidi.github.io/trackflow](https://obendidi.github.io/trackflow/)** — 100% local WebGPU/WASM execution with zero video upload.
 
-            **NOTE** : "deep_sort" only supports people tracking as it was only trained to track people(the code for training is not yet published)
+The [`web/`](web/) directory powers the playground via `@huggingface/transformers` using the exact same `onnx-community` ONNX models (`rtdetr_v2_r18vd-ONNX`, `dfine_n_coco-ONNX`) plus in-browser ByteTrack and live privacy anonymization. To run it locally:
 
-            **TODO** : add support for GOTURN tracker(tensorflow implementation)
+```bash
+python3 -m http.server 8080 --directory web
+```
 
-            **TODO** : add support for opencv trackers (MIL,KCF,TLD,MEDIANFLOW)
+---
 
-- `skip ` : skip frames to increase fps, might decrease accuracy !
-- `csv` : save csv file of detections in the format (frame_id,object_id,x,y,w,h)
-- `display` : display video while processing or Not
+## Built-in Models
 
-Next you just have to run `python run.py`, and enjoy !
+All weights auto-download and cache from Hugging Face on first run:
 
-## Some numbers :
+| Preset | Model | Size (FP32) | License | Best For |
+| :--- | :--- | ---: | :--- | :--- |
+| `rtdetr-v2-r18` *(default)* | RT-DETRv2 ResNet-18 | ~81 MB | Apache-2.0 | Balanced speed & dense crowd accuracy |
+| `dfine-n` | D-FINE Nano (COCO) | ~15 MB | Apache-2.0 | Ultra-lightweight edge / CPU fallback |
+| `rfdetr-base` | RF-DETR Base (COCO) | ~108 MB | Apache-2.0 | High-accuracy people tracking |
+| `--reid clip` | CLIP ViT-B/32 (INT8 ONNX) | ~153 MB | MIT | Fast natural-language querying & Re-ID |
+| `--reid siglip` | SigLIP Base (INT8 ONNX) | ~205 MB | Apache-2.0 | Fine-grained clothing/attribute queries |
 
-`speed using yolo.cfg:
+---
 
-    YOLO with track Flag set to False : 30fps
+## Python API
 
-    YOLO with track Flag set to True (deep_sort) : 14 fps
+```python
+from trackflow import FloorplanHomography, TrackflowPipeline
 
-    YOLO with track and background subtraction Flags set to True : 10.5 fps
+pipeline = TrackflowPipeline(
+    model="dfine-n",
+    tracker="botsort",
+    reid="clip",
+    query="person wearing a red jacket",
+    anonymize="face-blur",
+)
+summary = pipeline.run("crowd.mp4", output_dir="runs/crowd")
+print(f"{summary.unique_tracks} unique tracks at {summary.avg_fps:.1f} FPS")
+```
 
-Tests done on (1024, 1280, 3) resolution video on Nvidia GTX 1080
+---
 
-skipping up to 3 frames allows for more speed up while keeping accuracy of tracking`
+## License
 
-
-
-## Disclamer :
-
-this project is using code forked from:
-
-[thtrieu/darkflow](https://github.com/thtrieu/darkflow): for the real-time object detections and classifications.
-
-[nwojke/deep_sort](https://github.com/nwojke/deep_sort): for Simple Online Realtime Tracking with a Deep Association Metric.
-
-Please follow the links to get an understanding of all the features of each project.
-
-## Citation
-
-### Yolov2 :
-
-    @article{redmon2016yolo9000,
-      title={YOLO9000: Better, Faster, Stronger},
-      author={Redmon, Joseph and Farhadi, Ali},
-      journal={arXiv preprint arXiv:1612.08242},
-      year={2016}
-    }
-
-### deep_sort :
-
-    @article{Wojke2017simple,
-      title={Simple Online and Realtime Tracking with a Deep Association Metric},
-      author={Wojke, Nicolai and Bewley, Alex and Paulus, Dietrich},
-      journal={arXiv preprint arXiv:1703.07402},
-      year={2017}
-    }
-
-### sort :
-
-    @inproceedings{Bewley2016_sort,
-      author={Bewley, Alex and Ge, Zongyuan and Ott, Lionel and Ramos, Fabio and Upcroft, Ben},
-      booktitle={2016 IEEE International Conference on Image Processing (ICIP)},
-      title={Simple online and realtime tracking},
-      year={2016},
-      pages={3464-3468},
-      keywords={Benchmark testing;Complexity theory;Detectors;Kalman filters;Target tracking;Visualization;Computer Vision;Data Association;Detection;Multiple Object Tracking},
-      doi={10.1109/ICIP.2016.7533003}
-    }
+Trackflow v2 (`main`) is licensed under the **Apache License 2.0** — see [LICENSE](LICENSE).  
+The historical 2017 codebase on [`legacy-2017`](https://github.com/obendidi/trackflow/tree/legacy-2017) remains under GPL-3.0.
