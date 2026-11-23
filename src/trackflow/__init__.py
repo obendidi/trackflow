@@ -5,6 +5,7 @@ from __future__ import annotations
 from trackflow.boosttrack import BoostTracker
 from trackflow.detector import Detector, OnnxDetrDetector, create_detector
 from trackflow.homography import DwellZone, FloorplanHomography
+from trackflow.lines import CountingLine
 from trackflow.models import MODEL_REGISTRY, REID_REGISTRY, VLM_REGISTRY, ModelSpec
 from trackflow.ocsort import OcSortTracker
 from trackflow.pipeline import TrackflowPipeline
@@ -33,6 +34,7 @@ __all__ = [
     "BoostTracker",
     "BotSortTracker",
     "ByteTracker",
+    "CountingLine",
     "Detection",
     "Detector",
     "DwellZone",

@@ -105,6 +105,17 @@ trackflow inspect runs/run-1
 
 `trackflow inspect` starts a local web UI where you can scrub through frames, jump to flagged ID switches or recoveries, search track cards, compare two runs, and click 4 ground corners to project 2D tracks onto a top-down floorplan.
 
+### Line counting
+
+```bash
+# Count people crossing a doorway, in each direction
+trackflow run entrance.mp4 --line "door=640,300,640,720"
+```
+
+`--line` takes a line segment in image pixels as `name=x1,y1,x2,y2` (the name is optional) and can be repeated. A track crosses when the bottom center of its box moves from one side of the segment to the other. A crossing to the right of the direction from the first point to the second counts as `in`, the other way as `out`. For a line drawn left to right, `in` means moving down the frame, and the annotated video shows an arrow on the `in` side. Every crossing counts, so someone who steps back over the line adds one in each direction.
+
+The totals go to the run summary, `summary.json` (`line_counts`) and the HTML report. Each crossing is also a `line_crossed` event in `events.json`, with the track ID, class and direction. In Python, pass `lines=[CountingLine("door", (640, 300), (640, 720))]` to `TrackflowPipeline`; `stream()` reports crossings in each frame's `events`.
+
 ### Anonymization
 
 ```bash

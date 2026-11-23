@@ -15,6 +15,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from trackflow.lines import CountingLine
 from trackflow.privacy import _track_color
 from trackflow.types import FrameResult, RunSummary, Track, TrackCard
 
@@ -136,9 +137,41 @@ def draw_tracks(
     fps: float | None = None,
     query: str | None = None,
     anonymize_mode: str = "none",
+    lines: Sequence[CountingLine] = (),
+    line_counts: dict[str, dict[str, int]] | None = None,
 ) -> np.ndarray:
-    """Draw boxes, IDs, motion trails, query highlight badges, and HUD onto a frame."""
+    """Draw boxes, IDs, motion trails, query highlight badges, counting lines, and HUD."""
     canvas = frame_bgr.copy()
+
+    for line in lines:
+        start = tuple(int(round(v)) for v in line.start)
+        end = tuple(int(round(v)) for v in line.end)
+        cv2.line(canvas, start, end, (0, 215, 255), 2, cv2.LINE_AA)
+        # Arrow from the middle of the line toward its "in" side.
+        dx, dy = line.end[0] - line.start[0], line.end[1] - line.start[1]
+        norm = max((dx * dx + dy * dy) ** 0.5, 1e-6)
+        mid = ((line.start[0] + line.end[0]) / 2, (line.start[1] + line.end[1]) / 2)
+        tip = (mid[0] - dy / norm * 18, mid[1] + dx / norm * 18)
+        cv2.arrowedLine(
+            canvas,
+            (int(round(mid[0])), int(round(mid[1]))),
+            (int(round(tip[0])), int(round(tip[1]))),
+            (0, 215, 255),
+            2,
+            cv2.LINE_AA,
+            tipLength=0.4,
+        )
+        counts = (line_counts or {}).get(line.name, {"in": 0, "out": 0})
+        cv2.putText(
+            canvas,
+            f"{line.name} in {counts['in']} out {counts['out']}",
+            (start[0] + 4, max(14, start[1] - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 215, 255),
+            1,
+            cv2.LINE_AA,
+        )
 
     # Briefly-missed tracks at their predicted position: thin dimmed box + ID, so boxes don't blink.
     for tr in coasting or []:
@@ -277,6 +310,12 @@ def write_run_report(
             if len(id_switch_rows) == 40:
                 break
 
+    line_kpis = "".join(
+        f'<div class="kpi"><div class="label">Line {html.escape(name)} (in / out)</div>'
+        f'<div class="val">{c["in"]} / {c["out"]}</div></div>'
+        for name, c in summary.line_counts.items()
+    )
+
     card_html: list[str] = []
     for c in cards[:60]:
         q_badge = (
@@ -370,6 +409,7 @@ def write_run_report(
     <div class="kpi"><div class="label">Frames</div><div class="val">{summary.processed_frames}</div></div>
     <div class="kpi"><div class="label">Inference</div><div class="val">{summary.avg_inference_ms:.1f} ms</div></div>
     <div class="kpi"><div class="label">Recovered / Re-ID</div><div class="val">{summary.recovered_tracks} / {summary.reid_merges}</div></div>
+    {line_kpis}
   </div>
 
   <div class="panel">
