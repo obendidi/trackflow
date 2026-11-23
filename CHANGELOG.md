@@ -4,9 +4,15 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-23
+
 ### Added
 
 - `--line name=x1,y1,x2,y2` counts tracks crossing a line in each direction, with totals in the run summary, `summary.json` and the HTML report, and a `line_crossed` event per crossing.
+
+### Changed
+
+- The `--anonymize` help and the playground label say that `face-blur` blurs the top 30% of each person box, so nobody mistakes it for a face detector.
 
 ### Fixed
 
@@ -95,7 +101,8 @@ First release of Trackflow, a rewrite of the 2017 Tracking-with-darkflow project
 
 - `trackflow run` crashes with an `AttributeError` from the progress bar. Use 0.1.1 or later.
 
-[Unreleased]: https://github.com/obendidi/trackflow/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/obendidi/trackflow/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/obendidi/trackflow/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/obendidi/trackflow/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/obendidi/trackflow/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/obendidi/trackflow/compare/v0.1.0...v0.1.1
