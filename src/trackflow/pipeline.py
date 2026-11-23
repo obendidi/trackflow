@@ -374,7 +374,7 @@ class TrackflowPipeline:
         events = list(getattr(tracker, "last_events", ()))
         if counter is not None:
             # Raw tracker IDs: a Re-ID merge would join a track to a point from before it left.
-            events.extend(counter.update(tracks))
+            events.extend(counter.update(tracks, timestamp))
         if cards is not None:
             events.extend(cards.update(idx, timestamp, frame, tracks, frame_dt_s=dt))
         return FrameResult(

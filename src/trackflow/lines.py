@@ -57,19 +57,32 @@ class CountingLine:
         return a * b <= 0
 
 
-class LineCounter:
-    """Counts crossings of each line, per direction, for one run or stream."""
+@dataclass(slots=True)
+class _TrackSide:
+    side: float  # side the track was last confirmed on
+    point: Point  # its latest foot point on that side
+    pending_since_s: float | None = None  # when it was first seen on the other side
+    pending_spans: bool = False  # whether that move went through the segment
 
-    def __init__(self, lines: Sequence[CountingLine]) -> None:
+
+class LineCounter:
+    """Counts crossings of each line, per direction, for one run or stream.
+
+    A crossing counts once the track has stayed on the new side for ``hold_s`` seconds. When
+    people overlap, a box's bottom edge can jump back and forth across a line for a few
+    frames, and each jump would otherwise count.
+    """
+
+    def __init__(self, lines: Sequence[CountingLine], hold_s: float = 0.3) -> None:
         names = [line.name for line in lines]
         if len(set(names)) != len(names):
             raise ValueError(f"Counting line names must be unique, got {names}.")
         self.lines = list(lines)
+        self.hold_s = hold_s
         self.counts = {name: {"in": 0, "out": 0} for name in names}
-        # Last foot point of each track that was off the line, with its side.
-        self._last: dict[tuple[str, int], tuple[Point, float]] = {}
+        self._sides: dict[tuple[str, int], _TrackSide] = {}
 
-    def update(self, tracks: Sequence[Track]) -> list[dict[str, Any]]:
+    def update(self, tracks: Sequence[Track], timestamp_s: float) -> list[dict[str, Any]]:
         """Record this frame's tracks and return a ``line_crossed`` event per new crossing."""
         events: list[dict[str, Any]] = []
         for tr in tracks:
@@ -79,19 +92,29 @@ class LineCounter:
                 if side == 0:
                     continue
                 key = (line.name, tr.track_id)
-                prev = self._last.get(key)
-                self._last[key] = (point, side)
-                if prev is None or (prev[1] > 0) == (side > 0) or not line.spans(prev[0], point):
+                state = self._sides.get(key)
+                if state is None:
+                    self._sides[key] = _TrackSide(side, point)
                     continue
-                direction = "in" if side > 0 else "out"
-                self.counts[line.name][direction] += 1
-                events.append(
-                    {
-                        "type": "line_crossed",
-                        "line": line.name,
-                        "direction": direction,
-                        "track_id": tr.track_id,
-                        "class_name": tr.class_name,
-                    }
-                )
+                if (state.side > 0) == (side > 0):
+                    state.point, state.pending_since_s = point, None
+                    continue
+                if state.pending_since_s is None:
+                    state.pending_since_s = timestamp_s
+                    state.pending_spans = line.spans(state.point, point)
+                if timestamp_s - state.pending_since_s < self.hold_s:
+                    continue
+                if state.pending_spans:
+                    direction = "in" if side > 0 else "out"
+                    self.counts[line.name][direction] += 1
+                    events.append(
+                        {
+                            "type": "line_crossed",
+                            "line": line.name,
+                            "direction": direction,
+                            "track_id": tr.track_id,
+                            "class_name": tr.class_name,
+                        }
+                    )
+                state.side, state.point, state.pending_since_s = side, point, None
         return events

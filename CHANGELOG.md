@@ -4,6 +4,10 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+### Fixed
+
+- `--line` counts a crossing only once the track has stayed on the new side for 0.3 seconds, so boxes that jitter across the line in crowds no longer inflate the counts.
+
 ## [0.4.0] - 2026-11-23
 
 ### Added

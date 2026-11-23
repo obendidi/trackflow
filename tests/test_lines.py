@@ -18,12 +18,15 @@ def _at(track_id: int, foot_x: float, foot_y: float) -> Track:
     return Track(track_id, (foot_x - 10, foot_y - 40, foot_x + 10, foot_y), 0.9, 0, "person")
 
 
+def _feed(counter, frames, step=1.0):
+    """Feed one list of tracks per frame, ``step`` seconds apart, and return all events."""
+    return [e for i, tracks in enumerate(frames) for e in counter.update(tracks, i * step)]
+
+
 def test_counts_each_crossing_by_direction():
     # Drawn left to right, so "in" is moving down the frame.
     counter = LineCounter([CountingLine("door", (0, 100), (200, 100))])
-    events = []
-    for y in (80, 95, 105, 120, 90):
-        events += counter.update([_at(1, 50, y)])
+    events = _feed(counter, [[_at(1, 50, y)] for y in (80, 95, 105, 120, 90, 85)])
     assert counter.counts == {"door": {"in": 1, "out": 1}}
     assert [(e["direction"], e["track_id"]) for e in events] == [("in", 1), ("out", 1)]
     assert events[0] == {
@@ -35,12 +38,19 @@ def test_counts_each_crossing_by_direction():
     }
 
 
+def test_waits_for_a_track_to_stay_on_the_new_side():
+    counter = LineCounter([CountingLine("door", (0, 100), (200, 100))])
+    # At 30 FPS, a box edge that pokes over the line for two frames is not a crossing.
+    ys = [90] * 5 + [105] * 2 + [95] * 5 + [110] * 8 + [112] * 10
+    events = _feed(counter, [[_at(1, 50, y)] for y in ys], step=1 / 30)
+    assert counter.counts == {"door": {"in": 1, "out": 0}}
+    assert [e["direction"] for e in events] == ["in"]
+
+
 def test_ignores_moves_past_the_segment_end_and_points_on_the_line():
     counter = LineCounter([CountingLine("door", (0, 100), (200, 100))])
-    for y in (80, 120):
-        counter.update([_at(1, 300, y)])  # beside the segment, not through it
-    for y in (80, 100, 100, 120):
-        counter.update([_at(2, 50, y)])  # pauses on the line, then crosses once
+    _feed(counter, [[_at(1, 300, y)] for y in (80, 120, 120)])  # beside the segment
+    _feed(counter, [[_at(2, 50, y)] for y in (80, 100, 100, 120, 120)])  # pauses on the line
     assert counter.counts == {"door": {"in": 1, "out": 0}}
 
 
@@ -48,8 +58,7 @@ def test_tracks_and_lines_are_counted_independently():
     counter = LineCounter(
         [CountingLine("top", (0, 100), (200, 100)), CountingLine("bottom", (0, 200), (200, 200))]
     )
-    for y in (80, 150, 250):
-        counter.update([_at(1, 50, y), _at(2, 150, 300 - y)])
+    _feed(counter, [[_at(1, 50, y), _at(2, 150, 300 - y)] for y in (80, 150, 250, 260)])
     assert counter.counts == {"top": {"in": 1, "out": 1}, "bottom": {"in": 1, "out": 1}}
 
 
