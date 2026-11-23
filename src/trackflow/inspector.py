@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import shutil
 import webbrowser
 from collections import defaultdict
 from http import HTTPStatus
@@ -12,10 +13,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import pyarrow.csv as pcsv
 import pyarrow.parquet as pq
 
 from trackflow.homography import DwellZone, FloorplanHomography
 from trackflow.reid import search_track_cards
+from trackflow.sinks import PARQUET_SCHEMA
 
 UI_HTML_PATH = Path(__file__).with_name("inspector_ui.html")
 
@@ -53,16 +56,27 @@ def load_run_payload(run_dir: Path) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     jsonl_path = run_dir / "tracks.jsonl"
     parquet_path = run_dir / "tracks.parquet"
-    if jsonl_path.is_file():
-        for line in jsonl_path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                records.append(json.loads(line))
-    elif parquet_path.is_file():
+    outputs = summary.get("output_files")
+
+    def present(key: str, path: Path) -> bool:
+        return (outputs is None or key in outputs) and path.is_file()
+
+    csv_path = run_dir / "tracks.csv"
+    if present("jsonl", jsonl_path):
+        with jsonl_path.open(encoding="utf-8") as rows:
+            records = [json.loads(line) for line in rows if line.strip()]
+    elif present("parquet", parquet_path):
         records = pq.read_table(str(parquet_path)).to_pylist()
+    elif present("csv", csv_path):
+        opts = pcsv.ConvertOptions(column_types=PARQUET_SCHEMA, strings_can_be_null=True)
+        records = pcsv.read_csv(csv_path, convert_options=opts).to_pylist()
 
     frames_map: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for rec in records:
         frames_map[int(rec["frame_idx"])].append(rec)
+    if "frame_stride" in summary and outputs and {"jsonl", "parquet", "csv"}.intersection(outputs):
+        for idx in range(0, summary["total_frames"], summary["frame_stride"]):
+            frames_map.setdefault(idx, [])
 
     frames_sorted = [
         {"frame_idx": idx, "tracks": frames_map[idx]} for idx in sorted(frames_map.keys())
@@ -86,7 +100,7 @@ def load_run_payload(run_dir: Path) -> dict[str, Any]:
         },
         "homography": homography,
         "frames": frames_sorted,
-        "has_video": (run_dir / "annotated.mp4").is_file(),
+        "has_video": present("video", run_dir / "annotated.mp4"),
         "has_floorplan": (run_dir / "floorplan.png").is_file(),
     }
 
@@ -123,7 +137,7 @@ def compute_homography_projection(
 
     run_data = load_run_payload(run_dir)
     src_fps = float(run_data["summary"].get("source_fps", 30.0) or 30.0)
-    dt_s = 1.0 / max(src_fps, 1e-3)
+    dt_s = run_data["summary"].get("frame_stride", 1) / max(src_fps, 1e-3)
 
     trajectories: dict[str, list[list[float]]] = defaultdict(list)
     for frame in run_data["frames"]:
@@ -165,16 +179,16 @@ def make_inspector_handler(
 
         def _send_file(self, path: Path) -> None:
             resolved = path.resolve()
-            if not str(resolved).startswith(str(root_dir)) or not resolved.is_file():
+            if not resolved.is_relative_to(root_dir) or not resolved.is_file():
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             mime, _ = mimetypes.guess_type(str(resolved))
-            data = resolved.read_bytes()
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", mime or "application/octet-stream")
-            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Length", str(resolved.stat().st_size))
             self.end_headers()
-            self.wfile.write(data)
+            with resolved.open("rb") as stream:
+                shutil.copyfileobj(stream, self.wfile)
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -198,33 +212,65 @@ def make_inspector_handler(
 
             if route.startswith("/crops/"):
                 rel = route.removeprefix("/crops/")
-                self._send_file(root_dir / "crops" / Path(rel).name)
+                summary_path = root_dir / "summary.json"
+                summary = (
+                    json.loads(summary_path.read_text(encoding="utf-8"))
+                    if summary_path.is_file()
+                    else {}
+                )
+                if (
+                    summary.get("anonymize_mode", "none") != "none"
+                    or not Path(rel).match("track_*.jpg")
+                    or Path(rel).name != rel
+                ):
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                else:
+                    self._send_file(root_dir / "crops" / rel)
                 return
 
             if route.startswith("/media/"):
                 rel = route.removeprefix("/media/")
-                self._send_file(root_dir / Path(rel).name)
+                if rel not in {"floorplan.png", "annotated.mp4"}:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                if rel == "annotated.mp4":
+                    summary_path = root_dir / "summary.json"
+                    if summary_path.is_file():
+                        outputs = json.loads(summary_path.read_text(encoding="utf-8")).get(
+                            "output_files"
+                        )
+                        if outputs is not None and "video" not in outputs:
+                            self.send_error(HTTPStatus.NOT_FOUND)
+                            return
+                self._send_file(root_dir / rel)
                 return
 
             self.send_error(HTTPStatus.NOT_FOUND)
 
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
-            length = int(self.headers.get("Content-Length", "0"))
-            raw = self.rfile.read(length) if length > 0 else b"{}"
             try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 1024 * 1024:
+                    raise ValueError("Invalid content length")
+                if self.headers.get_content_type() != "application/json":
+                    self.send_error(HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                    return
+                raw = self.rfile.read(length)
                 body = json.loads(raw.decode("utf-8"))
-            except json.JSONDecodeError:
+                if not isinstance(body, dict):
+                    raise ValueError("Expected a JSON object")
+            except (ValueError, UnicodeError):
                 self._send_json({"error": "Invalid JSON body"}, status=HTTPStatus.BAD_REQUEST)
                 return
 
             if parsed.path == "/api/search":
                 query = str(body.get("query", "")).strip()
-                top_k = int(body.get("top_k", 10))
                 if not query:
                     self._send_json({"error": "Empty query"}, status=HTTPStatus.BAD_REQUEST)
                     return
                 try:
+                    top_k = int(body.get("top_k", 10))
                     hits = search_track_cards(root_dir, query, top_k=top_k)
                     self._send_json({"query": query, "results": hits})
                 except Exception as exc:

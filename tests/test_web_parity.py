@@ -40,7 +40,12 @@ def _python_replay(
     for dets in frames:
         tracks = tracker.update(
             [
-                Detection(bbox=tuple(d[:4]), confidence=d[4], class_id=0, class_name="person")
+                Detection(
+                    bbox=tuple(d[:4]),
+                    confidence=d[4],
+                    class_id=int(d[5]) if len(d) > 5 else 0,
+                    class_name="person" if len(d) <= 5 else str(int(d[5])),
+                )
                 for d in dets
             ]
         )
@@ -132,3 +137,19 @@ def test_tracker_quality_on_recorded_detections() -> None:
         # Before track confirmation: 75 IDs / 38 short on the full RT-DETR video.
         assert short <= 3, f"{name}: {short} IDs lived < 10 frames"
         assert len(lengths) <= 20, f"{name}: {len(lengths)} unique IDs in 250 frames"
+
+
+@pytest.mark.skipif(node is None, reason="Node.js not installed")
+def test_web_multiclass_tracks_match_python(tmp_path: Path):
+    frames = [
+        [[0, 0, 80, 100, 0.9, 0], [10, 10, 60, 70, 0.85, 24]],
+        [[11, 10, 61, 70, 0.3, 24]],
+        [[12, 10, 62, 70, 0.95, 24], [1, 0, 81, 100, 0.9, 0]],
+    ]
+    path = tmp_path / "mixed.json"
+    path.write_text(json.dumps({"sequences": {"mixed": frames}}))
+    js = _run_node("tracker", str(path), str(THRESHOLD))["mixed"]
+    py = _python_replay(frames)
+    assert [[t[0] for t in f["tracks"]] for f in js] == [[1, 2], [2], [1, 2]]
+    for a, b in zip(js, py, strict=True):
+        np.testing.assert_allclose(a["tracks"], b["tracks"])

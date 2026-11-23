@@ -5,7 +5,8 @@ from __future__ import annotations
 import csv
 import html
 import json
-from collections import defaultdict
+from collections.abc import Iterable, Sequence
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -43,34 +44,87 @@ PARQUET_SCHEMA = pa.schema(
 )
 
 
-def write_parquet(records: list[dict[str, Any]], path: Path) -> Path:
-    """Write track observations to Apache Parquet (directly queryable by DuckDB / Polars / Pandas)."""
-    if records:
-        table = pa.Table.from_pylist(records, schema=PARQUET_SCHEMA)
-    else:
-        empty = {field.name: [] for field in PARQUET_SCHEMA}
-        table = pa.Table.from_pydict(empty, schema=PARQUET_SCHEMA)
-    pq.write_table(table, str(path), compression="snappy")
-    return path
+class ObservationWriter:
+    """Write each requested format in bounded batches, including schemas on empty runs."""
+
+    def __init__(self, paths: dict[str, Path], stack: ExitStack) -> None:
+        self._batch: list[dict[str, Any]] = []
+        self._parquet = None
+        self._jsonl = self._csv = self._mot = None
+        if "parquet" in paths:
+            self._parquet = stack.enter_context(
+                pq.ParquetWriter(paths["parquet"], PARQUET_SCHEMA, compression="snappy")
+            )
+        if "jsonl" in paths:
+            self._jsonl = stack.enter_context(paths["jsonl"].open("w", encoding="utf-8"))
+        if "csv" in paths:
+            fh = stack.enter_context(paths["csv"].open("w", encoding="utf-8", newline=""))
+            self._csv = csv.DictWriter(fh, fieldnames=PARQUET_SCHEMA.names)
+            self._csv.writeheader()
+        if "mot" in paths:
+            fh = stack.enter_context(paths["mot"].open("w", encoding="utf-8", newline=""))
+            self._mot = csv.writer(fh, lineterminator="\n")
+        stack.callback(self.flush)
+
+    def append(self, record: dict[str, Any]) -> None:
+        self._batch.append(record)
+        if len(self._batch) >= 1024:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._batch:
+            return
+        batch, self._batch = self._batch, []
+        if self._parquet is not None:
+            self._parquet.write_table(pa.Table.from_pylist(batch, schema=PARQUET_SCHEMA))
+        if self._csv is not None:
+            self._csv.writerows(batch)
+        if self._jsonl is not None:
+            self._jsonl.writelines(json.dumps(r) + "\n" for r in batch)
+        if self._mot is not None:
+            for r in batch:
+                self._mot.writerow(
+                    (
+                        r["frame_idx"] + 1,
+                        r["track_id"],
+                        round(r["x1"] + 1, 2),
+                        round(r["y1"] + 1, 2),
+                        r["width"],
+                        r["height"],
+                        r["confidence"],
+                        -1,
+                        -1,
+                        -1,
+                    )
+                )
 
 
-def write_jsonl(records: list[dict[str, Any]], path: Path) -> Path:
-    """Write line-delimited JSON track observations."""
-    with path.open("w", encoding="utf-8") as fh:
+def _write_records(records: Iterable[dict[str, Any]], path: Path, fmt: str) -> Path:
+    with ExitStack() as stack:
+        writer = ObservationWriter({fmt: path}, stack)
         for rec in records:
-            fh.write(json.dumps(rec) + "\n")
+            writer.append(rec)
     return path
 
 
-def write_csv(records: list[dict[str, Any]], path: Path) -> Path:
-    """Write CSV track observations."""
-    fieldnames = [f.name for f in PARQUET_SCHEMA]
-    with path.open("w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-        writer.writeheader()
-        for rec in records:
-            writer.writerow(rec)
-    return path
+def write_parquet(records: Iterable[dict[str, Any]], path: Path) -> Path:
+    """Write track observations to Parquet with the public Trackflow schema."""
+    return _write_records(records, path, "parquet")
+
+
+def write_jsonl(records: Iterable[dict[str, Any]], path: Path) -> Path:
+    """Write line-delimited JSON observations."""
+    return _write_records(records, path, "jsonl")
+
+
+def write_csv(records: Iterable[dict[str, Any]], path: Path) -> Path:
+    """Write CSV observations with a header."""
+    return _write_records(records, path, "csv")
+
+
+def write_mot(records: Iterable[dict[str, Any]], path: Path) -> Path:
+    """Write MOTChallenge 2D results. Frame, ID, left and top are one-based."""
+    return _write_records(records, path, "mot")
 
 
 def draw_tracks(
@@ -173,13 +227,35 @@ def write_html_report(
 ) -> Path:
     """Generate a self-contained HTML run report with inline SVG charts & Track Card gallery."""
     counts = [len(fr.tracks) for fr in frame_results]
-    max_count = max(counts, default=1) or 1
+    events = (
+        {"frame_idx": fr.frame_idx, "timestamp_s": fr.timestamp_s, **ev}
+        for fr in frame_results
+        for ev in fr.events
+    )
+    return write_run_report(summary, counts, events, cards, path)
+
+
+def write_run_report(
+    summary: RunSummary,
+    counts: Sequence[int],
+    events: Iterable[dict[str, Any]],
+    cards: list[TrackCard],
+    path: Path,
+) -> Path:
+    """Render the report from frame counts and events without retaining track objects."""
+    max_count = max(counts, default=0)
 
     # Build inline SVG sparkline for active tracks per frame
     svg_w, svg_h = 720, 150
+    if len(counts) > svg_w:
+        # One peak per display column keeps the report usable for long recordings.
+        counts = [
+            max(counts[i * len(counts) // svg_w : (i + 1) * len(counts) // svg_w])
+            for i in range(svg_w)
+        ]
     if len(counts) >= 2:
         pts = [
-            f"{(i / (len(counts) - 1)) * svg_w:.1f},{svg_h - 12 - (c / max_count) * (svg_h - 24):.1f}"
+            f"{(i / (len(counts) - 1)) * svg_w:.1f},{svg_h - 12 - (c / max(1, max_count)) * (svg_h - 24):.1f}"
             for i, c in enumerate(counts)
         ]
         polyline = " ".join(pts)
@@ -189,18 +265,17 @@ def write_html_report(
         area = f"0,{svg_h} {polyline} {svg_w},{svg_h}"
 
     # Diagnostic events summary
-    event_counts: dict[str, int] = defaultdict(int)
     id_switch_rows: list[str] = []
-    for fr in frame_results:
-        for ev in fr.events:
-            et = ev.get("type", "event")
-            event_counts[et] += 1
-            if et in ("possible_id_switch", "reid_cross_exit_merge", "track_recovered"):
-                id_switch_rows.append(
-                    f"<tr><td>{fr.frame_idx}</td><td>{fr.timestamp_s:.2f}s</td>"
-                    f"<td><code>{html.escape(et)}</code></td>"
-                    f"<td><code>{html.escape(json.dumps(ev))}</code></td></tr>"
-                )
+    for ev in events:
+        et = ev.get("type", "event")
+        if et in ("possible_id_switch", "reid_cross_exit_merge", "track_recovered"):
+            id_switch_rows.append(
+                f"<tr><td>{int(ev['frame_idx'])}</td><td>{ev['timestamp_s']:.2f}s</td>"
+                f"<td><code>{html.escape(et)}</code></td>"
+                f"<td><code>{html.escape(json.dumps(ev))}</code></td></tr>"
+            )
+            if len(id_switch_rows) == 40:
+                break
 
     card_html: list[str] = []
     for c in cards[:60]:
@@ -232,7 +307,7 @@ def write_html_report(
                 <div class="meta">
                   Frames {c.first_frame}–{c.last_frame} ({c.duration_s:.1f}s · {c.frame_count} obs)<br/>
                   Peak conf: {c.best_confidence:.2f}
-                  {f"<br/>Zones: {', '.join(c.zones_visited)}" if c.zones_visited else ""}
+                  {f"<br/>Zones: {html.escape(', '.join(c.zones_visited))}" if c.zones_visited else ""}
                 </div>
               </div>
             </div>

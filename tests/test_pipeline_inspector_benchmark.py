@@ -152,7 +152,7 @@ def test_cli_smoke_commands(tmp_path: Path, monkeypatch) -> None:
     # Verify `trackflow run` CLI progress bar and summary rendering end-to-end
     vid = generate_synthetic_crowd_video(tmp_path / "cli_smoke.mp4", num_frames=6)
     monkeypatch.setattr(
-        "trackflow.pipeline.OnnxDetrDetector",
+        "trackflow.pipeline.create_detector",
         lambda **_kwargs: _SyntheticMotionDetector(),
     )
     res = runner.invoke(
@@ -161,3 +161,26 @@ def test_cli_smoke_commands(tmp_path: Path, monkeypatch) -> None:
     )
     assert res.exit_code == 0, f"CLI run failed: {res.output}"
     assert (tmp_path / "out" / "tracks.jsonl").is_file()
+
+    # Repeating a command with its default output must not collide with the previous run.
+    monkeypatch.chdir(tmp_path)
+    for args in (
+        ["run", str(vid), "--no-video", "--export", "jsonl"],
+        ["compare", str(vid), "--max-frames", "4"],
+        ["benchmark", str(vid), "--trackers", "bytetrack", "--max-frames", "4"],
+    ):
+        for _ in range(2):
+            res = runner.invoke(app, args)
+            assert res.exit_code == 0, f"CLI {args[0]} failed on repeat: {res.output}"
+    assert sorted(p.name for p in (tmp_path / "runs").iterdir()) == [
+        "benchmark-1",
+        "benchmark-2",
+        "compare-1",
+        "compare-2",
+        "run-1",
+        "run-2",
+    ]
+
+    # Reusing an explicit non-empty output is a clear usage error, not a traceback.
+    res = runner.invoke(app, ["compare", str(vid), "-o", "runs/compare-1"])
+    assert res.exit_code == 2 and "not empty" in res.output

@@ -7,14 +7,23 @@ requires identical IDs and boxes.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from trackflow.types import Detection, Track
+
+
+class Tracker(Protocol):
+    """A stateful per-source tracker. Return the observations for the current frame."""
+
+    def update(
+        self, detections: list[Detection], frame_bgr: np.ndarray | None = None
+    ) -> list[Track]: ...
 
 
 def compute_iou_matrix(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
@@ -257,12 +266,20 @@ def _linear_assignment(
     if n_rows == 0 or n_cols == 0:
         return [], list(range(n_rows)), list(range(n_cols))
 
-    row_ind, col_ind = linear_sum_assignment(cost_matrix)
+    # Cost-limited linear assignment. Each row can take a dummy at the cutoff; a
+    # marginal pairing need not displace a strong one just to fill the matrix.
+    transpose = n_rows > n_cols
+    cost = cost_matrix.T if transpose else cost_matrix
+    dummy = np.full((cost.shape[0], cost.shape[0]), np.nextafter(max_cost, np.inf))
+    rows, cols = linear_sum_assignment(np.column_stack((cost, dummy)))
     matches: list[tuple[int, int]] = []
     matched_rows: set[int] = set()
     matched_cols: set[int] = set()
 
-    for r, c in zip(row_ind.tolist(), col_ind.tolist(), strict=False):
+    for row, col in zip(rows.tolist(), cols.tolist(), strict=True):
+        if col >= cost.shape[1]:
+            continue
+        r, c = (col, row) if transpose else (row, col)
         if cost_matrix[r, c] <= max_cost:
             matches.append((r, c))
             matched_rows.add(r)
@@ -379,6 +396,26 @@ class ByteTracker:
         """No-op in ByteTrack; overridden by BoT-SORT."""
         _ = frame_bgr
 
+    def _associate(
+        self,
+        tracks: list[_TrackState],
+        dets: list[Detection],
+        max_cost: float,
+        *,
+        low: bool = False,
+    ) -> tuple[list[tuple[int, int]], list[int], list[int]]:
+        if not tracks or not dets:
+            return [], list(range(len(tracks))), list(range(len(dets)))
+        if low:
+            cost = 1.0 - compute_iou_matrix(_boxes(tracks), _boxes(dets))
+        else:
+            cost = self._compute_first_stage_cost(tracks, dets)
+        different_class = np.not_equal.outer(
+            [t.class_id for t in tracks], [d.class_id for d in dets]
+        )
+        cost[different_class] = np.inf
+        return _linear_assignment(cost, max_cost)
+
     def _activate(self, tr: _TrackState, events: list[dict[str, Any]]) -> None:
         tr.is_activated = True
         tr.track_id = self._next_id
@@ -389,7 +426,10 @@ class ByteTracker:
         recently_lost = [
             t
             for t in self._tracks
-            if t.state == "lost" and t.is_activated and t.time_since_update <= 5
+            if t.state == "lost"
+            and t.class_id == tr.class_id
+            and t.is_activated
+            and t.time_since_update <= 5
         ]
         if recently_lost:
             ious = compute_iou_matrix(_boxes([tr]), _boxes(recently_lost))[0]
@@ -448,12 +488,7 @@ class ByteTracker:
         updated: set[int] = set()
 
         # 2. First association: confirmed + lost tracks with high-score detections.
-        matches, u_pool, u_high = _linear_assignment(
-            self._compute_first_stage_cost(pool, high_dets)
-            if pool and high_dets
-            else np.zeros((len(pool), len(high_dets))),
-            max_cost=self.match_thresh,
-        )
+        matches, u_pool, u_high = self._associate(pool, high_dets, self.match_thresh)
         for ti, di in matches:
             tr = pool[ti]
             if tr.state == "lost":
@@ -466,20 +501,16 @@ class ByteTracker:
         # 3. Second association: remaining *tracked* tracks with low-score detections (IoU only).
         rem_tracked = [pool[i] for i in u_pool if pool[i].state == "tracked"]
         if rem_tracked and low_dets:
-            cost_low = 1.0 - compute_iou_matrix(_boxes(rem_tracked), _boxes(low_dets))
-            low_matches, _, _ = _linear_assignment(cost_low, max_cost=self.second_match_thresh)
+            low_matches, _, _ = self._associate(
+                rem_tracked, low_dets, self.second_match_thresh, low=True
+            )
             for ti, di in low_matches:
                 self._apply_detection(rem_tracked[ti], low_dets[di], update_class=False)
                 updated.add(rem_tracked[ti].uid)
 
         # 4. Unconfirmed tracks with the high-score detections left over from stage 1.
         rem_high = [high_dets[i] for i in u_high]
-        un_matches, _, u_rem = _linear_assignment(
-            self._compute_first_stage_cost(unconfirmed, rem_high)
-            if unconfirmed and rem_high
-            else np.zeros((len(unconfirmed), len(rem_high))),
-            max_cost=self.unconfirmed_match_thresh,
-        )
+        un_matches, _, u_rem = self._associate(unconfirmed, rem_high, self.unconfirmed_match_thresh)
         for ti, di in un_matches:
             tr = unconfirmed[ti]
             self._apply_detection(tr, rem_high[di], update_class=True)
@@ -504,13 +535,17 @@ class ByteTracker:
         self._tracks = surviving
 
         # 6. Spawn new (unconfirmed) tracks from leftover high-score detections.
-        occupied = [t.bbox for t in self._tracks if t.uid in updated]
+        occupied: dict[int, list[tuple[float, float, float, float]]] = defaultdict(list)
+        for t in self._tracks:
+            if t.uid in updated:
+                occupied[t.class_id].append(t.bbox)
         leftovers = sorted((rem_high[i] for i in u_rem), key=lambda d: d.confidence, reverse=True)
         for det in leftovers:
             if det.confidence < self.new_track_thresh:
                 continue
-            if occupied and (
-                float(compute_ioa_matrix(_boxes([det]), np.array(occupied)).max())
+            same_class = occupied[det.class_id]
+            if same_class and (
+                float(compute_ioa_matrix(_boxes([det]), np.array(same_class)).max())
                 >= self.spawn_overlap_thresh
             ):
                 continue
@@ -526,7 +561,7 @@ class ByteTracker:
             tr.update_embedding(det.embedding)
             self._tracks.append(tr)
             updated.add(tr.uid)
-            occupied.append(tr.bbox)
+            same_class.append(tr.bbox)
             if self._frame_id == 1:
                 self._activate(tr, events)
 
@@ -547,6 +582,8 @@ class ByteTracker:
         drop: set[int] = set()
         for p, q in zip(*np.where(iou > self.duplicate_iou), strict=False):
             a, b = tracked[int(p)], lost[int(q)]
+            if a.class_id != b.class_id:
+                continue
             if (self._frame_id - a.start_frame) > (self._frame_id - b.start_frame):
                 drop.add(b.uid)
             else:

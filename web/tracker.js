@@ -101,7 +101,14 @@ function linearAssignment(cost, maxCost, nRows, nCols) {
   const rowsUsed = new Set();
   const colsUsed = new Set();
   if (nRows && nCols) {
-    for (const [r, c] of linearSumAssignment(cost)) {
+    const transpose = nRows > nCols;
+    const rows = Math.min(nRows, nCols), cols = Math.max(nRows, nCols);
+    const extended = Array.from({ length: rows }, (_, r) =>
+      Array.from({ length: cols + rows }, (_, c) =>
+        c >= cols ? maxCost + Number.EPSILON : (transpose ? cost[c][r] : cost[r][c])));
+    for (const [row, col] of linearSumAssignment(extended)) {
+      if (col >= cols) continue;
+      const [r, c] = transpose ? [col, row] : [row, col];
       if (cost[r][c] <= maxCost) {
         matches.push([r, c]);
         rowsUsed.add(r);
@@ -114,10 +121,6 @@ function linearAssignment(cost, maxCost, nRows, nCols) {
   const unmatchedCols = [];
   for (let c = 0; c < nCols; c++) if (!colsUsed.has(c)) unmatchedCols.push(c);
   return { matches, unmatchedRows, unmatchedCols };
-}
-
-function iouCost(boxesA, boxesB) {
-  return boxesA.map(a => boxesB.map(b => 1 - boxIoU(a, b)));
 }
 
 /** Grow a box by `scale` x its width/height on every side (buffered IoU). */
@@ -262,9 +265,12 @@ export class ByteTracker {
     tr.tsu = 0;
   }
 
-  _highCost(tracks, dets) {
-    const s = this.iouBuffer;
-    return iouCost(tracks.map(t => expandBox(t.kf.box, s)), dets.map(d => expandBox(d.box, s)));
+  _cost(tracks, dets, buffer = this.iouBuffer) {
+    const boxes = dets.map(d => expandBox(d.box, buffer));
+    return tracks.map(t => {
+      const box = expandBox(t.kf.box, buffer);
+      return boxes.map((b, i) => t.classId === dets[i].classId ? 1 - boxIoU(box, b) : Infinity);
+    });
   }
 
   _activate(tr) {
@@ -293,7 +299,7 @@ export class ByteTracker {
     const updated = new Set();
 
     // 1. confirmed + lost tracks <-> high-score detections (buffered IoU when iouBuffer > 0)
-    const s1 = linearAssignment(this._highCost(pool, high), this.matchThresh, pool.length, high.length);
+    const s1 = linearAssignment(this._cost(pool, high), this.matchThresh, pool.length, high.length);
     for (const [ti, di] of s1.matches) {
       const tr = pool[ti];
       if (tr.state === 'lost') tr.recoveredNow = true;
@@ -306,7 +312,7 @@ export class ByteTracker {
     const remTracked = s1.unmatchedRows.map(i => pool[i]).filter(t => t.state === 'tracked');
     if (remTracked.length && low.length) {
       const s2 = linearAssignment(
-        iouCost(remTracked.map(t => t.kf.box), low.map(d => d.box)),
+        this._cost(remTracked, low, 0),
         this.secondMatchThresh, remTracked.length, low.length);
       for (const [ti, di] of s2.matches) {
         this._applyDetection(remTracked[ti], low[di], false);
@@ -317,7 +323,7 @@ export class ByteTracker {
     // 3. unconfirmed tracks <-> leftover high-score detections
     const remHigh = s1.unmatchedCols.map(i => high[i]);
     const s3 = linearAssignment(
-      this._highCost(unconfirmed, remHigh), this.unconfirmedMatchThresh, unconfirmed.length, remHigh.length);
+      this._cost(unconfirmed, remHigh), this.unconfirmedMatchThresh, unconfirmed.length, remHigh.length);
     for (const [ti, di] of s3.matches) {
       this._applyDetection(unconfirmed[ti], remHigh[di], true);
       updated.add(unconfirmed[ti].uid);
@@ -335,11 +341,11 @@ export class ByteTracker {
     this.tracks = surviving;
 
     // 5. spawn unconfirmed tracks from leftover high-score detections
-    const occupied = this.tracks.filter(t => updated.has(t.uid)).map(t => t.kf.box);
+    const occupied = this.tracks.filter(t => updated.has(t.uid));
     const leftovers = s3.unmatchedCols.map(i => remHigh[i]).sort((a, b) => b.score - a.score);
     for (const det of leftovers) {
       if (det.score < this.newTrackThresh) continue;
-      if (occupied.length && Math.max(...occupied.map(b => boxIoA(det.box, b))) >= this.spawnOverlapThresh) continue;
+      if (occupied.some(t => t.classId === det.classId && boxIoA(det.box, t.kf.box) >= this.spawnOverlapThresh)) continue;
       const tr = {
         uid: this.nextUid++,
         id: 0,
@@ -357,7 +363,7 @@ export class ByteTracker {
       };
       this.tracks.push(tr);
       updated.add(tr.uid);
-      occupied.push(tr.kf.box);
+      occupied.push(tr);
       if (this.frameId === 1) this._activate(tr);
     }
 
@@ -377,7 +383,7 @@ export class ByteTracker {
     const drop = new Set();
     for (const a of tracked) {
       for (const b of lost) {
-        if (boxIoU(a.kf.box, b.kf.box) > this.duplicateIou) {
+        if (a.classId === b.classId && boxIoU(a.kf.box, b.kf.box) > this.duplicateIou) {
           drop.add(this.frameId - a.startFrame > this.frameId - b.startFrame ? b.uid : a.uid);
         }
       }

@@ -179,6 +179,12 @@ async function init() {
   drawCalibCanvas();
 }
 
+function escapeText(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[ch]);
+}
+
 function renderKpis() {
   const s = DATA.summary, d = DATA.diagnostics;
   const items = [
@@ -190,7 +196,7 @@ function renderKpis() {
     ['Re-ID Backend', DATA.reid_backend || 'none'],
   ];
   document.getElementById('kpis').innerHTML = items.map(([l,v]) =>
-    `<div class="kpi"><div class="lbl">${l}</div><div class="val">${v}</div></div>`
+    `<div class="kpi"><div class="lbl">${l}</div><div class="val">${escapeText(v)}</div></div>`
   ).join('');
 }
 
@@ -207,7 +213,7 @@ function renderMarkers() {
       : e.type === 'reid_cross_exit_merge'
       ? `F${e.frame_idx} Re-ID #${e.raw_track_id}→#${e.canonical_track_id}`
       : `F${e.frame_idx} Recovered #${e.track_id}`;
-    return `<span class="marker ${cls}" onclick="jumpToFrame(${e.frame_idx})">${lbl}</span>`;
+    return `<span class="marker ${cls}" onclick="jumpToFrame(${Number(e.frame_idx)})">${escapeText(lbl)}</span>`;
   }).join('');
 }
 
@@ -226,13 +232,13 @@ function renderCards(cards) {
   grid.innerHTML = cards.map(c => {
     const score = c.search_score !== undefined ? `<div>Match: <b>${c.search_score.toFixed(3)}</b></div>`
       : (c.query_score !== null && c.query_score !== undefined ? `<div>Query: <b>${c.query_score.toFixed(3)}</b></div>` : '');
-    const thumb = c.thumbnail ? `<img src="/${c.thumbnail}" alt="Track #${c.track_id}" />` : '';
-    return `<div class="card ${selectedTrackId === c.track_id ? 'selected' : ''}" onclick="selectTrack(${c.track_id}, ${c.best_frame})">
+    const thumb = /^crops\/track_\d+\.jpg$/.test(c.thumbnail) ? `<img src="/${c.thumbnail}" alt="Track #${Number(c.track_id)}" />` : '';
+    return `<div class="card ${selectedTrackId === c.track_id ? 'selected' : ''}" onclick="selectTrack(${Number(c.track_id)}, ${Number(c.best_frame)})">
       ${thumb}
       <div class="meta">
-        <div style="color:#fff;font-weight:700;">#${c.track_id} · ${c.class_name}</div>
-        <div>F${c.first_frame}–F${c.last_frame} (${c.duration_s}s)</div>
-        <div>Conf ${c.best_confidence}</div>
+        <div style="color:#fff;font-weight:700;">#${Number(c.track_id)} · ${escapeText(c.class_name)}</div>
+        <div>F${Number(c.first_frame)}–F${Number(c.last_frame)} (${Number(c.duration_s)}s)</div>
+        <div>Conf ${Number(c.best_confidence)}</div>
         ${score}
       </div>
     </div>`;
@@ -432,7 +438,7 @@ function renderCompare() {
     ['Tracker', a.summary.tracker, b.summary.tracker],
     ['Model', a.summary.model, b.summary.model],
     ['Avg FPS', a.summary.avg_fps?.toFixed(1), b.summary.avg_fps?.toFixed(1)],
-    ['Unique Tracks (lower = less fragmentation)', a.summary.unique_tracks, b.summary.unique_tracks],
+    ['Unique Tracks', a.summary.unique_tracks, b.summary.unique_tracks],
     ['Possible ID Switches', a.diagnostics.possible_id_switches, b.diagnostics.possible_id_switches],
     ['Track Recoveries', a.diagnostics.recoveries, b.diagnostics.recoveries],
     ['Cross-Exit Re-ID Merges', a.diagnostics.reid_merges, b.diagnostics.reid_merges],
@@ -440,8 +446,8 @@ function renderCompare() {
   ];
   document.getElementById('compareContent').innerHTML = `
     <table>
-      <thead><tr><th>Metric</th><th>Run A (${a.summary.tracker})</th><th>Run B (${b.summary.tracker})</th></tr></thead>
-      <tbody>${rows.map(([m,va,vb]) => `<tr><td>${m}</td><td><b>${va}</b></td><td><b>${vb}</b></td></tr>`).join('')}</tbody>
+      <thead><tr><th>Metric</th><th>Run A (${escapeText(a.summary.tracker)})</th><th>Run B (${escapeText(b.summary.tracker)})</th></tr></thead>
+      <tbody>${rows.map(([m,va,vb]) => `<tr><td>${m}</td><td><b>${escapeText(va)}</b></td><td><b>${escapeText(vb)}</b></td></tr>`).join('')}</tbody>
     </table>`;
 }
 

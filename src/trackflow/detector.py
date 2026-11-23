@@ -1,17 +1,18 @@
-"""Apache-2.0 ONNX Runtime detector supporting D-FINE, RT-DETRv2, and RF-DETR."""
+"""Detector adapters for ONNX Runtime and optional Hugging Face Transformers models."""
 
 from __future__ import annotations
 
 import json
+import platform
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import cv2
 import numpy as np
 import onnxruntime as ort
 
-from trackflow.models import Precision, resolve_detector_artifacts
+from trackflow.models import MODEL_REGISTRY, Precision, resolve_detector_artifacts
 from trackflow.types import Detection
 
 DEFAULT_COCO_LABELS: dict[int, str] = {
@@ -98,23 +99,57 @@ DEFAULT_COCO_LABELS: dict[int, str] = {
 }
 
 
+class Detector(Protocol):
+    """A detector accepts one BGR uint8 frame and returns pixel-space xyxy boxes."""
+
+    def detect(self, frame_bgr: np.ndarray) -> list[Detection]: ...
+
+
+_COCO_ALIASES = {
+    "motorbike": "motorcycle",
+    "aeroplane": "airplane",
+    "sofa": "couch",
+    "pottedplant": "potted plant",
+    "diningtable": "dining table",
+    "tvmonitor": "tv",
+}
+
+
+def _class_key(name: str) -> str:
+    name = name.strip().lower()
+    return _COCO_ALIASES.get(name, name)
+
+
+def _allowed_classes(classes: Sequence[str] | None) -> set[str] | None:
+    if isinstance(classes, str):
+        classes = classes.split(",")
+    names = {_class_key(c) for c in classes or () if c.strip()}
+    if not names or names.intersection({"*", "all"}):
+        return None
+    return names
+
+
 def select_providers(device: str = "auto") -> list[str]:
     """Choose ONNX Runtime execution providers based on requested device."""
     available = ort.get_available_providers()
     req = device.lower().strip()
 
-    if req == "cpu":
-        return ["CPUExecutionProvider"]
-    if req == "cuda":
-        return [p for p in ("CUDAExecutionProvider", "CPUExecutionProvider") if p in available]
-    if req == "coreml":
-        return [p for p in ("CoreMLExecutionProvider", "CPUExecutionProvider") if p in available]
-    if req == "tensorrt":
-        return [
-            p
-            for p in ("TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider")
-            if p in available
-        ]
+    options = {
+        "cpu": ["CPUExecutionProvider"],
+        "cuda": ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        "coreml": ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+        "tensorrt": ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"],
+    }
+    if req != "auto":
+        if req not in options:
+            raise ValueError(
+                f"Unknown ONNX device {device!r}. Choose auto, cpu, coreml, cuda, or tensorrt."
+            )
+        if options[req][0] not in available:
+            raise ValueError(
+                f"{device} requires {options[req][0]}. Available providers: {available}"
+            )
+        return [p for p in options[req] if p in available]
 
     # Auto-selection: prefer NVIDIA CUDA if present, else multi-threaded CPU.
     # (DETR/RF-DETR graphs split into 75–135 partitions on CoreML EP, making CPU 1.4x–3x faster on Apple Silicon;
@@ -130,15 +165,19 @@ def select_providers(device: str = "auto") -> list[str]:
 def create_onnx_session(
     onnx_path: Path,
     device: str = "auto",
+    *,
+    optimization: ort.GraphOptimizationLevel = ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
 ) -> tuple[ort.InferenceSession, str]:
     """Create an ONNX Runtime session with safe fallback to CPU if an EP fails."""
     providers = select_providers(device)
     sess_opts = ort.SessionOptions()
-    sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    sess_opts.graph_optimization_level = optimization
 
     try:
         session = ort.InferenceSession(str(onnx_path), sess_options=sess_opts, providers=providers)
     except Exception:
+        if device.strip().lower() != "auto" or providers == ["CPUExecutionProvider"]:
+            raise
         session = ort.InferenceSession(
             str(onnx_path),
             sess_options=sess_opts,
@@ -147,6 +186,8 @@ def create_onnx_session(
 
     active = session.get_providers()
     active_name = active[0] if active else "CPUExecutionProvider"
+    if device.strip().lower() != "auto" and active_name != providers[0]:
+        raise RuntimeError(f"Could not start {providers[0]}. ONNX Runtime selected {active_name}.")
     return session, active_name
 
 
@@ -194,6 +235,7 @@ def postprocess_detr_outputs(
     allowed_classes: set[str] | None = None,
     max_detections: int = 300,
     nms_iou: float = 0.65,
+    softmax: bool = False,
 ) -> list[Detection]:
     """Convert DETR/RT-DETR/D-FINE/RF-DETR raw logits + normalized cxcywh boxes into Detections."""
     # Squeeze batch dimension [1, N, C] -> [N, C]
@@ -202,11 +244,15 @@ def postprocess_detr_outputs(
     if pred_boxes.ndim == 3:
         pred_boxes = pred_boxes[0]
 
-    probs = sigmoid(logits)
+    if softmax:
+        exp = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        probs = (exp / exp.sum(axis=-1, keepdims=True))[:, :-1]  # trailing no-object class
+    else:
+        probs = sigmoid(logits)
     class_ids = np.argmax(probs, axis=-1)
     scores = probs[np.arange(probs.shape[0]), class_ids]
 
-    keep = scores >= threshold
+    keep = (scores >= threshold) & np.isfinite(pred_boxes).all(axis=-1)
     if not np.any(keep):
         return []
 
@@ -215,14 +261,18 @@ def postprocess_detr_outputs(
     kept_boxes = pred_boxes[keep]
 
     # Stable sort so ties keep query order (web/detector.js mirrors this for parity).
-    order = np.argsort(-kept_scores, kind="stable")[:max_detections]
+    order = np.argsort(-kept_scores, kind="stable")
     orig_h, orig_w = orig_hw
 
     detections: list[Detection] = []
     for idx in order:
         cid = int(kept_classes[idx])
         cname = id2label.get(cid, str(cid))
-        if allowed_classes is not None and cname.lower() not in allowed_classes:
+        if (
+            allowed_classes is not None
+            and cname.lower() not in allowed_classes
+            and _class_key(cname) not in allowed_classes
+        ):
             continue
 
         cx, cy, w, h = kept_boxes[idx].tolist()
@@ -252,7 +302,7 @@ def postprocess_detr_outputs(
             )
         )
 
-    return _nms_class_aware(detections, iou_threshold=nms_iou)
+    return _nms_class_aware(detections, iou_threshold=nms_iou)[:max_detections]
 
 
 class OnnxDetrDetector:
@@ -270,12 +320,10 @@ class OnnxDetrDetector:
     ) -> None:
         self.model_name = model
         self.precision = precision
+        spec = MODEL_REGISTRY.get(model)
+        self.revision = spec.revision if spec else None
         self.threshold = float(threshold)
-        self.allowed_classes = (
-            None
-            if not classes or any(c.lower() in ("*", "all") for c in classes)
-            else {c.lower().strip() for c in classes}
-        )
+        self.allowed_classes = _allowed_classes(classes)
 
         onnx_path, config_path, prep_path = resolve_detector_artifacts(
             model=model,
@@ -290,13 +338,67 @@ class OnnxDetrDetector:
 
         # CoreML EP on int8 quantized DETR graphs can occasionally fail or degrade; prefer CPU for int8.
         effective_device = "cpu" if (device == "auto" and precision == "int8") else device
-        self.session, self.active_provider = create_onnx_session(onnx_path, device=effective_device)
+        cfg = json.loads(config_path.read_text(encoding="utf-8")) if config_path else {}
+        optimization = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # ORT's extended CPU fusions for this signed INT8 graph abort the process on arm64 macOS.
+        if (
+            cfg.get("model_type") == "d_fine"
+            and (precision == "int8" or "int8" in onnx_path.name)
+            and platform.system() == "Darwin"
+            and platform.machine() == "arm64"
+        ):
+            optimization = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        self.session, self.active_provider = create_onnx_session(
+            onnx_path, device=effective_device, optimization=optimization
+        )
 
         self.input_name = self.session.get_inputs()[0].name
-        self.input_dtype = (
-            np.float16 if "float16" in self.session.get_inputs()[0].type else np.float32
-        )
         self.output_names = [o.name for o in self.session.get_outputs()]
+        inputs = {i.name for i in self.session.get_inputs()}
+        self.deployed = inputs == {"images", "orig_target_sizes"} and set(self.output_names) == {
+            "labels",
+            "boxes",
+            "scores",
+        }
+        if self.deployed:
+            self.input_name = "images"
+            if spec and spec.normalize:
+                self.do_normalize = True
+        elif len(inputs) == 1 and {"logits", "pred_boxes"}.issubset(self.output_names):
+            self.raw_outputs = ["logits", "pred_boxes"]
+        elif len(inputs) == 1 and len(self.output_names) == 2:
+            # Legacy two-output exports can use other names or reverse the output order.
+            first, second = self.session.get_outputs()
+            if (
+                len(first.shape) != 3
+                or len(second.shape) != 3
+                or 4 not in (first.shape[-1], second.shape[-1])
+            ):
+                raise ValueError(
+                    "Expected class logits and cxcywh boxes with shape (1, queries, 4)."
+                )
+            self.raw_outputs = (
+                [first.name, second.name] if second.shape[-1] == 4 else [second.name, first.name]
+            )
+        else:
+            raise ValueError(
+                "Expected an ONNX detector with logits/pred_boxes or images + orig_target_sizes and labels/boxes/scores. For other formats supply detector= to TrackflowPipeline."
+            )
+        image_input = next(i for i in self.session.get_inputs() if i.name == self.input_name)
+        if len(image_input.shape) != 4 or image_input.type not in (
+            "tensor(float)",
+            "tensor(float16)",
+        ):
+            raise ValueError("Expected a float32 or float16 NCHW image input.")
+        self.input_dtype = np.float16 if image_input.type == "tensor(float16)" else np.float32
+        h, w = image_input.shape[-2:]
+        if isinstance(h, int) and isinstance(w, int):
+            self.input_hw = (h, w)
+        # The converted YOLO26 graphs use the YOLOS config type but have no background logit.
+        logits_out = next((o for o in self.session.get_outputs() if o.name == "logits"), None)
+        self.softmax = cfg.get("model_type") in ("detr", "yolos", "table-transformer") and (
+            logits_out is not None and logits_out.shape[-1] == max(self.id2label, default=-1) + 2
+        )
 
     @staticmethod
     def _load_labels(config_path: Path | None) -> dict[int, str]:
@@ -319,8 +421,10 @@ class OnnxDetrDetector:
 
         cfg: dict[str, Any] = json.loads(prep_path.read_text(encoding="utf-8"))
         size = cfg.get("size", {})
-        h = int(size.get("height", 640))
-        w = int(size.get("width", 640))
+        if isinstance(size, int):
+            size = {"height": size, "width": size}
+        h = int(size.get("height", size.get("shortest_edge", 640)))
+        w = int(size.get("width", size.get("shortest_edge", 640)))
         do_rescale = bool(cfg.get("do_rescale", True))
         do_normalize = bool(cfg.get("do_normalize", False))
         mean = np.array(cfg.get("image_mean", [0.485, 0.456, 0.406]), dtype=np.float32).reshape(
@@ -347,18 +451,167 @@ class OnnxDetrDetector:
     def detect(self, frame_bgr: np.ndarray, threshold: float | None = None) -> list[Detection]:
         """Run object detection on a single BGR frame."""
         orig_h, orig_w = frame_bgr.shape[:2]
+        cutoff = self.threshold if threshold is None else threshold
+        if self.deployed:
+            # Upstream DEIMv2 / RT-DETRv4 deployment graphs take a black-letterboxed RGB
+            # image and emit xyxy in the coordinate system supplied via orig_target_sizes.
+            h, w = self.input_hw
+            scale = min(w / orig_w, h / orig_h)
+            rw, rh = max(1, int(orig_w * scale)), max(1, int(orig_h * scale))
+            left, top = (w - rw) // 2, (h - rh) // 2
+            padded = np.zeros((h, w, 3), dtype=np.uint8)
+            padded[top : top + rh, left : left + rw] = cv2.resize(frame_bgr, (rw, rh))
+            labels, boxes, scores = self.session.run(
+                ["labels", "boxes", "scores"],
+                {
+                    "images": self.preprocess(padded),
+                    "orig_target_sizes": np.array([[w, h]], dtype=np.int64),
+                },
+            )
+            boxes = (boxes[0] - [left, top, left, top]) / [
+                rw / orig_w,
+                rh / orig_h,
+                rw / orig_w,
+                rh / orig_h,
+            ]
+            return _pixel_detections(
+                labels[0],
+                boxes,
+                scores[0],
+                (orig_h, orig_w),
+                self.id2label,
+                self.allowed_classes,
+                cutoff,
+            )
         tensor = self.preprocess(frame_bgr)
-        outputs = self.session.run(None, {self.input_name: tensor})
-
-        by_name = dict(zip(self.output_names, outputs, strict=False))
-        logits = by_name.get("logits", outputs[0])
-        pred_boxes = by_name.get("pred_boxes", outputs[1])
+        logits, pred_boxes = self.session.run(self.raw_outputs, {self.input_name: tensor})
 
         return postprocess_detr_outputs(
             logits=np.asarray(logits, dtype=np.float32),
             pred_boxes=np.asarray(pred_boxes, dtype=np.float32),
             orig_hw=(orig_h, orig_w),
             id2label=self.id2label,
-            threshold=self.threshold if threshold is None else threshold,
+            threshold=cutoff,
             allowed_classes=self.allowed_classes,
+            softmax=self.softmax,
         )
+
+
+def _pixel_detections(
+    labels: np.ndarray,
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    orig_hw: tuple[int, int],
+    id2label: dict[int, str],
+    allowed: set[str] | None,
+    threshold: float,
+) -> list[Detection]:
+    h, w = orig_hw
+    detections = []
+    for i in np.flatnonzero(scores >= threshold):
+        cid = int(labels[i])
+        name = id2label.get(cid, str(cid))
+        if allowed is not None and _class_key(name) not in allowed:
+            continue
+        x1, y1, x2, y2 = np.clip(boxes[i], 0, [w, h, w, h]).tolist()
+        if x2 - x1 >= 2 and y2 - y1 >= 2:
+            detections.append(Detection((x1, y1, x2, y2), float(scores[i]), cid, name))
+    detections.sort(key=lambda d: d.confidence, reverse=True)
+    return _nms_class_aware(detections, 0.65)
+
+
+class TransformersDetector:
+    """Use a native Transformers object-detection checkpoint and its own image processor."""
+
+    def __init__(
+        self,
+        repo_id: str,
+        *,
+        revision: str | None,
+        device: str,
+        precision: Precision,
+        threshold: float,
+        classes: Sequence[str] | None,
+        cache_dir: str | Path | None,
+    ) -> None:
+        try:
+            import torch
+            from transformers import AutoImageProcessor, AutoModelForObjectDetection
+        except ImportError as exc:
+            raise ImportError(
+                "Install 'trackflow-python[transformers]' to load native Transformers checkpoints."
+            ) from exc
+        if device == "auto":
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        if device not in ("cpu", "cuda", "mps"):
+            raise ValueError("Transformers supports --device auto, cpu, cuda, or mps.")
+        if precision not in ("fp32", "fp16"):
+            raise ValueError("Transformers detectors support fp32 or fp16.")
+        self.model_name = repo_id
+        self.device = device
+        self.precision = precision
+        self.dtype = torch.float32 if precision == "fp32" else torch.float16
+        kwargs = {"revision": revision, "cache_dir": cache_dir, "trust_remote_code": False}
+        self.processor = AutoImageProcessor.from_pretrained(repo_id, **kwargs)
+        self.model = (
+            AutoModelForObjectDetection.from_pretrained(repo_id, use_safetensors=True, **kwargs)
+            .to(device=device, dtype=self.dtype)
+            .eval()
+        )
+        self.revision = revision or getattr(self.model.config, "_commit_hash", None)
+        self.active_provider = f"torch:{device}"
+        self.threshold = threshold
+        self.allowed_classes = _allowed_classes(classes)
+
+    def detect(self, frame_bgr: np.ndarray) -> list[Detection]:
+        import torch
+
+        hw = frame_bgr.shape[:2]
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        with torch.inference_mode():
+            inputs = self.processor(images=rgb, return_tensors="pt").to(self.device, self.dtype)
+            output = self.model(**inputs)
+            result = self.processor.post_process_object_detection(
+                output, threshold=self.threshold, target_sizes=[hw]
+            )[0]
+        return _pixel_detections(
+            result["labels"].cpu().numpy(),
+            result["boxes"].float().cpu().numpy(),
+            result["scores"].float().cpu().numpy(),
+            hw,
+            self.model.config.id2label,
+            self.allowed_classes,
+            self.threshold,
+        )
+
+
+def create_detector(
+    model: str | Path = "rtdetr-v2-r18",
+    *,
+    precision: Precision = "fp32",
+    device: str = "auto",
+    threshold: float = 0.45,
+    classes: Sequence[str] | None = ("person",),
+    cache_dir: str | Path | None = None,
+) -> Detector:
+    """Load a preset, compatible ONNX graph/repository, or hf:owner/repo Transformers checkpoint."""
+    model = str(model)
+    spec = MODEL_REGISTRY.get(model)
+    if model.startswith("hf:") or (spec and spec.backend == "transformers"):
+        return TransformersDetector(
+            spec.repo_id if spec else model.removeprefix("hf:"),
+            revision=spec.revision if spec else None,
+            device=device,
+            precision=precision,
+            threshold=threshold,
+            classes=classes,
+            cache_dir=cache_dir,
+        )
+    return OnnxDetrDetector(
+        model,
+        precision=precision,
+        device=device,
+        threshold=threshold,
+        classes=classes,
+        cache_dir=cache_dir,
+    )

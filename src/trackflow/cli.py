@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import platform
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated
 
@@ -27,25 +31,37 @@ from trackflow.benchmark import (
 )
 from trackflow.inspector import serve_inspector
 from trackflow.models import MODEL_REGISTRY, REID_REGISTRY, VLM_REGISTRY
-from trackflow.pipeline import TrackflowPipeline
+from trackflow.pipeline import TrackflowPipeline, fresh_run_dir
 from trackflow.reid import search_track_cards
 
 app = typer.Typer(
     name="trackflow",
     help="Real-time people and object tracking with ONNX detectors, ByteTrack/BoT-SORT, text search, and a local inspector.",
     no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
     rich_markup_mode="rich",
 )
 console = Console()
 
 
+@contextmanager
+def _user_errors() -> Iterator[None]:
+    try:
+        yield
+    except (ValueError, FileExistsError, FileNotFoundError, ImportError, RuntimeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
 @app.command()
 def run(
     source: Annotated[
-        str, typer.Argument(help="Video path, image directory, or 'camera' / webcam index.")
+        str, typer.Argument(help="Video path, image directory, RTSP/HTTP URL, or camera index.")
     ],
     model: Annotated[
-        str, typer.Option("--model", "-m", help="Detector preset, HF repo, or local .onnx path.")
+        str,
+        typer.Option(
+            "--model", "-m", help="Preset, ONNX repo/file, or hf:owner/repo Transformers detector."
+        ),
     ] = "rtdetr-v2-r18",
     precision: Annotated[
         str, typer.Option("--precision", help="Model precision: fp32, fp16, or int8.")
@@ -54,10 +70,16 @@ def run(
         str, typer.Option("--tracker", "-t", help="Tracker: bytetrack or botsort.")
     ] = "bytetrack",
     device: Annotated[
-        str, typer.Option("--device", "-d", help="Execution device: auto, coreml, cuda, cpu.")
+        str,
+        typer.Option(
+            "--device",
+            "-d",
+            help="ONNX: auto, cpu, cuda, coreml, tensorrt. Transformers: auto, cpu, cuda, mps.",
+        ),
     ] = "auto",
     threshold: Annotated[
-        float, typer.Option("--threshold", help="Detection confidence threshold.")
+        float,
+        typer.Option("--threshold", min=0.0, max=1.0, help="High-confidence tracking threshold."),
     ] = 0.45,
     classes: Annotated[
         str, typer.Option("--classes", "-c", help="Comma-separated class names, or 'all'.")
@@ -88,7 +110,9 @@ def run(
     query: Annotated[
         str | None,
         typer.Option(
-            "--query", "-q", help='Highlight tracks matching a text description, e.g. "person in red jacket".'
+            "--query",
+            "-q",
+            help='Highlight tracks matching a text description, e.g. "person in red jacket".',
         ),
     ] = None,
     query_threshold: Annotated[
@@ -104,18 +128,29 @@ def run(
     homography: Annotated[
         Path | None, typer.Option("--homography", help="4-point floorplan calibration JSON file.")
     ] = None,
-    skip: Annotated[int, typer.Option("--skip", help="Skip N frames between detections.")] = 0,
+    skip: Annotated[
+        int, typer.Option("--skip", min=0, help="Skip N frames between detections.")
+    ] = 0,
     max_frames: Annotated[
-        int | None, typer.Option("--max-frames", help="Stop after N frames.")
+        int | None, typer.Option("--max-frames", min=1, help="Stop after N source frames.")
+    ] = None,
+    fps: Annotated[
+        float | None,
+        typer.Option("--fps", help="Override source frame rate (image sequences default to 25)."),
     ] = None,
     output: Annotated[
-        Path, typer.Option("--output", "-o", help="Output directory for run artifacts.")
-    ] = Path("runs/latest"),
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Empty output directory. By default a fresh directory under runs/.",
+        ),
+    ] = None,
     save_video: Annotated[
         bool, typer.Option("--save-video/--no-video", help="Save annotated MP4 video.")
     ] = True,
     export: Annotated[
-        str, typer.Option("--export", help="Comma-separated exports: parquet,jsonl,csv,html.")
+        str, typer.Option("--export", help="Comma-separated exports: parquet,jsonl,csv,mot,html.")
     ] = "parquet,jsonl,html",
     display: Annotated[
         bool, typer.Option("--display", help="Show live preview window if OpenCV GUI is available.")
@@ -130,47 +165,49 @@ def run(
         f"tracker=[bold]{tracker}[/] · privacy=[bold]{anonymize}[/]"
     )
 
-    pipeline = TrackflowPipeline(
-        model=model,
-        precision=precision,  # type: ignore[arg-type]
-        tracker=tracker,
-        device=device,
-        threshold=threshold,
-        classes=class_list,
-        reid=reid,  # type: ignore[arg-type]
-        vlm=vlm,  # type: ignore[arg-type]
-        reid_merge=reid_merge,
-        query=query,
-        query_threshold=query_threshold,
-        anonymize=anonymize,  # type: ignore[arg-type]
-        homography=homography,
-    )
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        console=console,
-    ) as progress:
-        task_id = progress.add_task("Tracking…", total=None)
-
-        def _on_progress(done: int, total: int, fps: float) -> None:
-            if total > 0:
-                progress.update(task_id, total=total)
-            progress.update(task_id, completed=done, description=f"Tracking ({fps:.1f} FPS)")
-
-        summary = pipeline.run(
-            source,
-            output_dir=output,
-            skip=skip,
-            max_frames=max_frames,
-            save_video=save_video,
-            exports=export_list,
-            display=display,
-            progress_callback=_on_progress,
+    with _user_errors():
+        pipeline = TrackflowPipeline(
+            model=model,
+            precision=precision,  # type: ignore[arg-type]
+            tracker=tracker,
+            device=device,
+            threshold=threshold,
+            classes=class_list,
+            reid=reid,  # type: ignore[arg-type]
+            vlm=vlm,  # type: ignore[arg-type]
+            reid_merge=reid_merge,
+            query=query,
+            query_threshold=query_threshold,
+            anonymize=anonymize,  # type: ignore[arg-type]
+            homography=homography,
         )
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task_id = progress.add_task("Tracking…", total=None)
+
+            def _on_progress(done: int, total: int, fps: float) -> None:
+                if total > 0:
+                    progress.update(task_id, total=total)
+                progress.update(task_id, completed=done, description=f"Tracking ({fps:.1f} FPS)")
+
+            summary = pipeline.run(
+                source,
+                output_dir=output,
+                skip=skip,
+                fps=fps,
+                max_frames=max_frames,
+                save_video=save_video,
+                exports=export_list,
+                display=display,
+                progress_callback=_on_progress,
+            )
 
     table = Table(title="Run Summary", show_header=False, box=None)
     table.add_row("Provider", f"[cyan]{summary.device}[/]")
@@ -205,7 +242,8 @@ def search(
     ] = -1.0,
 ) -> None:
     """Search saved Track Cards in a completed run using natural language."""
-    hits = search_track_cards(run_dir, query, top_k=top_k, min_score=min_score)
+    with _user_errors():
+        hits = search_track_cards(run_dir, query, top_k=top_k, min_score=min_score)
     table = Table(title=f'Track Card Search: "{query}"')
     table.add_column("Track ID", style="bold cyan")
     table.add_column("Score", justify="right", style="bold green")
@@ -228,7 +266,10 @@ def search(
 
 @app.command()
 def inspect(
-    run_dir: Annotated[Path, typer.Argument(help="Completed Trackflow run directory to inspect.")],
+    run_dir: Annotated[
+        Path | None,
+        typer.Argument(help="Completed run. Defaults to the most recent run under runs/."),
+    ] = None,
     compare: Annotated[
         Path | None,
         typer.Option(
@@ -242,6 +283,13 @@ def inspect(
     ] = False,
 ) -> None:
     """Open the local web inspector for a completed run (timeline, track cards, floorplan, compare)."""
+    if run_dir is None:
+        latest = max(
+            Path("runs").glob("*/summary.json"), key=lambda p: p.stat().st_mtime_ns, default=None
+        )
+        if latest is None:
+            raise typer.BadParameter("No completed runs under runs/. Supply a run directory.")
+        run_dir = latest.parent
     console.print(
         f"[bold green]Trackflow Inspector[/] running at [link=http://{host}:{port}]http://{host}:{port}[/]"
     )
@@ -269,8 +317,13 @@ def compare(
         int | None, typer.Option("--max-frames", help="Limit frames for quick comparison.")
     ] = None,
     output: Annotated[
-        Path, typer.Option("--output", "-o", help="Parent directory for both runs.")
-    ] = Path("runs/compare"),
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Parent directory for both runs. By default a fresh directory under runs/.",
+        ),
+    ] = None,
     open_inspector: Annotated[
         bool, typer.Option("--inspect", help="Open the local inspector after comparing.")
     ] = False,
@@ -283,11 +336,13 @@ def compare(
         )
 
     runs: list[tuple[str, Path, object]] = []
-    for tname in names[:2]:
-        sub = output / tname
-        pipe = TrackflowPipeline(model=model, tracker=tname)
-        summary = pipe.run(source, output_dir=sub, max_frames=max_frames, save_video=False)
-        runs.append((tname, sub, summary))
+    with _user_errors():
+        parent = output if output is not None else fresh_run_dir("compare")
+        for tname in names[:2]:
+            sub = parent / tname
+            pipe = TrackflowPipeline(model=model, tracker=tname)
+            summary = pipe.run(source, output_dir=sub, max_frames=max_frames, save_video=False)
+            runs.append((tname, sub, summary))
 
     table = Table(title=f"Tracker Comparison ({model})")
     table.add_column("Metric", style="bold")
@@ -324,29 +379,36 @@ def benchmark(
     ] = "auto",
     max_frames: Annotated[int, typer.Option("--max-frames", help="Max frames per run.")] = 90,
     output: Annotated[
-        Path, typer.Option("--output", "-o", help="Benchmark output directory.")
-    ] = Path("runs/benchmark"),
+        Path | None,
+        typer.Option(
+            "--output",
+            "-o",
+            help="Benchmark output directory. By default a fresh directory under runs/.",
+        ),
+    ] = None,
     split_screen: Annotated[
         bool, typer.Option("--split-screen", help="Generate a 2017 vs. 2026 split-screen MP4.")
     ] = False,
 ) -> None:
     """Benchmark detector and tracker combinations on a video."""
-    output.mkdir(parents=True, exist_ok=True)
-    target_video = (
-        video
-        if video is not None
-        else generate_synthetic_crowd_video(output / "synthetic_crowd.mp4")
-    )
+    with _user_errors():
+        output = output if output is not None else fresh_run_dir("benchmark")
+        output.mkdir(parents=True, exist_ok=True)
+        target_video = (
+            video
+            if video is not None
+            else generate_synthetic_crowd_video(output / "synthetic_crowd.mp4")
+        )
 
-    res = run_benchmark_suite(
-        target_video,
-        output_dir=output,
-        models=[m.strip() for m in models.split(",") if m.strip()],
-        trackers=[t.strip() for t in trackers.split(",") if t.strip()],
-        device=device,
-        max_frames=max_frames,
-        split_screen=split_screen,
-    )
+        res = run_benchmark_suite(
+            target_video,
+            output_dir=output,
+            models=[m.strip() for m in models.split(",") if m.strip()],
+            trackers=[t.strip() for t in trackers.split(",") if t.strip()],
+            device=device,
+            max_frames=max_frames,
+            split_screen=split_screen,
+        )
 
     table = Table(title="2017 vs. 2026 Benchmark Results")
     table.add_column("Config")
@@ -359,7 +421,7 @@ def benchmark(
         f"[dim]2017 {LEGACY_2017_BASELINE['detector']} + DeepSORT[/]",
         f"[dim]{LEGACY_2017_BASELINE['hardware']}[/]",
         f"[dim]{LEGACY_2017_BASELINE['avg_fps']:.1f}[/]",
-        "[dim]~71.4[/]",
+        "[dim]—[/]",
         "[dim]—[/]",
     )
     for row in res["results"]:
@@ -375,11 +437,30 @@ def benchmark(
 
 
 @app.command()
-def models() -> None:
+def models(
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print the model catalog as JSON.")
+    ] = False,
+) -> None:
     """List built-in detectors, person Re-ID models, and vision-language models."""
-    det_table = Table(title="Built-in ONNX Object Detectors (Auto-Downloaded from Hugging Face)")
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "detectors": [
+                        {**asdict(s), "precisions": s.precisions} for s in MODEL_REGISTRY.values()
+                    ],
+                    "reid": [asdict(s) for s in REID_REGISTRY.values()],
+                    "vlm": [asdict(s) for s in VLM_REGISTRY.values()],
+                },
+                indent=2,
+            )
+        )
+        return
+    det_table = Table(title="Object Detectors")
     det_table.add_column("Preset", style="bold cyan")
     det_table.add_column("Architecture")
+    det_table.add_column("Runtime")
     det_table.add_column("Size", justify="right")
     det_table.add_column("License", style="green")
     det_table.add_column("Hugging Face Repo", style="dim")
@@ -388,6 +469,7 @@ def models() -> None:
         det_table.add_row(
             spec.name,
             spec.architecture,
+            spec.backend,
             f"{spec.approx_size_mb:.1f} MB",
             spec.license,
             spec.repo_id,
