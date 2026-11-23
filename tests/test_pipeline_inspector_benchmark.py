@@ -184,3 +184,8 @@ def test_cli_smoke_commands(tmp_path: Path, monkeypatch) -> None:
     # Reusing an explicit non-empty output is a clear usage error, not a traceback.
     res = runner.invoke(app, ["compare", str(vid), "-o", "runs/compare-1"])
     assert res.exit_code == 2 and "not empty" in res.output
+
+    # A run that fails on its input leaves no empty run folder behind.
+    res = runner.invoke(app, ["run", str(tmp_path / "missing.mp4")])
+    assert res.exit_code == 2
+    assert not (tmp_path / "runs" / "run-3").exists()

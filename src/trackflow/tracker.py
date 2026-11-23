@@ -1,4 +1,7 @@
-"""Pure NumPy/SciPy ByteTrack and BoT-SORT multi-object trackers with Kalman filtering & CMC.
+"""Pure NumPy/SciPy multi-object trackers with Kalman filtering & CMC.
+
+This module holds ByteTrack, BoT-SORT, the track lifecycle shared by the SORT-style trackers in
+:mod:`trackflow.ocsort` and :mod:`trackflow.boosttrack`, and :func:`create_tracker`.
 
 ``web/tracker.js`` is a direct port of :class:`ByteTracker` for the browser playground. Keep the
 two in sync: ``tests/test_web_parity.py`` replays the same recorded detections through both and
@@ -311,6 +314,24 @@ def _expand_boxes(boxes: np.ndarray, scale: float) -> np.ndarray:
     )
 
 
+def _switch_event(
+    new_id: int, box: tuple[float, float, float, float], recently_lost: list[tuple[int, Any]]
+) -> dict[str, Any] | None:
+    """Flag a possible ID switch when a new ID appears where another ID was just lost."""
+    if not recently_lost:
+        return None
+    ious = compute_iou_matrix(np.array([box]), np.array([b for _, b in recently_lost]))[0]
+    j = int(np.argmax(ious))
+    if float(ious[j]) < 0.25:
+        return None
+    return {
+        "type": "possible_id_switch",
+        "new_track_id": new_id,
+        "previous_track_id": recently_lost[j][0],
+        "iou": round(float(ious[j]), 3),
+    }
+
+
 def iou_buffer_for_interval(dt_s: float) -> float:
     """Buffered-IoU scale for a given time between processed frames.
 
@@ -341,6 +362,9 @@ class ByteTracker:
     """
 
     name: str = "bytetrack"
+    # Minimum detection confidence for which the pipeline computes person Re-ID embeddings;
+    # None when the tracker doesn't use appearance.
+    embedding_min_confidence: float | None = None
 
     def __init__(
         self,
@@ -421,28 +445,20 @@ class ByteTracker:
         tr.track_id = self._next_id
         self._next_id += 1
         events.append({"type": "track_started", "track_id": tr.track_id})
-
-        # Flag a possible ID switch if the new ID appears where another ID was just lost.
-        recently_lost = [
-            t
-            for t in self._tracks
-            if t.state == "lost"
-            and t.class_id == tr.class_id
-            and t.is_activated
-            and t.time_since_update <= 5
-        ]
-        if recently_lost:
-            ious = compute_iou_matrix(_boxes([tr]), _boxes(recently_lost))[0]
-            j = int(np.argmax(ious))
-            if float(ious[j]) >= 0.25:
-                events.append(
-                    {
-                        "type": "possible_id_switch",
-                        "new_track_id": tr.track_id,
-                        "previous_track_id": recently_lost[j].track_id,
-                        "iou": round(float(ious[j]), 3),
-                    }
-                )
+        switch = _switch_event(
+            tr.track_id,
+            tr.bbox,
+            [
+                (t.track_id, t.bbox)
+                for t in self._tracks
+                if t.state == "lost"
+                and t.class_id == tr.class_id
+                and t.is_activated
+                and t.time_since_update <= 5
+            ],
+        )
+        if switch is not None:
+            events.append(switch)
 
     @staticmethod
     def _apply_detection(tr: _TrackState, det: Detection, *, update_class: bool) -> None:
@@ -646,6 +662,8 @@ class BotSortTracker(ByteTracker):
         self.proximity_thresh = float(proximity_thresh)
         self.appearance_thresh = float(appearance_thresh)
         self._cmc = SparseOpticalFlowCMC() if use_cmc else None
+        # Appearance is fused into the first association, which only sees high-score detections.
+        self.embedding_min_confidence = self.track_high_thresh
 
     def reset(self) -> None:
         super().reset()
@@ -694,6 +712,198 @@ class BotSortTracker(ByteTracker):
         return np.minimum(iou_dist, emb_dist)
 
 
+def _assign(
+    similarity: np.ndarray, valid: np.ndarray
+) -> tuple[list[tuple[int, int]], list[int], list[int]]:
+    """Pair rows and columns to maximize total ``similarity`` over the ``valid`` pairs only."""
+    cost = np.where(valid, -np.maximum(similarity, 0.0), np.inf)
+    return _linear_assignment(cost, 0.0)
+
+
+@dataclass(eq=False)
+class _SortTrack:
+    """One track of a SORT-style tracker.
+
+    ``motion`` is the tracker's per-track model. It provides ``predict()`` and a ``box`` property
+    with its current estimate, which is what coasting tracks report.
+    """
+
+    uid: int
+    motion: Any
+    class_id: int
+    class_name: str
+    confidence: float
+    box: tuple[float, float, float, float]  # reported while the track is observed
+    track_id: int = 0  # public ID, assigned on confirmation
+    age: int = 0  # predictions since the spawn frame
+    hits: int = 1  # matched detections, counting the one that spawned the track
+    hit_streak: int = 0  # consecutive matched frames after the spawn frame
+    time_since_update: int = 0
+    reported: bool = False  # output this frame
+    recovering: bool = False  # confirmed, missed, matched again, not yet reported again
+    recovered_now: bool = False
+    embedding: np.ndarray | None = field(default=None, repr=False)
+
+    def to_track(self, *, coasting: bool = False) -> Track:
+        return Track(
+            track_id=self.track_id,
+            bbox=self.motion.box if coasting else self.box,
+            confidence=self.confidence,
+            class_id=self.class_id,
+            class_name=self.class_name,
+            age=self.age + 1,
+            hits=self.hits,
+            recovered=self.recovered_now and not coasting,
+            coasting=coasting,
+        )
+
+    def blend_embedding(self, emb: np.ndarray | None, alpha: float) -> None:
+        """Exponential moving average of unit embeddings; ``alpha`` weights the old value."""
+        if emb is None:
+            return
+        norm = float(np.linalg.norm(emb))
+        if norm <= 1e-6:
+            return
+        unit = np.asarray(emb, dtype=np.float64) / norm
+        if self.embedding is None:
+            self.embedding = unit
+            return
+        blended = alpha * self.embedding + (1.0 - alpha) * unit
+        self.embedding = blended / max(float(np.linalg.norm(blended)), 1e-6)
+
+
+class _SortStyleTracker:
+    """Track lifecycle shared by the SORT-style trackers (OC-SORT, BoostTrack).
+
+    It follows SORT's conventions. Every track is predicted each frame. A track is reported on a
+    frame when that frame ends a run of ``min_hits`` consecutive matched frames; the frame that
+    spawned the track doesn't count. During the first ``min_hits`` frames, a match is enough. A
+    track gets its public ID the first time it is reported. After a miss it is not reported
+    again until it has a new run of ``min_hits`` matches, but :meth:`coasting_tracks` still
+    returns it. A track is dropped after ``max_age`` frames without a match.
+    """
+
+    name: str = "sort"
+    embedding_min_confidence: float | None = None
+
+    def __init__(self, *, max_age: int, min_hits: int) -> None:
+        if max_age < 1 or min_hits < 0:
+            raise ValueError("max_age must be positive and min_hits nonnegative.")
+        # Frames a lost track stays recoverable; Re-ID merging waits this long.
+        self.track_buffer = int(max_age)
+        self.min_hits = int(min_hits)
+        self.reset()
+
+    def reset(self) -> None:
+        self._next_id = 1
+        self._next_uid = 1
+        self._frame_id = 0
+        self._tracks: list[_SortTrack] = []
+        self.last_events: list[dict[str, Any]] = []
+
+    def _spawn(self, det: Detection, motion: Any) -> _SortTrack:
+        tr = _SortTrack(
+            uid=self._next_uid,
+            motion=motion,
+            class_id=det.class_id,
+            class_name=det.class_name,
+            confidence=det.confidence,
+            box=det.bbox,
+        )
+        self._next_uid += 1
+        self._tracks.append(tr)
+        return tr
+
+    def _predict(self) -> None:
+        for tr in self._tracks:
+            tr.recovered_now = False
+            tr.reported = False
+            tr.motion.predict()
+            tr.age += 1
+            if tr.time_since_update > 0:
+                tr.hit_streak = 0
+            tr.time_since_update += 1
+
+    @staticmethod
+    def _observe(
+        tr: _SortTrack,
+        det: Detection,
+        box: tuple[float, float, float, float],
+    ) -> None:
+        """Record that ``tr`` matched ``det`` this frame and will report ``box``."""
+        if tr.track_id and tr.time_since_update > 1:
+            tr.recovering = True
+        tr.time_since_update = 0
+        tr.hits += 1
+        tr.hit_streak += 1
+        tr.confidence = det.confidence
+        tr.box = box
+
+    def _finish_frame(self, events: list[dict[str, Any]]) -> list[Track]:
+        """Confirm, report, and expire tracks once this frame's matches are applied."""
+        for tr in self._tracks:
+            tr.reported = tr.time_since_update == 0 and (
+                tr.hit_streak >= self.min_hits or self._frame_id <= self.min_hits
+            )
+            if not tr.reported:
+                continue
+            if tr.recovering:
+                tr.recovering = False
+                tr.recovered_now = True
+                events.append({"type": "track_recovered", "track_id": tr.track_id})
+            if not tr.track_id:
+                tr.track_id = self._next_id
+                self._next_id += 1
+                events.append({"type": "track_started", "track_id": tr.track_id})
+                switch = _switch_event(
+                    tr.track_id,
+                    tr.box,
+                    [
+                        (t.track_id, t.motion.box)
+                        for t in self._tracks
+                        if t.track_id
+                        and t.class_id == tr.class_id
+                        and 1 <= t.time_since_update <= 5
+                    ],
+                )
+                if switch is not None:
+                    events.append(switch)
+
+        outputs: list[Track] = []
+        surviving: list[_SortTrack] = []
+        for tr in self._tracks:
+            if tr.reported:
+                outputs.append(tr.to_track())
+            elif tr.track_id and tr.time_since_update == 1 and not tr.recovering:
+                events.append({"type": "track_lost", "track_id": tr.track_id})
+            if tr.time_since_update > self.track_buffer:
+                if tr.track_id:
+                    events.append({"type": "track_ended", "track_id": tr.track_id})
+                continue
+            surviving.append(tr)
+        self._tracks = surviving
+        self.last_events = events
+        outputs.sort(key=lambda t: t.track_id)
+        return outputs
+
+    def coasting_tracks(self, max_frames: int = 3) -> list[Track]:
+        """Confirmed tracks not reported this frame, at the filter's estimate.
+
+        That is tracks missed for at most ``max_frames`` frames, and tracks matched again that
+        are still rebuilding their hit streak. They are never written to exports.
+        """
+        out = [
+            t.to_track(coasting=True)
+            for t in self._tracks
+            if t.track_id and not t.reported and t.time_since_update <= max_frames
+        ]
+        out.sort(key=lambda t: t.track_id)
+        return out
+
+
+TRACKER_NAMES = ("bytetrack", "botsort", "ocsort", "boosttrack")
+
+
 def create_tracker(
     tracker_name: str = "bytetrack",
     *,
@@ -702,8 +912,13 @@ def create_tracker(
     new_track_thresh: float = 0.55,
     track_buffer: int = 30,
     iou_buffer: float = 0.0,
-) -> ByteTracker:
-    """Factory for built-in multi-object trackers."""
+) -> Tracker:
+    """Factory for the built-in multi-object trackers, named as in :data:`TRACKER_NAMES`.
+
+    OC-SORT and BoostTrack start a track from any unmatched detection at or above
+    ``track_high_thresh``, as their reference implementations do, so they ignore
+    ``new_track_thresh``.
+    """
     key = tracker_name.lower().strip().replace("-", "_")
     if key in ("bytetrack", "byte"):
         return ByteTracker(
@@ -721,4 +936,21 @@ def create_tracker(
             track_buffer=max(track_buffer, 45),
             iou_buffer=iou_buffer,
         )
-    raise ValueError(f"Unknown tracker '{tracker_name}'. Choose 'bytetrack' or 'botsort'.")
+    if key in ("ocsort", "oc_sort"):
+        from trackflow.ocsort import OcSortTracker
+
+        return OcSortTracker(
+            det_thresh=track_high_thresh,
+            low_thresh=track_low_thresh,
+            max_age=track_buffer,
+            iou_buffer=iou_buffer,
+        )
+    if key in ("boosttrack", "boost_track", "boosttrack++", "boosttrackpp"):
+        from trackflow.boosttrack import BoostTracker
+
+        return BoostTracker(
+            det_thresh=track_high_thresh, max_age=track_buffer, iou_buffer=iou_buffer
+        )
+    raise ValueError(
+        f"Unknown tracker '{tracker_name}'. Choose one of: {', '.join(TRACKER_NAMES)}."
+    )
