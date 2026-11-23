@@ -62,18 +62,20 @@ GROUP BY track_id ORDER BY frames DESC;
 
 All four keep a person and a bag in the same box as separate tracks, and only give out an ID once a track has been seen on more than one frame. OC-SORT and BoostTrack report a track again after a miss once it has matched three frames in a row; in between, the annotated video shows it as a coasting box. The browser playground uses ByteTrack.
 
-Scores on two labeled MOT17 sequences, with the default detector on CPU:
+Scores on MOT17, over the second half of each of its 7 training sequences (2,652 frames, the `val` split of Roboflow's [MOT17 download](https://trackers.roboflow.com/develop/evaluations/download/)), with the default detector on CPU:
 
-| Tracker | MOT17-05 HOTA | IDF1 | MOTA | MOT17-09 HOTA | IDF1 | MOTA |
-| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `bytetrack` | 42.7 | 57.1 | 40.8 | 47.9 | 57.9 | 51.0 |
-| `botsort` | 44.6 | 60.4 | 42.7 | 48.0 | 57.7 | 50.9 |
-| `ocsort` | 43.7 | 59.2 | 46.5 | 45.7 | 54.2 | 56.6 |
-| `boosttrack` | 43.7 | 59.2 | 43.9 | 45.4 | 52.8 | 53.5 |
-| `botsort --reid osnet` | 45.2 | 61.5 | 43.1 | 49.0 | 60.0 | 52.7 |
-| `boosttrack --reid osnet` | 45.2 | 61.7 | 43.8 | 47.0 | 55.8 | 53.8 |
+| Tracker | HOTA | IDF1 | MOTA | ID switches |
+| :--- | ---: | ---: | ---: | ---: |
+| `bytetrack` | 45.1 | 54.0 | 40.1 | 281 |
+| `botsort` | 45.7 | 55.0 | 40.2 | 193 |
+| `ocsort` | 44.7 | 53.6 | 39.3 | 244 |
+| `boosttrack` | 45.3 | 54.2 | 40.2 | 240 |
+| `botsort --reid osnet` | 46.1 | 55.7 | 40.5 | 170 |
+| `boosttrack --reid osnet` | 45.9 | 55.6 | 40.2 | 240 |
 
-No tracker wins everywhere. On MOT17-05, filmed from a moving camera at 14 FPS, every newer tracker beats ByteTrack. On MOT17-09, from a static camera, ByteTrack and BoT-SORT stay ahead on HOTA. OC-SORT has the highest MOTA on both sequences. With OSNet, BoT-SORT and BoostTrack tie on MOT17-05, and BoT-SORT is best on MOT17-09. BoostTrack with `--reid osnet` is slower than BoT-SORT because it embeds every person detection, including weak ones it might boost. Two sequences are not a benchmark, so compare trackers on your own footage with `trackflow compare` or `--export mot`.
+The four trackers are within 1.4 HOTA of each other. BoT-SORT with `--reid osnet` scores highest and has the fewest ID switches. BoostTrack with `--reid osnet` comes close but is slower, because it embeds every person detection, including weak ones it might boost. The detector matters more than the tracker (see [Models](#models)). Published MOT17 results of 60 HOTA and above use detectors trained on MOT17, while these presets are trained on COCO only.
+
+Each score comes from `trackflow run <sequence>/img1 --fps <frame rate> --device cpu --no-video --export mot`, plus the tracker options, scored with TrackEval over all 7 sequences. Scenes differ a lot (ByteTrack ranges from 33.8 HOTA on MOT17-02 to 49.3 on MOT17-09), so compare trackers on footage like yours with `trackflow compare` or `--export mot`.
 
 ### Text search and re-identification
 
@@ -142,7 +144,17 @@ Weights download automatically from Hugging Face on first use. `trackflow models
 | `deimv2-atto` | DEIMv2 Atto (320×320) | ~2 MB | **Non-commercial** | Tiny edge model, FP32 only |
 | `deimv2-s` | DEIMv2 Small, DINOv3 backbone (640×640) | ~41 MB | **Non-commercial** + DINOv3 | FP32 only |
 
-Most presets also have `--precision fp16` and `int8` variants. Trackflow itself is Apache-2.0, but each model's weights carry their own license, so check the table before shipping a product. On two labeled MOT17 sequences, `rfdetr-large` beat the default at about the same CPU speed (HOTA 44.9 vs 42.7 on MOT17-05, 51.2 vs 47.9 on MOT17-09). That's two sequences, so test on footage like yours before you switch.
+Most presets also have `--precision fp16` and `int8` variants. Trackflow itself is Apache-2.0, but each model's weights carry their own license, so check the table before shipping a product. With ByteTrack on the MOT17 split used for the [tracker scores](#trackers):
+
+| Preset | HOTA | IDF1 | MOTA |
+| :--- | ---: | ---: | ---: |
+| `rtdetr-v2-r18` *(default)* | 45.1 | 54.0 | 40.1 |
+| `rfdetr-large` | 44.3 | 51.1 | 35.9 |
+| `rfdetr-medium` | 41.2 | 46.4 | 32.7 |
+| `rfdetr-nano` | 36.5 | 40.5 | 28.2 |
+| `yolo26n` | 29.9 | 33.2 | 22.0 |
+
+The default scores highest here even though RF-DETR scores higher on COCO, so test on footage like yours before you switch.
 
 You aren't limited to presets. `-m` also takes any compatible ONNX repo on Hugging Face (`owner/repo`), a local `.onnx` file, or, with the extra installed, any Transformers object-detection checkpoint as `hf:owner/repo`:
 
