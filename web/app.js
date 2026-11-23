@@ -1,5 +1,5 @@
 import { AutoModelForObjectDetection, Tensor, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
-import { inputSizeFor, postprocessDetr, preprocessRGBA, scoringModeFor } from './detector.js';
+import { inputSizeFor, letterboxPlacement, postprocessDetr, preprocessRGBA, scoringModeFor, unletterbox } from './detector.js';
 import { ByteTracker, iouBufferForInterval } from './tracker.js';
 
 env.allowLocalModels = false;
@@ -29,7 +29,7 @@ const threshVal = document.getElementById('threshVal');
 
 // Per-model dtype/device configuration
 const MODEL_CONFIG = {
-  'onnx-community/yolo26n-ONNX': { revision: 'a8dc7e14743e1cea8ccd493bd99b4c2827de1acf', mode: 'sigmoid', webgpuDtype: 'fp32', wasmDtype: 'q8' },
+  'onnx-community/yolo26n-ONNX': { revision: 'a8dc7e14743e1cea8ccd493bd99b4c2827de1acf', mode: 'sigmoid', letterbox: true, webgpuDtype: 'fp32', wasmDtype: 'q8' },
   'onnx-community/rfdetr_nano-ONNX': { revision: 'eae21cee0687a91bcf9fa071605c48d7705d2d91', webgpuDtype: 'fp32', wasmDtype: 'q8', forceWasm: false },
   'onnx-community/rfdetr_base-ONNX': { revision: '7b18fa82ba7b1d6bc9446518cf2cc1d991097a3f', webgpuDtype: 'fp32', wasmDtype: 'q8', forceWasm: false },
   'onnx-community/rtdetr_v2_r18vd-ONNX': { revision: '936f90b6a476c6da4dfe053fc521af55285976ba', webgpuDtype: 'fp32', wasmDtype: 'q8', forceWasm: true },
@@ -120,6 +120,7 @@ async function loadDetector(modelId, forceWasm = false) {
       prep,
       input: inputSizeFor(prep),
       mode: cfg.mode || scoringModeFor(model.config.model_type),
+      letterbox: Boolean(cfg.letterbox),
       id2label: model.config.id2label,
       modelId,
       device,
@@ -153,22 +154,32 @@ async function detectFrame(det, captured) {
     offscreen.width = width;
     offscreen.height = height;
   }
-  // Plain resize to the model's input size (what the HF image processor does; no letterbox).
-  offCtx.drawImage(captured, 0, 0, width, height);
+  let placement = null;
+  if (det.letterbox) {
+    // YOLO is trained on letterboxed frames: keep the aspect ratio and pad with gray.
+    placement = letterboxPlacement(captured.width, captured.height, width, height);
+    offCtx.fillStyle = 'rgb(114, 114, 114)';
+    offCtx.fillRect(0, 0, width, height);
+    offCtx.drawImage(captured, placement.left, placement.top, placement.rw, placement.rh);
+  } else {
+    // Plain resize to the model's input size (what the HF image processor does).
+    offCtx.drawImage(captured, 0, 0, width, height);
+  }
   const { data } = offCtx.getImageData(0, 0, width, height);
   const pixels = preprocessRGBA(data, width, height, det.prep);
   const out = await det.model({ pixel_values: new Tensor('float32', pixels, [1, 3, height, width]) });
-  return postprocessDetr({
+  const dets = postprocessDetr({
     logits: out.logits.data,
     logitsDims: out.logits.dims,
     boxes: out.pred_boxes.data,
     id2label: det.id2label,
-    width: canvas.width,
-    height: canvas.height,
+    width: placement ? width : canvas.width,
+    height: placement ? height : canvas.height,
     mode: det.mode,
     threshold: Math.min(DETECT_THRESHOLD, tracker.lowThresh),
     allowedLabels: peopleOnlyChk.checked ? new Set(['person']) : null,
   });
+  return placement ? unletterbox(dets, placement, canvas.width, canvas.height) : dets;
 }
 
 function expand(box, margin) {

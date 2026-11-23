@@ -226,6 +226,29 @@ def _nms_class_aware(detections: list[Detection], iou_threshold: float) -> list[
     return kept
 
 
+def _letterbox(
+    frame_bgr: np.ndarray, input_hw: tuple[int, int], pad: int
+) -> tuple[np.ndarray, tuple[int, int, float, float]]:
+    """Resize keeping the aspect ratio, centered on a ``pad``-filled canvas of ``input_hw``.
+
+    Returns the canvas and ``(left, top, scale_x, scale_y)`` for ``_unletterbox``.
+    """
+    h, w = input_hw
+    orig_h, orig_w = frame_bgr.shape[:2]
+    scale = min(w / orig_w, h / orig_h)
+    rw, rh = max(1, int(orig_w * scale)), max(1, int(orig_h * scale))
+    left, top = (w - rw) // 2, (h - rh) // 2
+    canvas = np.full((h, w, 3), pad, dtype=np.uint8)
+    canvas[top : top + rh, left : left + rw] = cv2.resize(frame_bgr, (rw, rh))
+    return canvas, (left, top, rw / orig_w, rh / orig_h)
+
+
+def _unletterbox(xyxy: np.ndarray, placement: tuple[int, int, float, float]) -> np.ndarray:
+    """Map xyxy boxes on a ``_letterbox`` canvas back to the original frame's pixels."""
+    left, top, sx, sy = placement
+    return (np.asarray(xyxy, dtype=np.float64) - [left, top, left, top]) / [sx, sy, sx, sy]
+
+
 def postprocess_detr_outputs(
     logits: np.ndarray,
     pred_boxes: np.ndarray,
@@ -355,6 +378,7 @@ class OnnxDetrDetector:
         self.input_name = self.session.get_inputs()[0].name
         self.output_names = [o.name for o in self.session.get_outputs()]
         inputs = {i.name for i in self.session.get_inputs()}
+        self.letterbox = bool(spec and spec.letterbox)
         self.deployed = inputs == {"images", "orig_target_sizes"} and set(self.output_names) == {
             "labels",
             "boxes",
@@ -456,11 +480,7 @@ class OnnxDetrDetector:
             # Upstream DEIMv2 / RT-DETRv4 deployment graphs take a black-letterboxed RGB
             # image and emit xyxy in the coordinate system supplied via orig_target_sizes.
             h, w = self.input_hw
-            scale = min(w / orig_w, h / orig_h)
-            rw, rh = max(1, int(orig_w * scale)), max(1, int(orig_h * scale))
-            left, top = (w - rw) // 2, (h - rh) // 2
-            padded = np.zeros((h, w, 3), dtype=np.uint8)
-            padded[top : top + rh, left : left + rw] = cv2.resize(frame_bgr, (rw, rh))
+            padded, placement = _letterbox(frame_bgr, self.input_hw, 0)
             labels, boxes, scores = self.session.run(
                 ["labels", "boxes", "scores"],
                 {
@@ -468,33 +488,41 @@ class OnnxDetrDetector:
                     "orig_target_sizes": np.array([[w, h]], dtype=np.int64),
                 },
             )
-            boxes = (boxes[0] - [left, top, left, top]) / [
-                rw / orig_w,
-                rh / orig_h,
-                rw / orig_w,
-                rh / orig_h,
-            ]
             return _pixel_detections(
                 labels[0],
-                boxes,
+                _unletterbox(boxes[0], placement),
                 scores[0],
                 (orig_h, orig_w),
                 self.id2label,
                 self.allowed_classes,
                 cutoff,
             )
-        tensor = self.preprocess(frame_bgr)
+        image, placement = frame_bgr, None
+        if self.letterbox:
+            image, placement = _letterbox(frame_bgr, self.input_hw, 114)
+        tensor = self.preprocess(image)
         logits, pred_boxes = self.session.run(self.raw_outputs, {self.input_name: tensor})
 
-        return postprocess_detr_outputs(
+        detections = postprocess_detr_outputs(
             logits=np.asarray(logits, dtype=np.float32),
             pred_boxes=np.asarray(pred_boxes, dtype=np.float32),
-            orig_hw=(orig_h, orig_w),
+            orig_hw=image.shape[:2],
             id2label=self.id2label,
             threshold=cutoff,
             allowed_classes=self.allowed_classes,
             softmax=self.softmax,
         )
+        if placement is None:
+            return detections
+        restored = []
+        for det in detections:
+            x1, y1, x2, y2 = _unletterbox(det.bbox, placement)
+            x1, x2 = np.clip([x1, x2], 0.0, orig_w)
+            y1, y2 = np.clip([y1, y2], 0.0, orig_h)
+            if x2 - x1 >= 2.0 and y2 - y1 >= 2.0:
+                det.bbox = (float(x1), float(y1), float(x2), float(y2))
+                restored.append(det)
+        return restored
 
 
 def _pixel_detections(
