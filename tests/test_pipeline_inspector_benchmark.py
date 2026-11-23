@@ -81,6 +81,12 @@ def test_end_to_end_pipeline_inspector_and_benchmark(tmp_path: Path) -> None:
     assert (run_dir / "floorplan.png").is_file()
     assert (run_dir / "track_cards.json").is_file()
 
+    # Anonymized runs must not write raw person crops anywhere (files or report thumbnails).
+    assert not (run_dir / "crops").exists()
+    cards = json.loads((run_dir / "track_cards.json").read_text(encoding="utf-8"))["cards"]
+    assert cards and all(c["thumbnail"] is None for c in cards)
+    assert "crops/" not in (run_dir / "report.html").read_text(encoding="utf-8")
+
     # Verify Parquet schema and row count
     table = pq.read_table(str(run_dir / "tracks.parquet"))
     assert table.num_rows == summary.total_track_observations

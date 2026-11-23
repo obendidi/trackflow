@@ -76,3 +76,49 @@ def test_botsort_appearance_fusion_and_cmc() -> None:
 def test_create_tracker_factory() -> None:
     assert isinstance(create_tracker("bytetrack"), ByteTracker)
     assert isinstance(create_tracker("bot-sort"), BotSortTracker)
+
+
+def test_single_frame_false_positive_never_gets_an_id() -> None:
+    tracker = ByteTracker(track_high_thresh=0.5, new_track_thresh=0.55)
+    tracker.update([_det(10, 10, 50, 110)])  # frame 1: activated immediately (reference behavior)
+
+    # A ghost box appears for one frame only: it must not be output or consume an ID.
+    out = tracker.update([_det(12, 10, 52, 110), _det(300, 50, 340, 150)])
+    assert [t.track_id for t in out] == [1]
+    out = tracker.update([_det(14, 10, 54, 110)])
+    assert [t.track_id for t in out] == [1]
+
+    # A real newcomer is confirmed on its second detection and gets the next ID.
+    tracker.update([_det(16, 10, 56, 110), _det(200, 40, 240, 140)])
+    out = tracker.update([_det(18, 10, 58, 110), _det(203, 40, 243, 140)])
+    assert [t.track_id for t in out] == [1, 2]
+
+
+def test_partial_body_duplicate_does_not_spawn_a_track() -> None:
+    tracker = ByteTracker(track_high_thresh=0.5, new_track_thresh=0.55)
+    for i in range(3):
+        # Full-body box plus a confident upper-body duplicate inside it.
+        out = tracker.update([_det(100, 50, 140, 210, 0.9), _det(101 + i, 52, 139, 130, 0.8)])
+        assert [t.track_id for t in out] == [1]
+
+
+def test_coasting_tracks_cover_short_misses_only() -> None:
+    tracker = ByteTracker(track_buffer=30)
+    tracker.update([_det(10, 10, 50, 110)])
+    tracker.update([_det(14, 10, 54, 110)])
+    assert tracker.update([]) == []
+    coast = tracker.coasting_tracks(max_frames=3)
+    assert [t.track_id for t in coast] == [1] and coast[0].coasting is True
+    assert coast[0].bbox[0] > 14.0  # predicted forward along its motion
+    tracker.update([])
+    tracker.update([])
+    tracker.update([])
+    assert tracker.coasting_tracks(max_frames=3) == []
+
+
+def test_botsort_cmc_reference_frame_never_goes_stale() -> None:
+    tracker = BotSortTracker(use_cmc=True)
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    frame[30:200:20, 30:280:20] = 255
+    tracker.update([], frame_bgr=frame)  # no tracks yet, CMC must still see this frame
+    assert tracker._cmc is not None and tracker._cmc._prev_gray is not None

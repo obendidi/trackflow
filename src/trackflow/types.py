@@ -52,6 +52,7 @@ class Track:
     age: int = 1
     hits: int = 1
     recovered: bool = False
+    coasting: bool = False  # predicted position of a briefly-missed track (display only)
     query_score: float | None = None
     query_match: bool = True
     world_xy: tuple[float, float] | None = None

@@ -25,8 +25,8 @@ class ModelSpec:
 
 
 @dataclass(frozen=True, slots=True)
-class ReidModelSpec:
-    """Descriptor for a built-in vision-language Re-ID / query model."""
+class VlmModelSpec:
+    """Descriptor for a built-in vision-language model (``--query`` scoring & ``trackflow search``)."""
 
     name: str
     repo_id: str
@@ -45,7 +45,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         license="Apache-2.0",
         approx_size_mb=108.1,
         default_input_size=(384, 384),
-        description="Fast 384x384 Apache-2.0 DINOv2 detection transformer (~30+ FPS on Apple Silicon CPU).",
+        description="384x384 DINOv2 detection transformer; fast on Apple Silicon and WebGPU.",
     ),
     "dfine-n": ModelSpec(
         name="dfine-n",
@@ -54,7 +54,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         license="Apache-2.0",
         approx_size_mb=15.3,
         default_input_size=(640, 640),
-        description="Ultra-fast 15 MB end-to-end transformer detector (default for laptops & real-time).",
+        description="Compact 15 MB end-to-end transformer detector.",
     ),
     "rtdetr-v2-r18": ModelSpec(
         name="rtdetr-v2-r18",
@@ -63,7 +63,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         license="Apache-2.0",
         approx_size_mb=81.1,
         default_input_size=(640, 640),
-        description="Balanced accuracy and speed for crowded scenes.",
+        description="Default detector; balanced accuracy and speed for crowded scenes.",
     ),
     "rfdetr-base": ModelSpec(
         name="rfdetr-base",
@@ -72,12 +72,44 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         license="Apache-2.0",
         approx_size_mb=107.8,
         default_input_size=(560, 560),
-        description="High-accuracy Apache-2.0 detection transformer for dense people tracking.",
+        description="Higher-accuracy 560x560 detection transformer.",
     ),
 }
 
+
+@dataclass(frozen=True, slots=True)
+class ReidModelSpec:
+    """Descriptor for a built-in person Re-ID model (identity embeddings for BoT-SORT & merges)."""
+
+    name: str
+    repo_id: str
+    filename: str
+    revision: str
+    license: str
+    approx_size_mb: float
+    input_hw: tuple[int, int]
+    description: str
+
+
+# Person Re-ID: embeddings trained to tell *people* apart. Used for BoT-SORT appearance matching
+# and opt-in cross-exit merges. (CLIP/SigLIP can't do this: on vtest.avi different people scored
+# 0.83 cosine on average vs 0.86 for the same person.)
 REID_REGISTRY: dict[str, ReidModelSpec] = {
-    "clip": ReidModelSpec(
+    "osnet": ReidModelSpec(
+        name="osnet",
+        repo_id="mprib/osnet-ain-x1-0-msmt17-onnx",
+        filename="osnet_ain_x1_0_msmt17.onnx",
+        revision="306c3dca7875c91a7cbffe48dadc673de73fbb1b",
+        license="MIT (weights trained on MSMT17; check dataset terms for commercial use)",
+        approx_size_mb=8.7,
+        input_hw=(256, 128),
+        description="OSNet-AIN x1.0 person Re-ID (Torchreid, MSMT17), 512-d embeddings.",
+    ),
+}
+
+# Vision-language models: align images with text for --query and `trackflow search`.
+VLM_REGISTRY: dict[str, VlmModelSpec] = {
+    "clip": VlmModelSpec(
         name="clip",
         repo_id="Xenova/clip-vit-base-patch32",
         license="MIT",
@@ -92,9 +124,9 @@ REID_REGISTRY: dict[str, ReidModelSpec] = {
             "fp16": "onnx/text_model_fp16.onnx",
             "fp32": "onnx/text_model.onnx",
         },
-        description="Fast MIT-licensed CLIP ViT-B/32 vision+text ONNX for NL prompt-to-track and Re-ID.",
+        description="CLIP ViT-B/32 vision+text ONNX for --query and `trackflow search`.",
     ),
-    "siglip": ReidModelSpec(
+    "siglip": VlmModelSpec(
         name="siglip",
         repo_id="Xenova/siglip-base-patch16-224",
         license="Apache-2.0",
@@ -109,7 +141,7 @@ REID_REGISTRY: dict[str, ReidModelSpec] = {
             "fp16": "onnx/text_model_fp16.onnx",
             "fp32": "onnx/text_model.onnx",
         },
-        description="High-precision Apache-2.0 SigLIP Base vision+text ONNX for fine-grained clothing/attribute queries.",
+        description="SigLIP Base vision+text ONNX; stronger on clothing and attribute queries.",
     ),
 }
 
@@ -166,16 +198,31 @@ def resolve_detector_artifacts(
     return onnx_path, config_path, prep_path
 
 
-def resolve_reid_artifacts(
+def resolve_reid_model(backend: str = "osnet", cache_dir: str | Path | None = None) -> Path:
+    """Download and cache a person Re-ID ONNX model (pinned revision)."""
+    if backend not in REID_REGISTRY:
+        raise ValueError(f"Unknown Re-ID model '{backend}'. Available: {list(REID_REGISTRY)}")
+    spec = REID_REGISTRY[backend]
+    kwargs = {"cache_dir": str(cache_dir)} if cache_dir is not None else {}
+    return Path(
+        hf_hub_download(
+            repo_id=spec.repo_id, filename=spec.filename, revision=spec.revision, **kwargs
+        )
+    )
+
+
+def resolve_vlm_artifacts(
     backend: str = "clip",
     precision: Precision = "int8",
     cache_dir: str | Path | None = None,
 ) -> dict[str, Path]:
-    """Download and cache ONNX vision+text encoder and tokenizer files for Re-ID & NL search."""
-    if backend not in REID_REGISTRY:
-        raise ValueError(f"Unknown Re-ID model '{backend}'. Available: {list(REID_REGISTRY)}")
+    """Download and cache ONNX vision+text encoder and tokenizer files for NL query & search."""
+    if backend not in VLM_REGISTRY:
+        raise ValueError(
+            f"Unknown vision-language model '{backend}'. Available: {list(VLM_REGISTRY)}"
+        )
 
-    spec = REID_REGISTRY[backend]
+    spec = VLM_REGISTRY[backend]
     vision_file = spec.vision_files.get(precision, spec.vision_files["int8"])
     text_file = spec.text_files.get(precision, spec.text_files["int8"])
     kwargs = {"cache_dir": str(cache_dir)} if cache_dir is not None else {}

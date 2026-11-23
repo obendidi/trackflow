@@ -1,13 +1,21 @@
-"""Privacy-first anonymization: Gaussian blur, pixelation, head/face blur, and skeleton-only mode."""
+"""Privacy anonymization: Gaussian blur, pixelation, head/face blur, and stick-figure-only mode.
+
+Best effort, not a guarantee: every box the detector produced (any score, including people not yet
+confirmed as tracks) plus briefly-missed tracks is anonymized, with a margin. A person the detector
+never finds in a frame is not. ``face-blur`` assumes the head is in the top 30% of the box.
+``skeleton`` draws a fixed stick figure inside each track box (no pose estimation) on a blank
+canvas, so no video pixels are written at all.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Literal
 
 import cv2
 import numpy as np
 
-from trackflow.types import Track
+from trackflow.types import Detection, Track
 
 AnonymizeMode = Literal["none", "blur", "pixelate", "face-blur", "skeleton"]
 
@@ -28,32 +36,48 @@ def _track_color(track_id: int) -> tuple[int, int, int]:
 
 
 class PrivacyAnonymizer:
-    """Applies privacy-preserving transformations so identifiable PII never hits disk."""
+    """Applies privacy-preserving transformations to every detected person box."""
 
-    def __init__(self, mode: AnonymizeMode = "none", *, strength: int = 31) -> None:
+    def __init__(
+        self, mode: AnonymizeMode = "none", *, strength: int = 31, margin: float = 0.08
+    ) -> None:
         valid = ("none", "blur", "pixelate", "face-blur", "skeleton")
         if mode not in valid:
             raise ValueError(f"Unknown anonymize mode '{mode}'. Choose from: {valid}")
         self.mode: AnonymizeMode = mode
         # Ensure odd kernel size >= 9
         self.kernel_size = max(9, int(strength) | 1)
+        self.margin = float(margin)
 
-    def apply(self, frame_bgr: np.ndarray, tracks: list[Track]) -> np.ndarray:
-        """Return an anonymized copy of ``frame_bgr`` for the given tracked people."""
+    def apply(
+        self,
+        frame_bgr: np.ndarray,
+        tracks: Sequence[Track],
+        *,
+        detections: Sequence[Detection] = (),
+        coasting: Sequence[Track] = (),
+    ) -> np.ndarray:
+        """Return an anonymized copy of ``frame_bgr``.
+
+        Anonymizes the boxes of ``tracks``, of briefly-missed ``coasting`` tracks, and of all raw
+        ``detections`` (pass every detection, not only the ones that became tracks).
+        """
         if self.mode == "none":
             return frame_bgr
 
         if self.mode == "skeleton":
-            return self._render_skeleton_canvas(frame_bgr, tracks)
+            return self._render_skeleton_canvas(frame_bgr, [*tracks, *coasting])
 
         out = frame_bgr.copy()
         h, w = out.shape[:2]
 
-        for tr in tracks:
-            x1 = max(0, min(w - 1, int(round(tr.bbox[0]))))
-            y1 = max(0, min(h - 1, int(round(tr.bbox[1]))))
-            x2 = max(x1 + 1, min(w, int(round(tr.bbox[2]))))
-            y2 = max(y1 + 1, min(h, int(round(tr.bbox[3]))))
+        boxes = [t.bbox for t in tracks] + [t.bbox for t in coasting] + [d.bbox for d in detections]
+        for bx1, by1, bx2, by2 in boxes:
+            mx, my = (bx2 - bx1) * self.margin, (by2 - by1) * self.margin
+            x1 = max(0, min(w - 1, int(round(bx1 - mx))))
+            y1 = max(0, min(h - 1, int(round(by1 - my))))
+            x2 = max(x1 + 1, min(w, int(round(bx2 + mx))))
+            y2 = max(y1 + 1, min(h, int(round(by2 + my))))
             if x2 - x1 < 4 or y2 - y1 < 4:
                 continue
 
@@ -89,8 +113,8 @@ class PrivacyAnonymizer:
         return out
 
     @staticmethod
-    def _render_skeleton_canvas(frame_bgr: np.ndarray, tracks: list[Track]) -> np.ndarray:
-        """Render zero-PII pose-skeleton figures on a subtle dark grid canvas."""
+    def _render_skeleton_canvas(frame_bgr: np.ndarray, tracks: Sequence[Track]) -> np.ndarray:
+        """Render box-based stick figures (no pose estimation) on a blank grid canvas."""
         h, w = frame_bgr.shape[:2]
         canvas = np.full((h, w, 3), (18, 20, 26), dtype=np.uint8)
 

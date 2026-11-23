@@ -1,279 +1,409 @@
 /**
- * Production-grade BrowserByteTracker for Trackflow WebGPU/WASM playground:
- * - Class-aware NMS deduplication before association (prevents overlapping phantom IDs)
- * - Real-time delta (`dtSec`) damped velocity prediction (works cleanly from 2 FPS WASM to 60 FPS WebGPU)
- * - Hybrid IoU + normalized center-distance association (prevents ID breaks when a person moves fast between slow frames)
- * - Exponential box smoothing (eliminates bounding-box jitter)
- * - Confirmation (`minHits`) + short-term coasting (`maxCoast`) to stop flickering on missed frames
+ * ByteTrack for the browser playground: a direct port of `ByteTracker` in
+ * `src/trackflow/tracker.py` (Kalman filter, Hungarian matching, two-stage association,
+ * track confirmation, spawn suppression, duplicate removal).
+ *
+ * Keep the two in sync: `tests/test_web_parity.py` replays the same recorded detections
+ * through both implementations and requires identical IDs and boxes.
+ *
+ * Detections: { box: {xmin, ymin, xmax, ymax}, score, label, classId }
  */
 
-function computeIoU(a, b) {
-  const x1 = Math.max(a.xmin, b.xmin);
-  const y1 = Math.max(a.ymin, b.ymin);
-  const x2 = Math.min(a.xmax, b.xmax);
-  const y2 = Math.min(a.ymax, b.ymax);
-  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
-  if (inter <= 0) return 0;
+const STD_POS = 1 / 20;
+const STD_VEL = 1 / 160;
+
+function boxIoU(a, b) {
+  const iw = Math.max(0, Math.min(a.xmax, b.xmax) - Math.max(a.xmin, b.xmin));
+  const ih = Math.max(0, Math.min(a.ymax, b.ymax) - Math.max(a.ymin, b.ymin));
+  const inter = iw * ih;
   const areaA = Math.max(0, a.xmax - a.xmin) * Math.max(0, a.ymax - a.ymin);
   const areaB = Math.max(0, b.xmax - b.xmin) * Math.max(0, b.ymax - b.ymin);
   return inter / Math.max(areaA + areaB - inter, 1e-6);
 }
 
-function boxCenter(b) {
-  return [(b.xmin + b.xmax) * 0.5, (b.ymin + b.ymax) * 0.5];
+/** Fraction of box `a` covered by box `b`. */
+function boxIoA(a, b) {
+  const iw = Math.max(0, Math.min(a.xmax, b.xmax) - Math.max(a.xmin, b.xmin));
+  const ih = Math.max(0, Math.min(a.ymax, b.ymax) - Math.max(a.ymin, b.ymin));
+  const areaA = Math.max(Math.max(0, a.xmax - a.xmin) * Math.max(0, a.ymax - a.ymin), 1e-6);
+  return (iw * ih) / areaA;
 }
 
-function boxDiag(b) {
-  return Math.hypot(Math.max(1, b.xmax - b.xmin), Math.max(1, b.ymax - b.ymin));
+function xyxyToXyah(b) {
+  const w = Math.max(1, b.xmax - b.xmin);
+  const h = Math.max(1, b.ymax - b.ymin);
+  return [b.xmin + 0.5 * w, b.ymin + 0.5 * h, w / h, h];
+}
+
+function xyahToXyxy(m) {
+  const a = Math.max(0.05, m[2]);
+  const h = Math.max(1, m[3]);
+  const w = a * h;
+  return { xmin: m[0] - 0.5 * w, ymin: m[1] - 0.5 * h, xmax: m[0] + 0.5 * w, ymax: m[1] + 0.5 * h };
 }
 
 /**
- * Class-aware Non-Maximum Suppression to remove duplicate overlapping DETR/ViT queries.
+ * Minimum-cost assignment for a rectangular cost matrix (Hungarian / Kuhn-Munkres with
+ * potentials). Returns [row, col] pairs covering min(n, m) rows, like scipy's
+ * `linear_sum_assignment`.
  */
-export function nmsDetections(detections, iouThresh = 0.55) {
-  if (!detections || detections.length <= 1) return detections || [];
-  const sorted = [...detections].sort((a, b) => b.score - a.score);
-  const kept = [];
+export function linearSumAssignment(cost) {
+  const n0 = cost.length;
+  const m0 = n0 ? cost[0].length : 0;
+  if (!n0 || !m0) return [];
+  const transpose = n0 > m0;
+  const n = transpose ? m0 : n0;
+  const m = transpose ? n0 : m0;
+  const at = transpose ? (i, j) => cost[j][i] : (i, j) => cost[i][j];
 
-  for (const det of sorted) {
-    const w = det.box.xmax - det.box.xmin;
-    const h = det.box.ymax - det.box.ymin;
-    if (w < 8 || h < 8) continue;
+  const u = new Float64Array(n + 1);
+  const v = new Float64Array(m + 1);
+  const p = new Int32Array(m + 1); // p[j] = row assigned to column j (1-based)
+  const way = new Int32Array(m + 1);
+  for (let i = 1; i <= n; i++) {
+    p[0] = i;
+    let j0 = 0;
+    const minv = new Float64Array(m + 1).fill(Infinity);
+    const used = new Uint8Array(m + 1);
+    do {
+      used[j0] = 1;
+      const i0 = p[j0];
+      let delta = Infinity;
+      let j1 = 0;
+      for (let j = 1; j <= m; j++) {
+        if (used[j]) continue;
+        const cur = at(i0 - 1, j - 1) - u[i0] - v[j];
+        if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
+        if (minv[j] < delta) { delta = minv[j]; j1 = j; }
+      }
+      for (let j = 0; j <= m; j++) {
+        if (used[j]) { u[p[j]] += delta; v[j] -= delta; } else { minv[j] -= delta; }
+      }
+      j0 = j1;
+    } while (p[j0] !== 0);
+    do {
+      const j1 = way[j0];
+      p[j0] = p[j1];
+      j0 = j1;
+    } while (j0);
+  }
 
-    let duplicate = false;
-    for (const prev of kept) {
-      if (prev.label === det.label && computeIoU(prev.box, det.box) >= iouThresh) {
-        duplicate = true;
-        break;
+  const pairs = [];
+  for (let j = 1; j <= m; j++) {
+    if (p[j]) pairs.push(transpose ? [j - 1, p[j] - 1] : [p[j] - 1, j - 1]);
+  }
+  pairs.sort((a, b) => a[0] - b[0]);
+  return pairs;
+}
+
+function linearAssignment(cost, maxCost, nRows, nCols) {
+  const matches = [];
+  const rowsUsed = new Set();
+  const colsUsed = new Set();
+  if (nRows && nCols) {
+    for (const [r, c] of linearSumAssignment(cost)) {
+      if (cost[r][c] <= maxCost) {
+        matches.push([r, c]);
+        rowsUsed.add(r);
+        colsUsed.add(c);
       }
     }
-    if (!duplicate) kept.push(det);
   }
-  return kept;
+  const unmatchedRows = [];
+  for (let r = 0; r < nRows; r++) if (!rowsUsed.has(r)) unmatchedRows.push(r);
+  const unmatchedCols = [];
+  for (let c = 0; c < nCols; c++) if (!colsUsed.has(c)) unmatchedCols.push(c);
+  return { matches, unmatchedRows, unmatchedCols };
+}
+
+function iouCost(boxesA, boxesB) {
+  return boxesA.map(a => boxesB.map(b => 1 - boxIoU(a, b)));
+}
+
+/** Grow a box by `scale` x its width/height on every side (buffered IoU). */
+function expandBox(b, scale) {
+  if (scale <= 0) return b;
+  const w = b.xmax - b.xmin;
+  const h = b.ymax - b.ymin;
+  return { xmin: b.xmin - scale * w, ymin: b.ymin - scale * h, xmax: b.xmax + scale * w, ymax: b.ymax + scale * h };
 }
 
 /**
- * Hybrid IoU + center-distance affinity so tracks survive both tight overlap AND fast motion
- * across lower-FPS WASM frames without splitting into new IDs.
+ * Buffered-IoU scale for the time between processed frames (same rule as
+ * `iou_buffer_for_interval` in tracker.py): 0 up to 0.1 s, 0.3 at 0.3 s, capped at 0.5.
+ * Keeps IDs from fragmenting when inference runs at a few FPS (e.g. WASM).
  */
-function associationScore(track, det, minIou, maxNormDist = 1.65) {
-  const iou = computeIoU(track.predBox, det.box);
-  if (iou >= minIou) return 1.0 + iou; // Prefer genuine IoU overlap
-
-  // Fallback: normalized center distance & compatible scale (prevents ID fragmentation on fast motion)
-  const [tcx, tcy] = boxCenter(track.predBox);
-  const [dcx, dcy] = boxCenter(det.box);
-  const scale = Math.max(boxDiag(track.predBox), boxDiag(det.box), 40);
-  const normDist = Math.hypot(dcx - tcx, dcy - tcy) / scale;
-  if (normDist > maxNormDist) return -1;
-
-  const tArea = Math.max(1, (track.predBox.xmax - track.predBox.xmin) * (track.predBox.ymax - track.predBox.ymin));
-  const dArea = Math.max(1, (det.box.xmax - det.box.xmin) * (det.box.ymax - det.box.ymin));
-  const areaRatio = Math.min(tArea, dArea) / Math.max(tArea, dArea);
-  if (areaRatio < 0.25) return -1;
-
-  return (1.0 - normDist / maxNormDist) * 0.8 + areaRatio * 0.2;
+export function iouBufferForInterval(dtSec) {
+  return Math.min(0.5, Math.max(0, 1.5 * (dtSec - 0.1)));
 }
 
-function greedyMatch(tracks, dets, minIou, allowDistFallback = true) {
-  const pairs = [];
-  for (let i = 0; i < tracks.length; i++) {
-    for (let j = 0; j < dets.length; j++) {
-      if (tracks[i].label !== dets[j].label) continue;
-      const score = allowDistFallback
-        ? associationScore(tracks[i], dets[j], minIou)
-        : (computeIoU(tracks[i].predBox, dets[j].box) >= minIou
-            ? computeIoU(tracks[i].predBox, dets[j].box)
-            : -1);
-      if (score > 0) pairs.push([score, i, j]);
-    }
+/** 8-state constant-velocity Kalman filter over [cx, cy, a, h, vx, vy, va, vh]. */
+class KalmanBoxFilter {
+  constructor(box) {
+    const meas = xyxyToXyah(box);
+    this.mean = [...meas, 0, 0, 0, 0];
+    const h = Math.max(10, meas[3]);
+    const std = [
+      2 * STD_POS * h, 2 * STD_POS * h, 1e-2, 2 * STD_POS * h,
+      10 * STD_VEL * h, 10 * STD_VEL * h, 1e-5, 10 * STD_VEL * h,
+    ];
+    this.cov = Array.from({ length: 8 }, (_, i) =>
+      Array.from({ length: 8 }, (_, j) => (i === j ? std[i] * std[i] : 0)));
   }
-  pairs.sort((a, b) => b[0] - a[0]);
 
-  const usedT = new Set();
-  const usedD = new Set();
-  const matches = [];
-  for (const [, i, j] of pairs) {
-    if (!usedT.has(i) && !usedD.has(j)) {
-      usedT.add(i);
-      usedD.add(j);
-      matches.push([i, j]);
+  predict() {
+    const h = Math.max(10, this.mean[3]);
+    const std = [STD_POS * h, STD_POS * h, 1e-2, STD_POS * h, STD_VEL * h, STD_VEL * h, 1e-5, STD_VEL * h];
+    for (let i = 0; i < 4; i++) this.mean[i] += this.mean[i + 4];
+    if (this.mean[3] < 1) { this.mean[3] = 1; this.mean[7] = 0; }
+    // P = F P F^T + Q with F = [[I, I], [0, I]]
+    const P = this.cov;
+    const FP = P.map((row, i) => (i < 4 ? row.map((v, j) => v + P[i + 4][j]) : row.slice()));
+    this.cov = FP.map(row => row.map((v, j) => (j < 4 ? v + row[j + 4] : v)));
+    for (let i = 0; i < 8; i++) this.cov[i][i] += std[i] * std[i];
+  }
+
+  update(box) {
+    const meas = xyxyToXyah(box);
+    const h = Math.max(10, this.mean[3]);
+    const r = [STD_POS * h, STD_POS * h, 1e-1, STD_POS * h].map(x => x * x);
+    const P = this.cov;
+    // S = H P H^T + R (top-left 4x4 block), HP = first 4 rows of P
+    const S = [0, 1, 2, 3].map(i => [0, 1, 2, 3].map(j => P[i][j] + (i === j ? r[i] : 0)));
+    const HP = [0, 1, 2, 3].map(i => P[i].slice());
+    const Kt = solve4(S, HP); // 4x8, K = Kt^T
+    const innov = [0, 1, 2, 3].map(i => meas[i] - this.mean[i]);
+    for (let i = 0; i < 8; i++) {
+      let s = 0;
+      for (let k = 0; k < 4; k++) s += Kt[k][i] * innov[k];
+      this.mean[i] += s;
+    }
+    // P -= K S K^T
+    const KS = Array.from({ length: 8 }, (_, i) =>
+      [0, 1, 2, 3].map(j => { let s = 0; for (let k = 0; k < 4; k++) s += Kt[k][i] * S[k][j]; return s; }));
+    for (let i = 0; i < 8; i++) {
+      for (let j = 0; j < 8; j++) {
+        let s = 0;
+        for (let k = 0; k < 4; k++) s += KS[i][k] * Kt[k][j];
+        P[i][j] -= s;
+      }
     }
   }
-  const unmatchedT = tracks.map((_, i) => i).filter(i => !usedT.has(i));
-  const unmatchedD = dets.map((_, j) => j).filter(j => !usedD.has(j));
-  return { matches, unmatchedT, unmatchedD };
+
+  get box() {
+    return xyahToXyxy(this.mean);
+  }
 }
 
-export class BrowserByteTracker {
+/** Solve A X = B for X with A 4x4 and B 4xN (Gaussian elimination, partial pivoting). */
+function solve4(A, B) {
+  const a = A.map(row => row.slice());
+  const b = B.map(row => row.slice());
+  const n = 4;
+  for (let col = 0; col < n; col++) {
+    let piv = col;
+    for (let r = col + 1; r < n; r++) if (Math.abs(a[r][col]) > Math.abs(a[piv][col])) piv = r;
+    [a[col], a[piv]] = [a[piv], a[col]];
+    [b[col], b[piv]] = [b[piv], b[col]];
+    for (let r = col + 1; r < n; r++) {
+      const f = a[r][col] / a[col][col];
+      for (let c = col; c < n; c++) a[r][c] -= f * a[col][c];
+      for (let c = 0; c < b[r].length; c++) b[r][c] -= f * b[col][c];
+    }
+  }
+  const x = b.map(row => row.map(() => 0));
+  for (let r = n - 1; r >= 0; r--) {
+    for (let c = 0; c < b[r].length; c++) {
+      let s = b[r][c];
+      for (let k = r + 1; k < n; k++) s -= a[r][k] * x[k][c];
+      x[r][c] = s / a[r][r];
+    }
+  }
+  return x;
+}
+
+export class ByteTracker {
   constructor({
-    highThresh = 0.45,
-    lowThresh = 0.18,
-    newTrackThresh = 0.5,
-    maxAge = 24,
-    minIou = 0.2,
-    nmsIou = 0.55,
-    minHits = 2,
-    maxCoast = 4,
-    smoothAlpha = 0.65,
+    highThresh = 0.5,
+    lowThresh = 0.15,
+    newTrackThresh = 0.55,
+    matchThresh = 0.8,
+    secondMatchThresh = 0.5,
+    unconfirmedMatchThresh = 0.7,
+    trackBuffer = 30,
+    spawnOverlapThresh = 0.8,
+    duplicateIou = 0.85,
+    iouBuffer = 0,
   } = {}) {
-    this.highThresh = highThresh;
-    this.lowThresh = lowThresh;
-    this.newTrackThresh = newTrackThresh;
-    this.maxAge = maxAge;
-    this.minIou = minIou;
-    this.nmsIou = nmsIou;
-    this.minHits = minHits;
-    this.maxCoast = maxCoast;
-    this.smoothAlpha = smoothAlpha;
-    this.nextId = 1;
-    this.tracks = [];
-    this.uniqueCount = 0;
+    Object.assign(this, {
+      highThresh, lowThresh, newTrackThresh, matchThresh, secondMatchThresh,
+      unconfirmedMatchThresh, trackBuffer, spawnOverlapThresh, duplicateIou, iouBuffer,
+    });
+    this.reset();
   }
 
   reset() {
     this.nextId = 1;
+    this.nextUid = 1;
+    this.frameId = 0;
     this.tracks = [];
-    this.uniqueCount = 0;
   }
 
-  update(rawDetections, dtSec = 1 / 15) {
-    const dt = Math.max(0.016, Math.min(1.5, dtSec));
+  /** Number of public IDs handed out so far. */
+  get uniqueCount() {
+    return this.nextId - 1;
+  }
 
-    // 1. Deduplicate overlapping queries first so duplicates never spawn phantom tracks
-    const detections = nmsDetections(rawDetections, this.nmsIou);
+  _applyDetection(tr, det, updateLabel) {
+    tr.kf.update(det.box);
+    tr.score = det.score;
+    if (updateLabel) { tr.label = det.label; tr.classId = det.classId; }
+    tr.hits += 1;
+    tr.tsu = 0;
+  }
 
-    // 2. Predict next box using real elapsed time `dt` (vx/vy in px/sec)
-    for (const tr of this.tracks) {
-      const damping = tr.missed > 0 ? 0.6 : 0.88;
-      tr.vx *= damping;
-      tr.vy *= damping;
-      const dx = tr.vx * dt;
-      const dy = tr.vy * dt;
-      tr.predBox = {
-        xmin: tr.box.xmin + dx,
-        ymin: tr.box.ymin + dy,
-        xmax: tr.box.xmax + dx,
-        ymax: tr.box.ymax + dy,
-      };
-      tr.missed += 1;
-      tr.elapsedSinceMeas += dt;
+  _highCost(tracks, dets) {
+    const s = this.iouBuffer;
+    return iouCost(tracks.map(t => expandBox(t.kf.box, s)), dets.map(d => expandBox(d.box, s)));
+  }
+
+  _activate(tr) {
+    tr.isActivated = true;
+    tr.id = this.nextId++;
+  }
+
+  /** Advance one frame; returns the confirmed tracks observed in this frame. */
+  update(detections) {
+    this.frameId += 1;
+
+    for (const t of this.tracks) {
+      t.recoveredNow = false;
+      if (t.state !== 'tracked') t.kf.mean[7] = 0;
+      t.kf.predict();
+      t.age += 1;
+      t.tsu += 1;
     }
 
     const high = detections.filter(d => d.score >= this.highThresh);
     const low = detections.filter(d => d.score >= this.lowThresh && d.score < this.highThresh);
-    const updatedIds = new Set();
+    const confirmed = this.tracks.filter(t => t.isActivated && t.state === 'tracked');
+    const lost = this.tracks.filter(t => t.state === 'lost');
+    const unconfirmed = this.tracks.filter(t => !t.isActivated);
+    const pool = [...confirmed, ...lost];
+    const updated = new Set();
 
-    // 3. Stage 1: match confirmed tracks first, then tentative tracks, against high-conf detections
-    const confirmed = this.tracks.filter(t => t.confirmed);
-    const tentative = this.tracks.filter(t => !t.confirmed);
-
-    const s1 = greedyMatch(confirmed, high, this.minIou, true);
+    // 1. confirmed + lost tracks <-> high-score detections (buffered IoU when iouBuffer > 0)
+    const s1 = linearAssignment(this._highCost(pool, high), this.matchThresh, pool.length, high.length);
     for (const [ti, di] of s1.matches) {
-      this._applyUpdate(confirmed[ti], high[di]);
-      updatedIds.add(confirmed[ti].id);
+      const tr = pool[ti];
+      if (tr.state === 'lost') tr.recoveredNow = true;
+      tr.state = 'tracked';
+      this._applyDetection(tr, high[di], true);
+      updated.add(tr.uid);
     }
 
-    const remHigh = s1.unmatchedD.map(i => high[i]);
-    const s1b = greedyMatch(tentative, remHigh, this.minIou, true);
-    for (const [ti, di] of s1b.matches) {
-      this._applyUpdate(tentative[ti], remHigh[di]);
-      updatedIds.add(tentative[ti].id);
-    }
-
-    // 4. Stage 2: match remaining recently-active confirmed tracks against low-conf detections
-    const remConfirmed = s1.unmatchedT
-      .map(i => confirmed[i])
-      .filter(t => t.missed <= 3);
-    const s2 = greedyMatch(remConfirmed, low, 0.3, false);
-    for (const [ti, di] of s2.matches) {
-      this._applyUpdate(remConfirmed[ti], low[di]);
-      updatedIds.add(remConfirmed[ti].id);
-    }
-
-    // 5. Spawn new tentative tracks for unmatched high-confidence detections
-    const finalUnmatchedHigh = s1b.unmatchedD.map(i => remHigh[i]);
-    for (const det of finalUnmatchedHigh) {
-      if (det.score < Math.max(this.highThresh, this.newTrackThresh)) continue;
-      const overlapsActive = this.tracks.some(
-        t => t.missed <= 2 && t.label === det.label && computeIoU(t.box, det.box) >= 0.45
-      );
-      if (overlapsActive) continue;
-
-      const [cx, cy] = boxCenter(det.box);
-      const instantConfirm = det.score >= 0.62 || this.minHits <= 1;
-      const tr = {
-        id: instantConfirm ? this.nextId++ : -1,
-        box: { ...det.box },
-        predBox: { ...det.box },
-        lastMeasCx: cx,
-        lastMeasCy: cy,
-        elapsedSinceMeas: 0,
-        label: det.label,
-        score: det.score,
-        vx: 0,
-        vy: 0,
-        hits: 1,
-        missed: 0,
-        confirmed: instantConfirm,
-        trail: [[cx, det.box.ymax]],
-      };
-      if (instantConfirm) this.uniqueCount++;
-      this.tracks.push(tr);
-      updatedIds.add(tr.id);
-    }
-
-    // 6. Coast unmatched confirmed tracks gently for up to `maxCoast` steps so boxes don't blink
-    for (const tr of this.tracks) {
-      if (!updatedIds.has(tr.id) && tr.missed > 0 && tr.missed <= this.maxCoast) {
-        tr.box = { ...tr.predBox };
+    // 2. remaining tracked tracks <-> low-score detections
+    const remTracked = s1.unmatchedRows.map(i => pool[i]).filter(t => t.state === 'tracked');
+    if (remTracked.length && low.length) {
+      const s2 = linearAssignment(
+        iouCost(remTracked.map(t => t.kf.box), low.map(d => d.box)),
+        this.secondMatchThresh, remTracked.length, low.length);
+      for (const [ti, di] of s2.matches) {
+        this._applyDetection(remTracked[ti], low[di], false);
+        updated.add(remTracked[ti].uid);
       }
     }
 
-    // 7. Prune expired tracks
-    this.tracks = this.tracks.filter(t => {
-      if (!t.confirmed) return t.missed <= 1;
-      return t.missed <= this.maxAge;
-    });
+    // 3. unconfirmed tracks <-> leftover high-score detections
+    const remHigh = s1.unmatchedCols.map(i => high[i]);
+    const s3 = linearAssignment(
+      this._highCost(unconfirmed, remHigh), this.unconfirmedMatchThresh, unconfirmed.length, remHigh.length);
+    for (const [ti, di] of s3.matches) {
+      this._applyDetection(unconfirmed[ti], remHigh[di], true);
+      updated.add(unconfirmed[ti].uid);
+      this._activate(unconfirmed[ti]);
+    }
+
+    // 4. lost transitions, expiry, removal of unmatched unconfirmed tracks
+    const surviving = [];
+    for (const tr of this.tracks) {
+      if (updated.has(tr.uid)) { surviving.push(tr); continue; }
+      if (!tr.isActivated) continue;
+      if (tr.state === 'tracked') tr.state = 'lost';
+      if (tr.tsu <= this.trackBuffer) surviving.push(tr);
+    }
+    this.tracks = surviving;
+
+    // 5. spawn unconfirmed tracks from leftover high-score detections
+    const occupied = this.tracks.filter(t => updated.has(t.uid)).map(t => t.kf.box);
+    const leftovers = s3.unmatchedCols.map(i => remHigh[i]).sort((a, b) => b.score - a.score);
+    for (const det of leftovers) {
+      if (det.score < this.newTrackThresh) continue;
+      if (occupied.length && Math.max(...occupied.map(b => boxIoA(det.box, b))) >= this.spawnOverlapThresh) continue;
+      const tr = {
+        uid: this.nextUid++,
+        id: 0,
+        kf: new KalmanBoxFilter(det.box),
+        score: det.score,
+        label: det.label,
+        classId: det.classId,
+        startFrame: this.frameId,
+        isActivated: false,
+        age: 1,
+        hits: 1,
+        tsu: 0,
+        state: 'tracked',
+        recoveredNow: false,
+      };
+      this.tracks.push(tr);
+      updated.add(tr.uid);
+      occupied.push(tr.kf.box);
+      if (this.frameId === 1) this._activate(tr);
+    }
+
+    // 6. tracked/lost duplicates: the longer-lived track wins
+    this._removeDuplicates();
 
     return this.tracks
-      .filter(t => t.confirmed && t.missed <= this.maxCoast)
+      .filter(t => t.isActivated && updated.has(t.uid))
+      .map(t => this._output(t, false))
       .sort((a, b) => a.id - b.id);
   }
 
-  _applyUpdate(tr, det) {
-    const [newCx, newCy] = boxCenter(det.box);
-    const dtMeas = Math.max(0.016, tr.elapsedSinceMeas);
-    const measVx = (newCx - tr.lastMeasCx) / dtMeas;
-    const measVy = (newCy - tr.lastMeasCy) / dtMeas;
-    tr.vx = 0.55 * tr.vx + 0.45 * measVx;
-    tr.vy = 0.55 * tr.vy + 0.45 * measVy;
-    tr.lastMeasCx = newCx;
-    tr.lastMeasCy = newCy;
-    tr.elapsedSinceMeas = 0;
-
-    // Smooth box edges with EMA (higher weight when frame gap was large so box doesn't lag)
-    const a = dtMeas > 0.25 ? 0.85 : this.smoothAlpha;
-    tr.box = {
-      xmin: a * det.box.xmin + (1 - a) * tr.predBox.xmin,
-      ymin: a * det.box.ymin + (1 - a) * tr.predBox.ymin,
-      xmax: a * det.box.xmax + (1 - a) * tr.predBox.xmax,
-      ymax: a * det.box.ymax + (1 - a) * tr.predBox.ymax,
-    };
-
-    tr.score = 0.6 * det.score + 0.4 * tr.score;
-    tr.label = det.label;
-    tr.hits += 1;
-    tr.missed = 0;
-
-    if (!tr.confirmed && tr.hits >= this.minHits) {
-      tr.confirmed = true;
-      tr.id = this.nextId++;
-      this.uniqueCount++;
+  _removeDuplicates() {
+    const tracked = this.tracks.filter(t => t.state === 'tracked');
+    const lost = this.tracks.filter(t => t.state === 'lost');
+    if (!tracked.length || !lost.length) return;
+    const drop = new Set();
+    for (const a of tracked) {
+      for (const b of lost) {
+        if (boxIoU(a.kf.box, b.kf.box) > this.duplicateIou) {
+          drop.add(this.frameId - a.startFrame > this.frameId - b.startFrame ? b.uid : a.uid);
+        }
+      }
     }
+    if (drop.size) this.tracks = this.tracks.filter(t => !drop.has(t.uid));
+  }
 
-    const [smoothCx] = boxCenter(tr.box);
-    tr.trail.push([smoothCx, tr.box.ymax]);
-    if (tr.trail.length > 36) tr.trail.shift();
+  /** Confirmed tracks missed for <= maxFrames frames, at their predicted position (display only). */
+  coastingTracks(maxFrames = 3) {
+    return this.tracks
+      .filter(t => t.isActivated && t.state === 'lost' && t.tsu <= maxFrames)
+      .map(t => this._output(t, true))
+      .sort((a, b) => a.id - b.id);
+  }
+
+  _output(t, coasting) {
+    return {
+      id: t.id,
+      box: t.kf.box,
+      score: t.score,
+      label: t.label,
+      classId: t.classId,
+      age: t.age,
+      hits: t.hits,
+      recovered: t.recoveredNow && !coasting,
+      coasting,
+    };
   }
 }
