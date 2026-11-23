@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "trackflow-python"
 version = "0.1.0"
-description = "Modern real-time people & object tracking toolkit — ONNX RT-DETRv2/RF-DETR/D-FINE + ByteTrack/BoT-SORT, natural-language search, visual debugger, floorplan homography & privacy-first anonymization."
+description = "Real-time people and object tracking with ONNX detection transformers (RT-DETRv2, RF-DETR, D-FINE), ByteTrack/BoT-SORT, text search, local run inspector, floorplan homography, and anonymization."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
