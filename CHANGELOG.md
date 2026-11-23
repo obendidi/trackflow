@@ -4,6 +4,8 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-24
+
 ### Fixed
 
 - YOLO26 presets keep each frame's aspect ratio and pad it with gray, as YOLO is trained, instead of stretching it to 640×640. With ByteTrack on MOT17, YOLO26 Nano goes from 29.9 to 37.4 HOTA.
@@ -112,7 +114,8 @@ First release of Trackflow, a rewrite of the 2017 Tracking-with-darkflow project
 
 - `trackflow run` crashes with an `AttributeError` from the progress bar. Use 0.1.1 or later.
 
-[Unreleased]: https://github.com/obendidi/trackflow/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/obendidi/trackflow/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/obendidi/trackflow/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/obendidi/trackflow/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/obendidi/trackflow/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/obendidi/trackflow/compare/v0.2.0...v0.3.0
