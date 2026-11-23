@@ -91,15 +91,15 @@ export function postprocessDetr({
   for (let q = 0; q < numQueries; q++) {
     const row = q * numClasses;
     let best = 0;
-    for (let c = 1; c < numClasses; c++) if (logits[row + c] > logits[row + best]) best = c;
+    const foregroundClasses = mode === 'softmax' ? numClasses - 1 : numClasses;
+    for (let c = 1; c < foregroundClasses; c++) if (logits[row + c] > logits[row + best]) best = c;
 
     let score;
     if (mode === 'softmax') {
-      if (best === numClasses - 1) continue; // no-object class
       let denom = 0;
-      const mx = logits[row + best];
+      const mx = Math.max(logits[row + best], logits[row + numClasses - 1]);
       for (let c = 0; c < numClasses; c++) denom += Math.exp(logits[row + c] - mx);
-      score = 1 / denom;
+      score = Math.exp(logits[row + best] - mx) / denom;
     } else {
       const x = Math.max(-60, Math.min(60, logits[row + best]));
       score = 1 / (1 + Math.exp(-x));
@@ -109,11 +109,12 @@ export function postprocessDetr({
 
   cands.sort((a, b) => b.score - a.score); // stable: ties keep query order
   const dets = [];
-  for (const { q, classId, score } of cands.slice(0, maxDetections)) {
+  for (const { q, classId, score } of cands) {
     const label = String(id2label?.[classId] ?? id2label?.[String(classId)] ?? classId);
     if (allowedLabels && !allowedLabels.has(label.toLowerCase())) continue;
 
     const [cx, cy, w, h] = [boxes[q * 4], boxes[q * 4 + 1], boxes[q * 4 + 2], boxes[q * 4 + 3]];
+    if (![cx, cy, w, h].every(Number.isFinite)) continue;
     let x1, y1, x2, y2;
     if (Math.max(cx, cy, w, h) <= 2.0) {
       x1 = (cx - 0.5 * w) * width;
@@ -132,5 +133,5 @@ export function postprocessDetr({
     if (box.xmax - box.xmin < 2 || box.ymax - box.ymin < 2) continue;
     dets.push({ box, score, classId, label });
   }
-  return nmsClassAware(dets, nmsIou);
+  return nmsClassAware(dets, nmsIou).slice(0, maxDetections);
 }

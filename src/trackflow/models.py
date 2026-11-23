@@ -7,13 +7,14 @@ from pathlib import Path
 from typing import Literal
 
 from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import EntryNotFoundError
 
 Precision = Literal["fp32", "fp16", "int8"]
 
 
 @dataclass(frozen=True, slots=True)
 class ModelSpec:
-    """Descriptor for a built-in Hugging Face ONNX detector model."""
+    """Descriptor for a built-in detector. Sizes are decimal MB at FP32."""
 
     name: str
     repo_id: str
@@ -22,6 +23,18 @@ class ModelSpec:
     approx_size_mb: float
     default_input_size: tuple[int, int]
     description: str
+    revision: str | None = None
+    backend: Literal["onnx", "transformers"] = "onnx"
+    onnx_file: str | None = None  # standalone FP32 graph with embedded post-processing
+    normalize: bool = False  # preprocessing for standalone graphs without a sidecar
+
+    @property
+    def precisions(self) -> tuple[Precision, ...]:
+        if self.onnx_file:
+            return ("fp32",)
+        if self.backend == "transformers":
+            return ("fp32", "fp16")
+        return ("fp32", "fp16", "int8")
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,6 +48,7 @@ class VlmModelSpec:
     vision_files: dict[str, str]
     text_files: dict[str, str]
     description: str
+    revision: str | None = None
 
 
 MODEL_REGISTRY: dict[str, ModelSpec] = {
@@ -46,6 +60,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         approx_size_mb=108.1,
         default_input_size=(384, 384),
         description="384x384 DINOv2 detection transformer; fast on Apple Silicon and WebGPU.",
+        revision="eae21cee0687a91bcf9fa071605c48d7705d2d91",
     ),
     "dfine-n": ModelSpec(
         name="dfine-n",
@@ -55,6 +70,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         approx_size_mb=15.3,
         default_input_size=(640, 640),
         description="Compact 15 MB end-to-end transformer detector.",
+        revision="380d2839c327efaf65dd0fe0c2c10ab7fadd5473",
     ),
     "rtdetr-v2-r18": ModelSpec(
         name="rtdetr-v2-r18",
@@ -64,6 +80,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         approx_size_mb=81.1,
         default_input_size=(640, 640),
         description="Default detector; balanced accuracy and speed for crowded scenes.",
+        revision="936f90b6a476c6da4dfe053fc521af55285976ba",
     ),
     "rfdetr-base": ModelSpec(
         name="rfdetr-base",
@@ -73,8 +90,82 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         approx_size_mb=107.8,
         default_input_size=(560, 560),
         description="Higher-accuracy 560x560 detection transformer.",
+        revision="7b18fa82ba7b1d6bc9446518cf2cc1d991097a3f",
+    ),
+    "rfdetr-small": ModelSpec(
+        "rfdetr-small",
+        "onnx-community/rfdetr_small-ONNX",
+        "RF-DETR Small",
+        "Apache-2.0",
+        114.7,
+        (512, 512),
+        "512px COCO detector.",
+        "63463b68b200177d1fea7015f11f3cebb0ba4eeb",
+    ),
+    "rfdetr-medium": ModelSpec(
+        "rfdetr-medium",
+        "onnx-community/rfdetr_medium-ONNX",
+        "RF-DETR Medium",
+        "Apache-2.0",
+        121.0,
+        (576, 576),
+        "576px COCO detector.",
+        "8553cefdd984bbaeb9d9ca8743d6a6a1c3e29dce",
+    ),
+    "rfdetr-large": ModelSpec(
+        "rfdetr-large",
+        "Roboflow/rf-detr-large",
+        "RF-DETR Large",
+        "Apache-2.0",
+        135.8,
+        (704, 704),
+        "Official 704px checkpoint. Install the transformers extra.",
+        "f62f7dd5252b61097cbace33886045816dadbde9",
+        backend="transformers",
+    ),
+    "deimv2-atto": ModelSpec(
+        "deimv2-atto",
+        "tatsuyaaaaaaa/deimv2-onnx",
+        "DEIMv2 Atto",
+        "DEIMv2 (non-commercial)",
+        2.2,
+        (320, 320),
+        "HGNetv2 COCO edge detector.",
+        "e1514db73b6a64566560cc54a2c28f3bf25a31da",
+        onnx_file="deimv2_hgnetv2_atto_coco.onnx",
+    ),
+    "deimv2-s": ModelSpec(
+        "deimv2-s",
+        "tatsuyaaaaaaa/deimv2-onnx",
+        "DEIMv2 Small",
+        "DEIMv2 (non-commercial) + DINOv3",
+        40.7,
+        (640, 640),
+        "DINOv3 COCO detector.",
+        "e1514db73b6a64566560cc54a2c28f3bf25a31da",
+        onnx_file="deimv2_dinov3_s_coco.onnx",
+        normalize=True,
     ),
 }
+
+for size, mb, revision in (
+    ("n", 9.9, "a8dc7e14743e1cea8ccd493bd99b4c2827de1acf"),
+    ("s", 38.2, "37669b009f416cb1df28751257d6ec5f8e4b4e20"),
+    ("m", 81.9, "a1db4877f0a3ed68554c231cdae958e2280087e3"),
+    ("l", 99.6, "7a72d097ea1719e10eda2d89f75b6e9c009f7f6b"),
+    ("x", 223.2, "032eec52a570b81e5f9d66485b9322bd9b7f4053"),
+):
+    name = f"yolo26{size}"
+    MODEL_REGISTRY[name] = ModelSpec(
+        name,
+        f"onnx-community/{name}-ONNX",
+        f"YOLO26{size}",
+        "AGPL-3.0 / Ultralytics Enterprise",
+        mb,
+        (640, 640),
+        "COCO detector converted to logits and normalized boxes.",
+        revision,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +216,7 @@ VLM_REGISTRY: dict[str, VlmModelSpec] = {
             "fp32": "onnx/text_model.onnx",
         },
         description="CLIP ViT-B/32 vision+text ONNX for --query and `trackflow search`.",
+        revision="6b7c523703ae26e39be4b03774966f8571c7f523",
     ),
     "siglip": VlmModelSpec(
         name="siglip",
@@ -142,6 +234,7 @@ VLM_REGISTRY: dict[str, VlmModelSpec] = {
             "fp32": "onnx/text_model.onnx",
         },
         description="SigLIP Base vision+text ONNX; stronger on clothing and attribute queries.",
+        revision="4649052661e53c7000355844105f8a1792088239",
     ),
 }
 
@@ -161,6 +254,8 @@ def resolve_detector_artifacts(
 
     Returns ``(onnx_path, config_path, preprocessor_config_path)``.
     """
+    if precision not in PRECISION_TO_FILENAME:
+        raise ValueError(f"Unknown precision {precision!r}. Choose fp32, fp16, or int8.")
     local_path = Path(model)
     if local_path.is_file():
         parent = local_path.parent
@@ -176,24 +271,40 @@ def resolve_detector_artifacts(
             prep if prep.is_file() else None,
         )
 
-    repo_id = MODEL_REGISTRY[model].repo_id if model in MODEL_REGISTRY else model
-    onnx_filename = PRECISION_TO_FILENAME.get(precision, "onnx/model.onnx")
-
-    kwargs = {"cache_dir": str(cache_dir)} if cache_dir is not None else {}
+    spec = MODEL_REGISTRY.get(model)
+    if spec is None and (local_path.is_absolute() or model.endswith(".onnx")):
+        raise FileNotFoundError(f"ONNX file not found: {model}")
+    if spec is None and "/" not in model:
+        raise ValueError(
+            f"Unknown detector {model!r}. See 'trackflow models' for presets or use an owner/repo ID."
+        )
+    repo_id = spec.repo_id if spec else model
+    kwargs = {"revision": spec.revision if spec else None, "cache_dir": cache_dir}
+    if spec and spec.backend != "onnx":
+        raise ValueError(
+            f"{model} uses the {spec.backend} backend. Load it with create_detector()."
+        )
+    if spec and spec.onnx_file:
+        if precision != "fp32":
+            raise ValueError(f"{model} is available only in fp32.")
+        return Path(hf_hub_download(repo_id, spec.onnx_file, **kwargs)), None, None
+    onnx_filename = PRECISION_TO_FILENAME[precision]
     onnx_path = Path(hf_hub_download(repo_id=repo_id, filename=onnx_filename, **kwargs))
 
     config_path: Path | None = None
     prep_path: Path | None = None
     try:
         config_path = Path(hf_hub_download(repo_id=repo_id, filename="config.json", **kwargs))
-    except Exception:
-        config_path = None
+    except EntryNotFoundError:
+        if spec:
+            raise
     try:
         prep_path = Path(
             hf_hub_download(repo_id=repo_id, filename="preprocessor_config.json", **kwargs)
         )
-    except Exception:
-        prep_path = None
+    except EntryNotFoundError:
+        if spec:
+            raise
 
     return onnx_path, config_path, prep_path
 
@@ -223,9 +334,11 @@ def resolve_vlm_artifacts(
         )
 
     spec = VLM_REGISTRY[backend]
-    vision_file = spec.vision_files.get(precision, spec.vision_files["int8"])
-    text_file = spec.text_files.get(precision, spec.text_files["int8"])
-    kwargs = {"cache_dir": str(cache_dir)} if cache_dir is not None else {}
+    if precision not in spec.vision_files or precision not in spec.text_files:
+        raise ValueError(f"Unsupported precision {precision!r} for {backend}.")
+    vision_file = spec.vision_files[precision]
+    text_file = spec.text_files[precision]
+    kwargs = {"cache_dir": cache_dir, "revision": spec.revision}
 
     return {
         "vision_onnx": Path(hf_hub_download(repo_id=spec.repo_id, filename=vision_file, **kwargs)),

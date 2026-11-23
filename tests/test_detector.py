@@ -3,8 +3,62 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from trackflow.detector import postprocess_detr_outputs
+
+
+def test_deployed_graph_reverses_padding_and_reports_native_scores():
+    from trackflow import OnnxDetrDetector
+
+    class Session:
+        def run(self, names, inputs):
+            assert names == ["labels", "boxes", "scores"]
+            assert inputs["images"].shape == (1, 3, 320, 320)
+            assert inputs["orig_target_sizes"].tolist() == [[320, 320]]
+            assert np.all(inputs["images"][0, :, :80] == 0)
+            assert np.all(inputs["images"][0, :, 80:240] == 1)
+            return (
+                np.array([[1, 0]]),
+                np.array([[[40, 100, 200, 200], [0, 0, 30, 40]]]),
+                np.array([[0.76, 0.9]]),
+            )
+
+    detector = OnnxDetrDetector.__new__(OnnxDetrDetector)
+    detector.deployed = detector.do_rescale = True
+    detector.do_normalize = False
+    detector.input_hw = (320, 320)
+    detector.id2label = {0: "person", 1: "bicycle"}
+    detector.allowed_classes = None
+    detector.threshold = 0.2
+    detector.input_dtype = np.float32
+    detector.session = Session()
+    (det,) = detector.detect(np.full((100, 200, 3), 255, np.uint8))
+    assert det.bbox == (25.0, 12.5, 125.0, 75.0)
+    assert det.class_name == "bicycle" and det.confidence == 0.76
+
+
+def test_precision_mistakes_and_missing_extra_are_actionable(monkeypatch):
+    import sys
+
+    from trackflow import create_detector
+
+    with pytest.raises(ValueError, match="fp32"):
+        create_detector("deimv2-s", precision="int8")
+    with pytest.raises(ValueError, match="Unknown precision"):
+        create_detector("rtdetr-v2-r18", precision="int9")
+    monkeypatch.setitem(sys.modules, "torch", None)
+    with pytest.raises(ImportError, match=r"trackflow-python\[transformers\]"):
+        create_detector("rfdetr-large")
+
+
+def test_softmax_background_and_nonfinite_boxes():
+    logits = np.array([[[2.0, 3.0], [4.0, 0.0], [-2.0, 4.0]]])
+    boxes = np.array([[[0.5, 0.5, 0.1, 0.1], [np.nan, 0.2, 0.1, 0.1], [0.2, 0.2, 0.2, 0.2]]])
+    (det,) = postprocess_detr_outputs(
+        logits, boxes, (100, 100), {0: "person"}, threshold=0.2, softmax=True
+    )
+    assert det.confidence == pytest.approx(1 / (1 + np.e))
 
 
 def test_postprocess_detr_0_indexed_and_class_filter() -> None:

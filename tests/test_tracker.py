@@ -3,9 +3,34 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from trackflow.tracker import BotSortTracker, ByteTracker, compute_iou_matrix, create_tracker
 from trackflow.types import Detection
+
+
+@pytest.mark.parametrize("tracker", [ByteTracker, BotSortTracker])
+def test_different_classes_can_overlap_without_stealing_ids(tracker):
+    mot = tracker()
+    person = _det(0, 0, 60, 80)
+    bag = Detection((1, 1, 59, 79), 0.92, 24, "backpack")
+    ids = {t.class_id: t.track_id for t in mot.update([person, bag])}
+    assert ids.keys() == {0, 24}
+    # A weak bag cannot match the person. A lost person cannot be deduplicated with the bag.
+    bag.confidence = 0.30
+    assert [t.track_id for t in mot.update([bag])] == [ids[24]]
+    bag.confidence = 0.92
+    assert {t.class_id: t.track_id for t in mot.update([bag, person])} == ids
+
+
+def test_cost_limit_allows_an_unmatched_row_or_column():
+    from trackflow.tracker import _linear_assignment
+
+    cost = np.array([[0.20, 0.55, 0.9], [0.55, 1.0, 1.0]])
+    assert _linear_assignment(cost, 0.5) == ([(0, 0)], [1], [1, 2])
+    assert _linear_assignment(cost.T, 0.5) == ([(0, 0)], [1, 2], [1])
+    # Preserve a perfect pair when the alternative is two marginal matches.
+    assert _linear_assignment(np.array([[0, 0.44], [0.44, 0.6]]), 0.5)[0] == [(0, 0)]
 
 
 def _det(x1: float, y1: float, x2: float, y2: float, conf: float = 0.9, emb=None) -> Detection:

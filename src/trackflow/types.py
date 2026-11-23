@@ -196,16 +196,24 @@ class RunSummary:
     anonymize_mode: str = "none"
     output_files: dict[str, str] = field(default_factory=dict)
     zone_dwell_totals_s: dict[str, float] = field(default_factory=dict)
+    frame_stride: int = 1
+    model_revision: str | None = None
+    precision: str | None = None
+    tracking_threshold: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "source": self.source,
             "model": self.model,
+            "model_revision": self.model_revision,
+            "precision": self.precision,
+            "tracking_threshold": self.tracking_threshold,
             "tracker": self.tracker,
             "device": self.device,
             "total_frames": self.total_frames,
             "processed_frames": self.processed_frames,
             "source_fps": round(self.source_fps, 2),
+            "frame_stride": self.frame_stride,
             "avg_fps": round(self.avg_fps, 2),
             "avg_inference_ms": round(self.avg_inference_ms, 2),
             "avg_tracking_ms": round(self.avg_tracking_ms, 2),

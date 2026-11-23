@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "trackflow-python"
 version = "0.1.1"
-description = "Real-time people and object tracking with ONNX detection transformers (RT-DETRv2, RF-DETR, D-FINE), ByteTrack/BoT-SORT, text search, local run inspector, floorplan homography, and anonymization."
+description = "Stream or export multi-object tracks with ONNX and optional Transformers detectors, ByteTrack/BoT-SORT, text search, floorplan projection, and anonymization."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -54,6 +54,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+transformers = [
+  "transformers>=5.10,<6",
+  "torch>=2.6",
+  "torchvision>=0.21",
+]
 cuda = [
   "onnxruntime-gpu>=1.17",
 ]

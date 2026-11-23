@@ -7,11 +7,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import cv2
 import numpy as np
 
-from trackflow.pipeline import TrackflowPipeline
+from trackflow.pipeline import TrackflowPipeline, fresh_run_dir
 from trackflow.types import RunSummary
 
 # Historical baseline recorded in the original July 2017 README (preserved on `legacy-2017`)
@@ -66,6 +67,9 @@ def generate_synthetic_crowd_video(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(path), fourcc, fps, (width, height))
 
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open video writer at {path}")
+
     actors = [
         {"x": 60.0, "y": 140.0, "vx": 4.2, "vy": 0.4, "color": (60, 60, 220)},
         {"x": 540.0, "y": 150.0, "vx": -3.8, "vy": 0.3, "color": (220, 140, 50)},
@@ -84,7 +88,7 @@ def generate_synthetic_crowd_video(
                 cv2.rectangle(frame, (cx - 14, cy - 24), (cx + 14, cy + 20), a["color"], -1)
                 cv2.rectangle(frame, (cx - 12, cy + 20), (cx - 2, cy + 56), (40, 45, 60), -1)
                 cv2.rectangle(frame, (cx + 2, cy + 20), (cx + 12, cy + 56), (40, 45, 60), -1)
-                a["x"] = (a["x"] + a["vx"]) % (width - 40) + 20
+                a["x"] = 20 + (a["x"] - 20 + a["vx"]) % (width - 40)
                 a["y"] = float(np.clip(a["y"] + a["vy"], 90, height - 80))
             writer.write(frame)
     finally:
@@ -112,28 +116,35 @@ def render_split_screen_2017_vs_2026(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(out), fourcc, fps, (w * 2, h))
 
-    frame_i = 0
+    if not writer.isOpened():
+        cap.release()
+        raise RuntimeError(f"Could not open video writer at {out}")
+
+    # The 2017 README supplies a measurement, not frame-level predictions for this input.
+    left_frame = np.full((h, w, 3), (24, 24, 30), dtype=np.uint8)
+    lines = [
+        "2017 historical measurement",
+        "YOLOv2 + DeepSORT",
+        "14 FPS on NVIDIA GTX 1080",
+        "1280 x 1024, original README",
+    ]
+    scale = max(0.2, min(w / 600, h / 400, 1.0))
+    for i, line in enumerate(lines):
+        cv2.putText(
+            left_frame,
+            line,
+            (int(12 * scale), int((40 + i * 38) * scale)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.78 * scale,
+            (220, 220, 225),
+            1,
+            cv2.LINE_AA,
+        )
     try:
         while True:
             ok, right_frame = cap.read()
             if not ok:
                 break
-
-            # Stylized 2017 panel: lower effective cadence + retro YOLOv2/DeepSORT HUD banner
-            if frame_i % 2 == 0 or frame_i == 0:
-                left_frame = cv2.GaussianBlur(right_frame, (5, 5), 0)
-                left_frame = cv2.convertScaleAbs(left_frame, alpha=0.82, beta=-10)
-            cv2.rectangle(left_frame, (0, 0), (w, 42), (24, 24, 30), -1)
-            cv2.putText(
-                left_frame,
-                "2017: YOLOv2 + DeepSORT (TF 1.0, Cython, 14 FPS GTX 1080, 6 setup steps)",
-                (10, 27),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (190, 190, 210),
-                1,
-                cv2.LINE_AA,
-            )
 
             cv2.rectangle(right_frame, (0, 0), (w, 42), (10, 38, 32), -1)
             cv2.putText(
@@ -150,7 +161,6 @@ def render_split_screen_2017_vs_2026(
             combined = np.hstack([left_frame, right_frame])
             cv2.line(combined, (w, 0), (w, h), (56, 189, 248), 2)
             writer.write(combined)
-            frame_i += 1
     finally:
         cap.release()
         writer.release()
@@ -161,7 +171,7 @@ def render_split_screen_2017_vs_2026(
 def run_benchmark_suite(
     video_path: str | Path,
     *,
-    output_dir: str | Path = "runs/benchmark",
+    output_dir: str | Path | None = None,
     models: Sequence[str] = ("rtdetr-v2-r18",),
     trackers: Sequence[str] = ("bytetrack", "botsort"),
     device: str = "auto",
@@ -169,8 +179,11 @@ def run_benchmark_suite(
     split_screen: bool = False,
     detector_factory: Any | None = None,
 ) -> dict[str, Any]:
-    """Run reproducible Trackflow benchmarks and write JSON + Markdown 2017 vs. 2026 report."""
-    out_dir = Path(output_dir)
+    """Run reproducible Trackflow benchmarks and write JSON + Markdown 2017 vs. 2026 report.
+
+    Without ``output_dir``, results go to a fresh ``runs/benchmark-N`` directory.
+    """
+    out_dir = fresh_run_dir("benchmark") if output_dir is None else Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[BenchmarkRow] = []
@@ -178,7 +191,7 @@ def run_benchmark_suite(
 
     for model_name in models:
         for tracker_name in trackers:
-            sub_dir = out_dir / f"{model_name}_{tracker_name}"
+            sub_dir = out_dir / f"{quote(str(model_name), safe='')}_{quote(tracker_name, safe='')}"
             det = detector_factory(model_name) if detector_factory is not None else None
             pipe = TrackflowPipeline(
                 model=model_name,
@@ -190,7 +203,7 @@ def run_benchmark_suite(
                 str(video_path),
                 output_dir=sub_dir,
                 max_frames=max_frames,
-                save_video=split_screen and len(summaries) == 0,
+                save_video=split_screen,
                 exports=("parquet", "jsonl"),
             )
             summaries.append(summary)

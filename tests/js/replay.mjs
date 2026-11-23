@@ -22,8 +22,8 @@ if (mode === 'tracker') {
     });
     const stride = Number(arg3 ?? 1);
     out[name] = frames.filter((_, i) => i % stride === 0).map(dets => {
-      const tracks = tracker.update(dets.map(([xmin, ymin, xmax, ymax, score]) => ({
-        box: { xmin, ymin, xmax, ymax }, score, label: 'person', classId: 0,
+      const tracks = tracker.update(dets.map(([xmin, ymin, xmax, ymax, score, classId = 0]) => ({
+        box: { xmin, ymin, xmax, ymax }, score, label: classId === 0 ? 'person' : String(classId), classId,
       })));
       const fmt = t => [t.id, t.box.xmin, t.box.ymin, t.box.xmax, t.box.ymax];
       return { tracks: tracks.map(fmt), coasting: tracker.coastingTracks(3).map(fmt) };

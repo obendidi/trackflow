@@ -147,6 +147,7 @@ class VlmEmbedder:
         self._text_sess = None
         self._tokenizer: Tokenizer | None = None
         self._image_size = (224, 224)
+        self._shortest_edge: int | None = None
         self._mean = np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(3, 1, 1)
         self._std = np.array([0.5, 0.5, 0.5], dtype=np.float32).reshape(3, 1, 1)
         self._max_length = 77 if backend == "clip" else 64
@@ -166,6 +167,8 @@ class VlmEmbedder:
     def _load_preprocess(self, prep_path: Path, config_path: Path) -> None:
         if prep_path.is_file():
             cfg = json.loads(prep_path.read_text(encoding="utf-8"))
+            if cfg.get("do_center_crop") and isinstance(cfg.get("size"), dict):
+                self._shortest_edge = cfg["size"].get("shortest_edge")
             size = cfg.get("crop_size") or cfg.get("size") or {}
             if isinstance(size, int):
                 self._image_size = (size, size)
@@ -187,7 +190,15 @@ class VlmEmbedder:
     def _preprocess_crop(self, crop_bgr: np.ndarray) -> np.ndarray:
         th, tw = self._image_size
         rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-        resized = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_CUBIC)
+        if self._shortest_edge:
+            h, w = rgb.shape[:2]
+            scale = self._shortest_edge / min(h, w)
+            rh, rw = max(th, int(h * scale)), max(tw, int(w * scale))
+            resized = cv2.resize(rgb, (rw, rh), interpolation=cv2.INTER_CUBIC)
+            top, left = (rh - th) // 2, (rw - tw) // 2
+            resized = resized[top : top + th, left : left + tw]
+        else:
+            resized = cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_CUBIC)
         arr = resized.astype(np.float32) * (1.0 / 255.0)
         chw = np.transpose(arr, (2, 0, 1))
         chw = (chw - self._mean) / self._std
@@ -313,13 +324,16 @@ class TrackCardIndex:
         self.reid_merges: int = 0
 
     def canonical_id(self, raw_track_id: int) -> int:
-        return self._alias.get(raw_track_id, raw_track_id)
+        cid = raw_track_id
+        while cid in self._alias:
+            cid = self._alias[cid]
+        return cid
 
     def _reid_vec(self, cid: int) -> np.ndarray | None:
         s = self._reid_sum.get(cid)
         return None if s is None else _l2_normalize(s)
 
-    def _try_merge(self, raw: int, class_name: str) -> tuple[int, float] | None:
+    def _try_merge(self, raw: int, class_name: str, visible: set[int]) -> tuple[int, float] | None:
         samples = self._pending.pop(raw, [])
         self._decided.add(raw)
         if not samples:
@@ -328,7 +342,7 @@ class TrackCardIndex:
         start = self._raw_first_frame[raw]
         sims: list[tuple[float, int]] = []
         for cid, card in self.cards.items():
-            if cid == raw or card.class_name != class_name:
+            if cid in visible or card.class_name != class_name:
                 continue
             if start - card.last_frame < self.min_exit_gap_frames:
                 continue  # overlaps in time (or too recent) -> must be someone else
@@ -399,7 +413,9 @@ class TrackCardIndex:
             crop = _crop_bbox(frame_bgr, tr.bbox)
             crops.append(crop)
             want = (
-                self.reid is not None
+                self.reid_merge
+                and self.reid is not None
+                and tr.class_name.lower() == "person"
                 and crop is not None
                 and tr.height >= self.min_reid_height
                 and (is_new or frame_idx % self.reid_sample_every == 0)
@@ -412,6 +428,7 @@ class TrackCardIndex:
         )
 
         # Pass 2: merges, cards, query scores.
+        visible = {self.canonical_id(tr.track_id) for tr in tracks} if self.reid_merge else set()
         for tr, crop, remb in zip(tracks, crops, reid_embs, strict=True):
             raw = tr.track_id
             cid = self.canonical_id(raw)
@@ -451,7 +468,7 @@ class TrackCardIndex:
                 if remb is not None:
                     self._pending.setdefault(raw, []).append(remb)
                 if len(self._pending.get(raw, [])) >= self.merge_min_samples:
-                    hit = self._try_merge(raw, tr.class_name)
+                    hit = self._try_merge(raw, tr.class_name, visible)
                     if hit is not None:
                         dst, sim = hit
                         self._fold_card(raw, dst)
@@ -466,6 +483,7 @@ class TrackCardIndex:
                             }
                         )
                         cid = dst
+                        visible.add(dst)
                         card = self.cards[cid]
 
             if cid != raw:

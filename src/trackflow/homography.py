@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -52,10 +53,27 @@ class FloorplanHomography:
             )
         src = np.array(self.image_points, dtype=np.float32)
         dst = np.array(self.world_points, dtype=np.float32)
+        if not all(np.isfinite(v) and v > 0 for v in (self.width_m, self.height_m)):
+            raise ValueError("Floorplan width and height must be positive and finite.")
+        for points in (src, dst):
+            if points.shape != (4, 2) or not np.isfinite(points).all():
+                raise ValueError("Calibration points must be finite x, y pairs.")
+            if any(
+                cv2.contourArea(points[list(triple)]) == 0 for triple in combinations(range(4), 3)
+            ):
+                raise ValueError(
+                    "Calibration needs four distinct points with no three on the same line."
+                )
         self._matrix = cv2.getPerspectiveTransform(src, dst)
         self._heatmap = np.zeros((100, 100), dtype=np.float32)
         for z in self.zones:
             self.zone_dwell_totals_s.setdefault(z.name, 0.0)
+
+    def fresh(self) -> FloorplanHomography:
+        """Reuse this calibration for an independent stream with empty trajectories and dwell totals."""
+        return FloorplanHomography(
+            self.image_points, self.world_points, self.width_m, self.height_m, self.zones
+        )
 
     @classmethod
     def from_json(cls, path: str | Path) -> FloorplanHomography:

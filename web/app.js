@@ -29,9 +29,10 @@ const threshVal = document.getElementById('threshVal');
 
 // Per-model dtype/device configuration
 const MODEL_CONFIG = {
-  'onnx-community/rfdetr_nano-ONNX': { webgpuDtype: 'fp32', wasmDtype: 'q8', forceWasm: false },
-  'onnx-community/rfdetr_base-ONNX': { webgpuDtype: 'fp32', wasmDtype: 'q8', forceWasm: false },
-  'onnx-community/rtdetr_v2_r18vd-ONNX': { webgpuDtype: 'fp32', wasmDtype: 'q8', forceWasm: true },
+  'onnx-community/yolo26n-ONNX': { revision: 'a8dc7e14743e1cea8ccd493bd99b4c2827de1acf', mode: 'sigmoid', webgpuDtype: 'fp32', wasmDtype: 'q8' },
+  'onnx-community/rfdetr_nano-ONNX': { revision: 'eae21cee0687a91bcf9fa071605c48d7705d2d91', webgpuDtype: 'fp32', wasmDtype: 'q8', forceWasm: false },
+  'onnx-community/rfdetr_base-ONNX': { revision: '7b18fa82ba7b1d6bc9446518cf2cc1d991097a3f', webgpuDtype: 'fp32', wasmDtype: 'q8', forceWasm: false },
+  'onnx-community/rtdetr_v2_r18vd-ONNX': { revision: '936f90b6a476c6da4dfe053fc521af55285976ba', webgpuDtype: 'fp32', wasmDtype: 'q8', forceWasm: true },
 };
 
 const runtimeForceWasm = new Set(
@@ -41,7 +42,10 @@ const runtimeForceWasm = new Set(
 );
 
 let detector = null; // { model, prep, input, mode, id2label, modelId, device }
-let loadingPromise = null;
+let worker = Promise.resolve();
+let renderRequest = 0;
+let fileUrl = null;
+let latestFrame = null;
 let sessionToken = 0;
 let running = false;
 let latestTracks = [];
@@ -73,13 +77,15 @@ function resetTracking() {
   latestTracks = [];
   latestCoasting = [];
   latestDets = [];
+  latestFrame = null;
+  tracker.iouBuffer = 0;
 }
 
 modelSelect.addEventListener('change', () => {
+  if (!running) return;
   sessionToken++;
-  detector = null;
-  resetTracking();
-  if (running) startInferenceWorker(sessionToken);
+  resetRecording();
+  scheduleWorker(sessionToken);
 });
 
 async function hasRealWebGPU() {
@@ -103,24 +109,24 @@ async function loadDetector(modelId, forceWasm = false) {
 
   try {
     const [model, prep] = await Promise.all([
-      AutoModelForObjectDetection.from_pretrained(modelId, { device, dtype }),
-      fetch(`https://huggingface.co/${modelId}/resolve/main/preprocessor_config.json`).then(r => {
+      AutoModelForObjectDetection.from_pretrained(modelId, { device, dtype, revision: cfg.revision }),
+      fetch(`https://huggingface.co/${modelId}/resolve/${cfg.revision}/preprocessor_config.json`).then(r => {
         if (!r.ok) throw new Error(`preprocessor_config.json: HTTP ${r.status}`);
         return r.json();
       }),
     ]);
-    detector = {
+    const loaded = {
       model,
       prep,
       input: inputSizeFor(prep),
-      mode: scoringModeFor(model.config.model_type),
+      mode: cfg.mode || scoringModeFor(model.config.model_type),
       id2label: model.config.id2label,
       modelId,
       device,
     };
     deviceEl.textContent = device.toUpperCase();
     statusEl.textContent = `Running ${modelId} 100% locally on ${device.toUpperCase()}.`;
-    return detector;
+    return loaded;
   } catch (err) {
     if (device === 'webgpu') {
       runtimeForceWasm.add(modelId);
@@ -134,22 +140,21 @@ async function loadDetector(modelId, forceWasm = false) {
 async function ensureDetector() {
   const modelId = modelSelect.value;
   if (detector && detector.modelId === modelId) return detector;
-  if (loadingPromise) return loadingPromise;
-  loadingPromise = loadDetector(modelId).finally(() => {
-    loadingPromise = null;
-  });
-  return loadingPromise;
+  if (detector) await detector.model.dispose();
+  detector = null;
+  detector = await loadDetector(modelId);
+  return detector;
 }
 
 /** Run the detector on the current video frame; boxes come back in canvas pixels. */
-async function detectFrame(det) {
+async function detectFrame(det, captured) {
   const { width, height } = det.input;
   if (offscreen.width !== width || offscreen.height !== height) {
     offscreen.width = width;
     offscreen.height = height;
   }
   // Plain resize to the model's input size (what the HF image processor does; no letterbox).
-  offCtx.drawImage(video, 0, 0, width, height);
+  offCtx.drawImage(captured, 0, 0, width, height);
   const { data } = offCtx.getImageData(0, 0, width, height);
   const pixels = preprocessRGBA(data, width, height, det.prep);
   const out = await det.model({ pixel_values: new Tensor('float32', pixels, [1, 3, height, width]) });
@@ -161,7 +166,7 @@ async function detectFrame(det) {
     width: canvas.width,
     height: canvas.height,
     mode: det.mode,
-    threshold: DETECT_THRESHOLD,
+    threshold: Math.min(DETECT_THRESHOLD, tracker.lowThresh),
     allowedLabels: peopleOnlyChk.checked ? new Set(['person']) : null,
   });
 }
@@ -197,8 +202,16 @@ function drawPrivacyBackdrop(mode) {
     return;
   }
 
-  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-  if (mode === 'none') return;
+  if (mode === 'none') {
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    return;
+  }
+  // Display the exact pixels that produced the boxes, including while inference is pending.
+  if (!latestFrame) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+  ctx.drawImage(latestFrame, 0, 0);
 
   for (const { xmin, ymin, xmax, ymax } of privacyBoxes()) {
     const w = Math.max(4, xmax - xmin);
@@ -213,7 +226,12 @@ function drawPrivacyBackdrop(mode) {
       ctx.rect(xmin, ymin, w, h);
     }
     ctx.clip();
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    if (ctx.filter === 'blur(16px)' && 'filter' in CanvasRenderingContext2D.prototype) {
+      ctx.drawImage(latestFrame, 0, 0);
+    } else {
+      ctx.fillStyle = '#10131a';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
     ctx.restore();
   }
 }
@@ -277,7 +295,7 @@ function renderFrame() {
     for (const tr of latestCoasting) drawTrack(tr, mode);
     for (const tr of latestTracks) drawTrack(tr, mode);
   }
-  requestAnimationFrame(renderFrame);
+  renderRequest = requestAnimationFrame(renderFrame);
 }
 
 function updateTrails(tracks, coasting) {
@@ -299,6 +317,7 @@ async function startInferenceWorker(myToken) {
   let lastVideoTime = -1;
   let lastFrameTs = null; // video time (files) or wall-clock time (webcam) of the last processed frame
   let emaInterval = null;
+  let captured = document.createElement('canvas');
 
   while (running && myToken === sessionToken) {
     if (video.paused || video.ended || video.readyState < 2) {
@@ -306,33 +325,42 @@ async function startInferenceWorker(myToken) {
       continue;
     }
 
-    // Reset tracking when a looped video wraps back to the beginning
-    if (!video.srcObject && lastVideoTime > 0 && video.currentTime + 0.5 < lastVideoTime) {
-      resetTracking();
-    }
-    lastVideoTime = video.currentTime;
-
     try {
       let det = await ensureDetector();
       if (!running || myToken !== sessionToken) break;
-
+      const frameTs = video.currentTime;
+      if (frameTs === lastVideoTime) {
+        await new Promise(r => setTimeout(r, 8));
+        continue;
+      }
+      if (lastVideoTime > frameTs) {
+        resetRecording();
+        lastFrameTs = null;
+        emaInterval = null;
+      }
+      lastVideoTime = frameTs;
+      if (captured.width !== canvas.width) captured.width = canvas.width;
+      if (captured.height !== canvas.height) captured.height = canvas.height;
+      captured.getContext('2d').drawImage(video, 0, 0, captured.width, captured.height);
       const t0 = performance.now();
       let dets;
       try {
-        dets = await detectFrame(det);
+        dets = await detectFrame(det, captured);
       } catch (inferErr) {
         if (det.device !== 'webgpu') throw inferErr;
         runtimeForceWasm.add(det.modelId);
+        await det.model.dispose();
         detector = null;
         statusEl.textContent = `WebGPU op unsupported for ${det.modelId}; switching to WASM…`;
-        det = await loadDetector(det.modelId, true);
+        detector = await loadDetector(det.modelId, true);
+        det = detector;
         if (!running || myToken !== sessionToken) break;
-        dets = await detectFrame(det);
+        dets = await detectFrame(det, captured);
       }
       if (!running || myToken !== sessionToken) break;
 
       // Widen association when inference runs slowly, so walking people keep their ID.
-      const frameTs = video.srcObject ? performance.now() / 1000 : video.currentTime;
+
       if (lastFrameTs !== null && frameTs > lastFrameTs) {
         const dt = frameTs - lastFrameTs;
         emaInterval = emaInterval === null ? dt : 0.8 * emaInterval + 0.2 * dt;
@@ -343,6 +371,9 @@ async function startInferenceWorker(myToken) {
       const tracks = tracker.update(dets);
       const coasting = tracker.coastingTracks(COAST_FRAMES);
       updateTrails(tracks, coasting);
+      const previous = latestFrame;
+      latestFrame = captured;
+      captured = previous || document.createElement('canvas');
       latestDets = dets;
       latestTracks = tracks;
       latestCoasting = coasting;
@@ -356,6 +387,7 @@ async function startInferenceWorker(myToken) {
       for (const tr of tracks) {
         records.push({
           frame_idx: frameIdx,
+          timestamp_s: Number(frameTs.toFixed(4)),
           track_id: tr.id,
           class_name: tr.label,
           confidence: Number(tr.score.toFixed(4)),
@@ -368,7 +400,7 @@ async function startInferenceWorker(myToken) {
       frameIdx++;
     } catch (err) {
       if (myToken !== sessionToken) break;
-      running = false;
+      stopSource();
       statusEl.textContent = `Error: ${err?.message || err}`;
       console.error('Trackflow playground error:', err);
       break;
@@ -379,56 +411,89 @@ async function startInferenceWorker(myToken) {
   }
 }
 
-function beginSession() {
-  sessionToken++;
+function resetRecording() {
   resetTracking();
   records = [];
   frameIdx = 0;
   emaInferFps = 0;
+}
+
+function scheduleWorker(token) {
+  worker = worker.then(() => startInferenceWorker(token));
+}
+
+function stopSource() {
+  sessionToken++;
+  running = false;
+  cancelAnimationFrame(renderRequest);
+  video.pause();
+  if (video.srcObject) {
+    video.srcObject.getTracks().forEach(track => track.stop());
+    video.srcObject = null;
+  }
+  if (fileUrl) {
+    video.removeAttribute('src');
+    video.load();
+    URL.revokeObjectURL(fileUrl);
+    fileUrl = null;
+  }
+  resetTracking();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+function beginSession() {
+  resetRecording();
   running = true;
-  requestAnimationFrame(renderFrame);
-  startInferenceWorker(sessionToken);
+  renderRequest = requestAnimationFrame(renderFrame);
+  scheduleWorker(sessionToken);
 }
 
 document.getElementById('webcamBtn').addEventListener('click', async () => {
+  stopSource();
+  const token = sessionToken;
   try {
-    await ensureDetector();
     const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 360 } });
+    if (token !== sessionToken) {
+      stream.getTracks().forEach(track => track.stop());
+      return;
+    }
     video.srcObject = stream;
     await video.play();
+    if (token !== sessionToken) return;
     canvas.width = video.videoWidth || 640;
     canvas.height = video.videoHeight || 360;
     beginSession();
   } catch (err) {
-    statusEl.textContent = `Webcam error: ${err?.message || err}`;
+    if (token === sessionToken) {
+      stopSource();
+      statusEl.textContent = `Webcam error: ${err?.message || err}`;
+    }
   }
 });
 
 document.getElementById('videoFile').addEventListener('change', async e => {
   const file = e.target.files?.[0];
   if (!file) return;
+  stopSource();
+  const token = sessionToken;
   try {
-    await ensureDetector();
-    video.srcObject = null;
-    video.src = URL.createObjectURL(file);
+    fileUrl = URL.createObjectURL(file);
+    video.src = fileUrl;
     await video.play();
+    if (token !== sessionToken) return;
     canvas.width = Math.min(960, video.videoWidth || 640);
     canvas.height = Math.round(canvas.width * ((video.videoHeight || 360) / (video.videoWidth || 640)));
     beginSession();
   } catch (err) {
-    statusEl.textContent = `Video error: ${err?.message || err}`;
+    if (token === sessionToken) {
+      stopSource();
+      statusEl.textContent = `Video error: ${err?.message || err}`;
+    }
   }
 });
 
 document.getElementById('stopBtn').addEventListener('click', () => {
-  sessionToken++;
-  running = false;
-  resetTracking();
-  video.pause();
-  if (video.srcObject) {
-    video.srcObject.getTracks().forEach(t => t.stop());
-    video.srcObject = null;
-  }
+  stopSource();
   statusEl.textContent = 'Stopped.';
 });
 
@@ -440,4 +505,5 @@ document.getElementById('exportBtn').addEventListener('click', () => {
   a.href = URL.createObjectURL(blob);
   a.download = 'trackflow_tracks.jsonl';
   a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 });
