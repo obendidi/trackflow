@@ -123,7 +123,8 @@ def run(
     anonymize: Annotated[
         str,
         typer.Option(
-            "--anonymize", help="Privacy mode: none, blur, pixelate, face-blur, skeleton."
+            "--anonymize",
+            help="Privacy mode: none, blur, pixelate, face-blur (top 30% of each person box), skeleton.",
         ),
     ] = "none",
     homography: Annotated[
