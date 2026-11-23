@@ -38,6 +38,15 @@ class ReidModelSpec:
 
 
 MODEL_REGISTRY: dict[str, ModelSpec] = {
+    "rfdetr-nano": ModelSpec(
+        name="rfdetr-nano",
+        repo_id="onnx-community/rfdetr_nano-ONNX",
+        architecture="RF-DETR Nano",
+        license="Apache-2.0",
+        approx_size_mb=108.1,
+        default_input_size=(384, 384),
+        description="Fast 384x384 Apache-2.0 DINOv2 detection transformer (~30+ FPS on Apple Silicon CPU).",
+    ),
     "dfine-n": ModelSpec(
         name="dfine-n",
         repo_id="onnx-community/dfine_n_coco-ONNX",

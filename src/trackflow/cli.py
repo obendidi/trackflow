@@ -9,7 +9,14 @@ from typing import Annotated
 import onnxruntime as ort
 import typer
 from rich.console import Console
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.table import Table
 
 from trackflow import __version__
@@ -121,7 +128,7 @@ def run(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
-        TextColumn("{task.completed}/{task.total or '?'} frames"),
+        MofNCompleteColumn(),
         TimeElapsedColumn(),
         console=console,
     ) as progress:

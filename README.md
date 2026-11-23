@@ -102,9 +102,10 @@ All weights auto-download and cache from Hugging Face on first run:
 
 | Preset | Model | Size (FP32) | License | Best For |
 | :--- | :--- | ---: | :--- | :--- |
-| `rtdetr-v2-r18` *(default)* | RT-DETRv2 ResNet-18 | ~81 MB | Apache-2.0 | Balanced speed & dense crowd accuracy |
-| `dfine-n` | D-FINE Nano (COCO) | ~15 MB | Apache-2.0 | Ultra-lightweight edge / CPU fallback |
-| `rfdetr-base` | RF-DETR Base (COCO) | ~108 MB | Apache-2.0 | High-accuracy people tracking |
+| `rtdetr-v2-r18` *(default)* | RT-DETRv2 ResNet-18 | ~81 MB | Apache-2.0 | High accuracy for dense crowds |
+| `rfdetr-nano` | RF-DETR Nano (384×384) | ~108 MB | Apache-2.0 | **30+ FPS** real-time on Apple Silicon & WebGPU |
+| `rfdetr-base` | RF-DETR Base (COCO) | ~108 MB | Apache-2.0 | Maximum accuracy people tracking |
+| `dfine-n` | D-FINE Nano (COCO) | ~15 MB | Apache-2.0 | Ultra-small download footprint |
 | `--reid clip` | CLIP ViT-B/32 (INT8 ONNX) | ~153 MB | MIT | Fast natural-language querying & Re-ID |
 | `--reid siglip` | SigLIP Base (INT8 ONNX) | ~205 MB | Apache-2.0 | Fine-grained clothing/attribute queries |
 

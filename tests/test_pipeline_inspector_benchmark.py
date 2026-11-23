@@ -137,8 +137,21 @@ def test_end_to_end_pipeline_inspector_and_benchmark(tmp_path: Path) -> None:
     assert Path(bench["split_screen_video"]).is_file()
 
 
-def test_cli_smoke_commands() -> None:
+def test_cli_smoke_commands(tmp_path: Path, monkeypatch) -> None:
     runner = CliRunner()
     for args in (["--help"], ["models"], ["info"], ["version"]):
         res = runner.invoke(app, args)
         assert res.exit_code == 0, f"CLI failed for {args}: {res.output}"
+
+    # Verify `trackflow run` CLI progress bar and summary rendering end-to-end
+    vid = generate_synthetic_crowd_video(tmp_path / "cli_smoke.mp4", num_frames=6)
+    monkeypatch.setattr(
+        "trackflow.pipeline.OnnxDetrDetector",
+        lambda **_kwargs: _SyntheticMotionDetector(),
+    )
+    res = runner.invoke(
+        app,
+        ["run", str(vid), "--no-video", "--export", "jsonl", "--output", str(tmp_path / "out")],
+    )
+    assert res.exit_code == 0, f"CLI run failed: {res.output}"
+    assert (tmp_path / "out" / "tracks.jsonl").is_file()

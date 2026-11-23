@@ -116,10 +116,11 @@ def select_providers(device: str = "auto") -> list[str]:
             if p in available
         ]
 
-    # Auto-selection: prefer GPU / Apple Neural Engine / Metal via CoreML, then CPU.
+    # Auto-selection: prefer NVIDIA CUDA if present, else multi-threaded CPU.
+    # (DETR/RF-DETR graphs split into 75–135 partitions on CoreML EP, making CPU 1.4x–3x faster on Apple Silicon;
+    # users can still explicitly opt in with --device coreml.)
     preferred = [
         "CUDAExecutionProvider",
-        "CoreMLExecutionProvider",
         "CPUExecutionProvider",
     ]
     selected = [p for p in preferred if p in available]

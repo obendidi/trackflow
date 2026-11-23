@@ -1,4 +1,4 @@
-import { pipeline, env, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.2';
+import { pipeline, env, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
 import { BrowserByteTracker } from './tracker.js';
 
 env.allowLocalModels = false;
@@ -22,50 +22,82 @@ const peopleOnlyChk = document.getElementById('peopleOnly');
 const threshSlider = document.getElementById('threshSlider');
 const threshVal = document.getElementById('threshVal');
 
-// Models known to use AveragePool ceil_mode=1 (unsupported in ORT WebGPU EP) run on WASM directly.
-const forceWasmModels = new Set(['onnx-community/rtdetr_v2_r18vd-ONNX']);
+// Per-model optimal dtype/device configuration
+const MODEL_CONFIG = {
+  'onnx-community/rfdetr_nano-ONNX': { webgpuDtype: 'fp32', wasmDtype: 'q8', forceWasm: false },
+  'onnx-community/rfdetr_base-ONNX': { webgpuDtype: 'fp32', wasmDtype: 'q8', forceWasm: false },
+  'onnx-community/rtdetr_v2_r18vd-ONNX': { webgpuDtype: 'fp32', wasmDtype: 'q8', forceWasm: true },
+  'Xenova/yolos-tiny': { webgpuDtype: 'fp32', wasmDtype: 'q8', forceWasm: false },
+};
+
+const runtimeForceWasm = new Set(
+  Object.entries(MODEL_CONFIG)
+    .filter(([, cfg]) => cfg.forceWasm)
+    .map(([id]) => id)
+);
 
 let detector = null;
 let loadedModelId = null;
 let activeDevice = null;
 let loadingPromise = null;
+let sessionToken = 0;
 let running = false;
+let latestTracks = [];
 let tracker = new BrowserByteTracker();
 let frameIdx = 0;
 let records = [];
+let emaInferFps = 0;
 
 threshSlider.addEventListener('input', () => {
-  threshVal.textContent = Number(threshSlider.value).toFixed(2);
-  tracker.highThresh = Number(threshSlider.value);
+  const val = Number(threshSlider.value);
+  threshVal.textContent = val.toFixed(2);
+  tracker.highThresh = val;
+  tracker.newTrackThresh = Math.min(0.9, val + 0.05);
 });
 
 modelSelect.addEventListener('change', () => {
+  sessionToken++;
   detector = null;
   loadedModelId = null;
   activeDevice = null;
+  latestTracks = [];
   tracker.reset();
+  if (running) startInferenceWorker(sessionToken);
 });
 
+async function hasRealWebGPU() {
+  if (typeof navigator === 'undefined' || !navigator.gpu) return false;
+  try {
+    const adapter = await navigator.gpu.requestAdapter();
+    return Boolean(adapter);
+  } catch {
+    return false;
+  }
+}
+
 async function loadDetector(modelId, forceWasm = false) {
-  const hasWebGPU = typeof navigator !== 'undefined' && 'gpu' in navigator;
-  const targetDevice = !forceWasm && hasWebGPU && !forceWasmModels.has(modelId) ? 'webgpu' : 'wasm';
-  deviceEl.textContent = targetDevice.toUpperCase();
-  statusEl.textContent = `Loading ${modelId} on ${targetDevice.toUpperCase()} (cached in browser after first download)…`;
+  const cfg = MODEL_CONFIG[modelId] || { webgpuDtype: 'fp32', wasmDtype: 'q8' };
+  const hasWebGPU = !forceWasm && !runtimeForceWasm.has(modelId) && (await hasRealWebGPU());
+  const targetDevice = hasWebGPU ? 'webgpu' : 'wasm';
+  const dtype = targetDevice === 'webgpu' ? cfg.webgpuDtype : cfg.wasmDtype;
+
+  deviceEl.textContent = `${targetDevice.toUpperCase()}…`;
+  statusEl.textContent = `Loading ${modelId} (${dtype}) on ${targetDevice.toUpperCase()} — cached in browser after first download…`;
 
   try {
     const det = await pipeline('object-detection', modelId, {
       device: targetDevice,
-      dtype: targetDevice === 'webgpu' ? 'fp32' : 'q8',
+      dtype,
     });
     detector = det;
     loadedModelId = modelId;
     activeDevice = targetDevice;
     deviceEl.textContent = targetDevice.toUpperCase();
-    statusEl.textContent = `Ready · ${modelId} running 100% locally on ${targetDevice.toUpperCase()}.`;
+    statusEl.textContent = `Running ${modelId} 100% locally on ${targetDevice.toUpperCase()}.`;
     return det;
   } catch (err) {
     if (targetDevice === 'webgpu') {
-      forceWasmModels.add(modelId);
+      runtimeForceWasm.add(modelId);
       statusEl.textContent = `WebGPU init failed (${err?.message || err}); switching to WASM…`;
       return loadDetector(modelId, true);
     }
@@ -143,105 +175,173 @@ function drawSkeleton(tr, color) {
   seg(cx, ymin + bh * 0.56, cx + bw * 0.16, ymax - 2);
 }
 
-function renderTracks(tracks, mode) {
-  drawPrivacyBackdrop(tracks, mode);
-  for (const tr of tracks) {
-    const col = PALETTE[tr.id % PALETTE.length];
-    if (mode === 'skeleton') drawSkeleton(tr, col);
+function renderFrame() {
+  if (!running) return;
+  if (!video.paused && !video.ended && video.readyState >= 2) {
+    const mode = privacySelect.value;
+    drawPrivacyBackdrop(latestTracks, mode);
 
-    if (tr.trail.length >= 2) {
+    for (const tr of latestTracks) {
+      const col = PALETTE[tr.id % PALETTE.length];
+      ctx.globalAlpha = tr.missed > 0 ? 0.65 : 1.0;
+
+      if (mode === 'skeleton') drawSkeleton(tr, col);
+
+      if (tr.trail.length >= 2) {
+        ctx.strokeStyle = col;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        tr.trail.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+        ctx.stroke();
+      }
+
+      const { xmin, ymin, xmax, ymax } = tr.box;
       ctx.strokeStyle = col;
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      tr.trail.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
-      ctx.stroke();
+      ctx.lineWidth = 2.2;
+      ctx.strokeRect(xmin, ymin, xmax - xmin, ymax - ymin);
+
+      const lbl = `#${tr.id} ${tr.label} ${tr.score.toFixed(2)}`;
+      ctx.font = '600 12px ui-monospace, monospace';
+      const tw = ctx.measureText(lbl).width + 10;
+      ctx.fillStyle = col;
+      ctx.fillRect(xmin, Math.max(0, ymin - 19), tw, 19);
+      ctx.fillStyle = '#090d1a';
+      ctx.fillText(lbl, xmin + 5, Math.max(13, ymin - 5));
+    }
+    ctx.globalAlpha = 1.0;
+  }
+  requestAnimationFrame(renderFrame);
+}
+
+/**
+ * Decoupled async inference worker: processes the latest video frame continuously
+ * without ever blocking or stuttering the 60 FPS video render loop.
+ */
+async function startInferenceWorker(myToken) {
+  let lastInferTs = performance.now();
+  let lastVideoTime = -1;
+
+  while (running && myToken === sessionToken) {
+    if (video.paused || video.ended || video.readyState < 2) {
+      await new Promise(r => setTimeout(r, 40));
+      continue;
     }
 
-    const { xmin, ymin, xmax, ymax } = tr.box;
-    ctx.strokeStyle = col;
-    ctx.lineWidth = 2;
-    ctx.strokeRect(xmin, ymin, xmax - xmin, ymax - ymin);
+    // Reset tracker cleanly when a looped video wraps back to the beginning
+    if (!video.srcObject && lastVideoTime > 0 && video.currentTime + 0.5 < lastVideoTime) {
+      tracker.reset();
+      latestTracks = [];
+    }
+    lastVideoTime = video.currentTime;
 
-    const lbl = `#${tr.id} ${tr.label} ${tr.score.toFixed(2)}`;
-    ctx.font = '12px ui-monospace, monospace';
-    const tw = ctx.measureText(lbl).width + 8;
-    ctx.fillStyle = col;
-    ctx.fillRect(xmin, Math.max(0, ymin - 18), tw, 18);
-    ctx.fillStyle = '#090d1a';
-    ctx.fillText(lbl, xmin + 4, Math.max(13, ymin - 5));
+    try {
+      let detFn = await ensureDetector();
+      if (!running || myToken !== sessionToken) break;
+
+      const t0 = performance.now();
+      // Downscale offscreen capture to <= 448px wide to accelerate RawImage pixel transfer
+      const inferW = Math.min(448, canvas.width);
+      const inferH = Math.max(1, Math.round(inferW * (canvas.height / Math.max(1, canvas.width))));
+      if (offscreen.width !== inferW || offscreen.height !== inferH) {
+        offscreen.width = inferW;
+        offscreen.height = inferH;
+      }
+      offCtx.drawImage(video, 0, 0, inferW, inferH);
+      const frameImage = RawImage.fromCanvas(offscreen);
+
+      let rawDets;
+      try {
+        rawDets = await detFn(frameImage, {
+          threshold: 0.18,
+          percentage: false,
+        });
+      } catch (inferErr) {
+        if (activeDevice === 'webgpu') {
+          const modelId = modelSelect.value;
+          runtimeForceWasm.add(modelId);
+          detector = null;
+          loadedModelId = null;
+          statusEl.textContent = `WebGPU op unsupported for ${modelId}; switching cleanly to WASM…`;
+          detFn = await loadDetector(modelId, true);
+          if (!running || myToken !== sessionToken) break;
+          rawDets = await detFn(frameImage, {
+            threshold: 0.18,
+            percentage: false,
+          });
+        } else {
+          throw inferErr;
+        }
+      }
+
+      if (!running || myToken !== sessionToken) break;
+
+      const scaleX = canvas.width / inferW;
+      const scaleY = canvas.height / inferH;
+      const peopleOnly = peopleOnlyChk.checked;
+      const filtered = rawDets
+        .filter(d => !peopleOnly || d.label.toLowerCase() === 'person')
+        .map(d => ({
+          ...d,
+          box: {
+            xmin: d.box.xmin * scaleX,
+            ymin: d.box.ymin * scaleY,
+            xmax: d.box.xmax * scaleX,
+            ymax: d.box.ymax * scaleY,
+          },
+        }));
+
+      const now = performance.now();
+      const dtSec = (now - lastInferTs) / 1000;
+      lastInferTs = now;
+
+      const tracks = tracker.update(filtered, dtSec);
+      latestTracks = tracks;
+
+      const dt = Math.max(1, now - t0);
+      const instFps = 1000 / dt;
+      emaInferFps = emaInferFps === 0 ? instFps : 0.75 * emaInferFps + 0.25 * instFps;
+      fpsEl.textContent = emaInferFps.toFixed(1);
+      activeEl.textContent = String(tracks.length);
+      uniqueEl.textContent = String(tracker.uniqueCount);
+
+      for (const tr of tracks) {
+        if (tr.missed === 0) {
+          records.push({
+            frame_idx: frameIdx,
+            track_id: tr.id,
+            class_name: tr.label,
+            confidence: Number(tr.score.toFixed(4)),
+            x1: Number(tr.box.xmin.toFixed(1)),
+            y1: Number(tr.box.ymin.toFixed(1)),
+            x2: Number(tr.box.xmax.toFixed(1)),
+            y2: Number(tr.box.ymax.toFixed(1)),
+          });
+        }
+      }
+      frameIdx++;
+    } catch (err) {
+      if (myToken !== sessionToken) break;
+      running = false;
+      statusEl.textContent = `Error: ${err?.message || err}`;
+      console.error('Trackflow WebGPU playground error:', err);
+      break;
+    }
+
+    // Yield one macrotask so UI controls stay responsive
+    await new Promise(r => setTimeout(r, 0));
   }
 }
 
-async function loop() {
-  if (!running || video.paused || video.ended) return;
-
-  try {
-    let detFn = await ensureDetector();
-
-    const t0 = performance.now();
-    if (offscreen.width !== canvas.width || offscreen.height !== canvas.height) {
-      offscreen.width = canvas.width;
-      offscreen.height = canvas.height;
-    }
-    offCtx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
-    const frameImage = RawImage.fromCanvas(offscreen);
-
-    let rawDets;
-    try {
-      rawDets = await detFn(frameImage, {
-        threshold: 0.15,
-        percentage: false,
-      });
-    } catch (inferErr) {
-      // ORT WebGPU compiles kernels lazily on the first run() call; gracefully fall back to WASM.
-      if (activeDevice === 'webgpu') {
-        const modelId = modelSelect.value;
-        forceWasmModels.add(modelId);
-        detector = null;
-        loadedModelId = null;
-        statusEl.textContent = `WebGPU op unsupported for ${modelId}; falling back to WASM…`;
-        detFn = await loadDetector(modelId, true);
-        rawDets = await detFn(frameImage, {
-          threshold: 0.15,
-          percentage: false,
-        });
-      } else {
-        throw inferErr;
-      }
-    }
-
-    const peopleOnly = peopleOnlyChk.checked;
-    const filtered = rawDets.filter(d => !peopleOnly || d.label.toLowerCase() === 'person');
-    const tracks = tracker.update(filtered);
-
-    const dt = Math.max(1, performance.now() - t0);
-    fpsEl.textContent = (1000 / dt).toFixed(1);
-    activeEl.textContent = String(tracks.length);
-    uniqueEl.textContent = String(tracker.uniqueCount);
-
-    renderTracks(tracks, privacySelect.value);
-
-    for (const tr of tracks) {
-      records.push({
-        frame_idx: frameIdx,
-        track_id: tr.id,
-        class_name: tr.label,
-        confidence: Number(tr.score.toFixed(4)),
-        x1: Number(tr.box.xmin.toFixed(1)),
-        y1: Number(tr.box.ymin.toFixed(1)),
-        x2: Number(tr.box.xmax.toFixed(1)),
-        y2: Number(tr.box.ymax.toFixed(1)),
-      });
-    }
-    frameIdx++;
-  } catch (err) {
-    running = false;
-    statusEl.textContent = `Error: ${err?.message || err}`;
-    console.error('Trackflow WebGPU playground error:', err);
-    return;
-  }
-
-  if (running) requestAnimationFrame(loop);
+function beginSession() {
+  sessionToken++;
+  tracker.reset();
+  latestTracks = [];
+  records = [];
+  frameIdx = 0;
+  emaInferFps = 0;
+  running = true;
+  requestAnimationFrame(renderFrame);
+  startInferenceWorker(sessionToken);
 }
 
 document.getElementById('webcamBtn').addEventListener('click', async () => {
@@ -252,11 +352,7 @@ document.getElementById('webcamBtn').addEventListener('click', async () => {
     await video.play();
     canvas.width = video.videoWidth || 640;
     canvas.height = video.videoHeight || 360;
-    tracker.reset();
-    records = [];
-    frameIdx = 0;
-    running = true;
-    loop();
+    beginSession();
   } catch (err) {
     statusEl.textContent = `Webcam error: ${err?.message || err}`;
   }
@@ -272,18 +368,16 @@ document.getElementById('videoFile').addEventListener('change', async e => {
     await video.play();
     canvas.width = Math.min(960, video.videoWidth || 640);
     canvas.height = Math.round(canvas.width * ((video.videoHeight || 360) / (video.videoWidth || 640)));
-    tracker.reset();
-    records = [];
-    frameIdx = 0;
-    running = true;
-    loop();
+    beginSession();
   } catch (err) {
     statusEl.textContent = `Video error: ${err?.message || err}`;
   }
 });
 
 document.getElementById('stopBtn').addEventListener('click', () => {
+  sessionToken++;
   running = false;
+  latestTracks = [];
   video.pause();
   if (video.srcObject) {
     video.srcObject.getTracks().forEach(t => t.stop());

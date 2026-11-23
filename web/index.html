@@ -48,9 +48,10 @@
       <label class="file-btn">Load Video File <input id="videoFile" type="file" accept="video/*" /></label>
       <button id="stopBtn">Stop</button>
       <select id="modelSelect" title="Detector model">
-        <option value="Xenova/yolos-tiny" selected>YOLOS Tiny (~26 MB · WebGPU Fast)</option>
-        <option value="onnx-community/rfdetr_base-ONNX">RF-DETR Base (~108 MB · WebGPU Accurate)</option>
-        <option value="onnx-community/rtdetr_v2_r18vd-ONNX">RT-DETRv2 R18 (~21 MB Q8 · WASM)</option>
+        <option value="onnx-community/rfdetr_nano-ONNX" selected>RF-DETR Nano (Apache-2.0 · WebGPU Fast & Accurate)</option>
+        <option value="onnx-community/rfdetr_base-ONNX">RF-DETR Base (Apache-2.0 · High Accuracy)</option>
+        <option value="onnx-community/rtdetr_v2_r18vd-ONNX">RT-DETRv2 R18 (Apache-2.0 · WASM)</option>
+        <option value="Xenova/yolos-tiny">YOLOS Tiny (26 MB · Ultra-Light)</option>
       </select>
       <select id="privacySelect" title="Privacy anonymization mode">
         <option value="none" selected>Privacy: Off</option>
