@@ -99,7 +99,7 @@ def render_split_screen_2017_vs_2026(
     *,
     modern_summary: RunSummary,
 ) -> Path:
-    """Create a 2017 vs. 2026 side-by-side showcase video illustrating 9 years of progress."""
+    """Create a side-by-side comparison video against the 2017 baseline."""
     src = Path(modern_video_path)
     out = Path(out_path)
     cap = cv2.VideoCapture(str(src))

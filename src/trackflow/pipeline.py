@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import time
+import warnings
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
@@ -17,9 +18,9 @@ from trackflow.detector import OnnxDetrDetector
 from trackflow.homography import FloorplanHomography
 from trackflow.models import Precision
 from trackflow.privacy import AnonymizeMode, PrivacyAnonymizer
-from trackflow.reid import AppearanceEmbedder, ReidBackend, TrackCardIndex
+from trackflow.reid import ReidBackend, ReidEmbedder, TrackCardIndex, VlmBackend, VlmEmbedder
 from trackflow.sinks import draw_tracks, write_csv, write_html_report, write_jsonl, write_parquet
-from trackflow.tracker import create_tracker
+from trackflow.tracker import create_tracker, iou_buffer_for_interval
 from trackflow.types import Detection, FrameResult, RunSummary
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -109,6 +110,15 @@ def _iter_frames(
     return _gen_vid(), float(fps), w, h, total
 
 
+def _crop(frame_bgr: np.ndarray, bbox: tuple[float, float, float, float]) -> np.ndarray | None:
+    h, w = frame_bgr.shape[:2]
+    x1, y1 = max(0, int(round(bbox[0]))), max(0, int(round(bbox[1])))
+    x2, y2 = min(w, int(round(bbox[2]))), min(h, int(round(bbox[3])))
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    return frame_bgr[y1:y2, x1:x2]
+
+
 class TrackflowPipeline:
     """Unified real-time tracking pipeline combining detection, MOT, Re-ID/NL query, privacy & floorplan."""
 
@@ -122,12 +132,15 @@ class TrackflowPipeline:
         threshold: float = 0.45,
         classes: Sequence[str] | None = ("person",),
         reid: ReidBackend = "none",
+        vlm: VlmBackend | None = None,
+        reid_merge: bool = False,
         query: str | None = None,
         query_threshold: float = 0.22,
         anonymize: AnonymizeMode = "none",
         homography: FloorplanHomography | str | Path | None = None,
         detector: Any | None = None,
-        embedder: AppearanceEmbedder | None = None,
+        reid_embedder: ReidEmbedder | None = None,
+        vlm_embedder: VlmEmbedder | None = None,
     ) -> None:
         self.model_name = model
         self.tracker_name = tracker
@@ -137,11 +150,24 @@ class TrackflowPipeline:
         self.query_threshold = float(query_threshold)
         self.anonymize_mode: AnonymizeMode = anonymize
 
-        # Automatically enable CLIP when a natural-language --query is passed without --reid
-        effective_reid: ReidBackend = reid
-        if self.query and effective_reid in ("none", "color") and embedder is None:
-            effective_reid = "clip"
-        self.reid_backend: ReidBackend = effective_reid
+        if reid in ("clip", "siglip"):
+            # Pre-0.1 runs used `--reid clip` for queries. CLIP can't tell people apart, so it is
+            # now only a vision-language model for --query / search, never an identity model.
+            warnings.warn(
+                f"--reid {reid} is now `--vlm {reid}` (text queries & search only). Use "
+                "`--reid osnet` for person re-identification.",
+                stacklevel=2,
+            )
+            vlm = vlm if vlm not in (None, "none") else reid  # type: ignore[assignment]
+            reid = "none"
+        if vlm is None:
+            vlm = "clip" if self.query else "none"
+        if reid_merge and reid == "none" and reid_embedder is None:
+            raise ValueError("--reid-merge needs a person Re-ID model: add `--reid osnet`.")
+
+        self.reid_backend: ReidBackend = reid_embedder.backend if reid_embedder else reid
+        self.vlm_backend: VlmBackend = vlm_embedder.backend if vlm_embedder else vlm
+        self.reid_merge = bool(reid_merge)
 
         self.detector = (
             detector
@@ -154,14 +180,15 @@ class TrackflowPipeline:
                 classes=classes,
             )
         )
-        self.embedder = (
-            embedder
-            if embedder is not None
-            else (
-                AppearanceEmbedder(backend=self.reid_backend, device=device)
-                if self.reid_backend != "none"
-                else None
-            )
+        self.reid_embedder = reid_embedder or (
+            ReidEmbedder(backend=self.reid_backend, device=device)
+            if self.reid_backend != "none"
+            else None
+        )
+        self.vlm_embedder = vlm_embedder or (
+            VlmEmbedder(backend=self.vlm_backend, device=device)
+            if self.vlm_backend != "none"
+            else None
         )
         self.anonymizer = PrivacyAnonymizer(mode=anonymize)
         if isinstance(homography, (str, Path)):
@@ -195,12 +222,17 @@ class TrackflowPipeline:
             track_high_thresh=self.threshold,
             track_low_thresh=max(0.10, self.threshold * 0.35),
             new_track_thresh=min(0.95, self.threshold + 0.05),
+            # Keep association working when frames are processed far apart (--skip, low FPS).
+            iou_buffer=iou_buffer_for_interval((skip + 1) / max(src_fps, 1e-3)),
         )
         card_index = TrackCardIndex(
-            embedder=self.embedder,
+            vlm=self.vlm_embedder,
+            reid=self.reid_embedder,
             query=self.query,
             query_threshold=self.query_threshold,
-            crops_dir=out_dir / "crops",
+            reid_merge=self.reid_merge,
+            # Raw person crops are PII: never write them when anonymizing.
+            crops_dir=out_dir / "crops" if self.anonymize_mode == "none" else None,
         )
 
         video_writer: cv2.VideoWriter | None = None
@@ -237,22 +269,21 @@ class TrackflowPipeline:
                 inf_ms_list.append(inf_ms)
                 total_dets += len(dets)
 
-                # Attach per-detection embeddings when BoT-SORT uses Re-ID
+                # Attach person Re-ID embeddings (batched) when BoT-SORT uses appearance
                 if (
                     self.tracker_name.lower().replace("-", "_") == "botsort"
-                    and self.embedder is not None
-                    and self.embedder.backend != "none"
+                    and self.reid_embedder is not None
                 ):
-                    for d in dets:
-                        if d.confidence >= self.threshold:
-                            x1, y1, x2, y2 = [int(round(v)) for v in d.bbox]
-                            x1, y1 = max(0, x1), max(0, y1)
-                            x2, y2 = min(width, x2), min(height, y2)
-                            if x2 - x1 >= 4 and y2 - y1 >= 4:
-                                d.embedding = self.embedder.encode_image(frame_bgr[y1:y2, x1:x2])
+                    high = [d for d in dets if d.confidence >= self.threshold]
+                    embs = self.reid_embedder.encode_images(
+                        [_crop(frame_bgr, d.bbox) for d in high]
+                    )
+                    for d, e in zip(high, embs, strict=True):
+                        d.embedding = e
 
                 t1 = time.perf_counter()
                 tracks = tracker.update(dets, frame_bgr=frame_bgr)
+                coasting = tracker.coasting_tracks(3)
                 trk_ms = (time.perf_counter() - t1) * 1000.0
                 trk_ms_list.append(trk_ms)
 
@@ -305,10 +336,16 @@ class TrackflowPipeline:
                 live_fps = processed / elapsed_now
 
                 if save_video or display:
-                    anon_frame = self.anonymizer.apply(frame_bgr, tracks)
+                    # Anonymize every box that may hold a person, not just confirmed tracks.
+                    anon_frame = self.anonymizer.apply(
+                        frame_bgr, tracks, detections=dets, coasting=coasting
+                    )
+                    for c in coasting:
+                        c.track_id = card_index.canonical_id(c.track_id)
                     rendered = draw_tracks(
                         anon_frame,
                         tracks,
+                        coasting=coasting,
                         trails=trails,
                         fps=live_fps,
                         query=self.query,
@@ -333,6 +370,15 @@ class TrackflowPipeline:
                 with contextlib.suppress(cv2.error):
                     cv2.destroyAllWindows()
 
+        # Merges are decided a few frames into a returning person's new track; relabel the
+        # observations recorded before that so exports use one ID per person.
+        if card_index.reid_merges:
+            for rec in records:
+                rec["track_id"] = card_index.canonical_id(rec["track_id"])
+            for fr_res in frame_results:
+                for tr in fr_res.tracks:
+                    tr.track_id = card_index.canonical_id(tr.track_id)
+
         elapsed_s = max(time.perf_counter() - t_start, 1e-6)
         avg_fps = processed / elapsed_s
         avg_inf = float(np.mean(inf_ms_list)) if inf_ms_list else 0.0
@@ -345,7 +391,9 @@ class TrackflowPipeline:
 
         # Persist Track Cards & diagnostic events (always written for `trackflow inspect` / `search`)
         cards_path = out_dir / "track_cards.json"
-        card_index.save_json(cards_path, reid_backend=self.reid_backend)
+        card_index.save_json(
+            cards_path, reid_backend=self.reid_backend, vlm_backend=self.vlm_backend
+        )
         output_files["track_cards"] = str(cards_path)
 
         events_path = out_dir / "events.json"

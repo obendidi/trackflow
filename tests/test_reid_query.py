@@ -1,16 +1,27 @@
-"""Tests for Track Cards, cross-exit long-term Re-ID, and natural-language video search."""
+"""Tests for Track Cards, opt-in cross-exit Re-ID merges, and natural-language video search."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import numpy as np
+import pytest
 
-from trackflow.reid import AppearanceEmbedder, TrackCardIndex, search_track_cards
+from trackflow.reid import ReidEmbedder, TrackCardIndex, VlmEmbedder, search_track_cards
 from trackflow.types import Track
 
+RED = (10, 10, 230)  # BGR
+BLUE = (230, 10, 10)
+GREEN = (10, 230, 10)
 
-class _MockVlmEmbedder(AppearanceEmbedder):
+
+def _mean_color_unit(crop_bgr: np.ndarray) -> np.ndarray:
+    b, g, r = crop_bgr.mean(axis=(0, 1))
+    vec = np.array([r, g, b], dtype=np.float32)
+    return vec / max(float(np.linalg.norm(vec)), 1e-6)
+
+
+class _MockVlm(VlmEmbedder):
     """Deterministic vision-language embedder mapping red vs blue crops & prompts cleanly."""
 
     def __init__(self) -> None:
@@ -21,16 +32,8 @@ class _MockVlmEmbedder(AppearanceEmbedder):
         self._tokenizer = object()  # type: ignore[assignment]
         self._text_cache = {}
 
-    @property
-    def supports_text(self) -> bool:
-        return True
-
     def encode_image(self, crop_bgr: np.ndarray | None) -> np.ndarray | None:
-        if crop_bgr is None or crop_bgr.size == 0:
-            return None
-        b, g, r = crop_bgr.mean(axis=(0, 1))
-        vec = np.array([r, g, b], dtype=np.float32)
-        return vec / max(float(np.linalg.norm(vec)), 1e-6)
+        return None if crop_bgr is None or crop_bgr.size == 0 else _mean_color_unit(crop_bgr)
 
     def encode_text(self, query: str) -> np.ndarray:
         q = query.lower()
@@ -41,59 +44,118 @@ class _MockVlmEmbedder(AppearanceEmbedder):
         return np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
 
-def test_cross_exit_reid_and_natural_language_search(tmp_path: Path) -> None:
-    embedder = _MockVlmEmbedder()
-    idx = TrackCardIndex(
-        embedder=embedder,
-        query="person in red jacket",
-        query_threshold=0.8,
-        reid_merge_threshold=0.95,
-        min_exit_gap_frames=5,
-        crops_dir=tmp_path / "crops",
-    )
+class _MockReid(ReidEmbedder):
+    """Identity embedder: people are distinguished by their (solid) clothing color."""
 
-    frame = np.zeros((200, 300, 3), dtype=np.uint8)
-    # Red jacket person on left (BGR: 10, 10, 230)
-    frame[20:140, 20:80] = (10, 10, 230)
-    # Blue coat person on right (BGR: 230, 10, 10)
-    frame[20:140, 180:240] = (230, 10, 10)
+    def __init__(self) -> None:
+        self.backend = "osnet"
 
-    tr_red = Track(
-        track_id=1, bbox=(20, 20, 80, 140), confidence=0.9, class_id=0, class_name="person"
-    )
-    tr_blue = Track(
-        track_id=2, bbox=(180, 20, 240, 140), confidence=0.88, class_id=0, class_name="person"
-    )
+    def encode_images(self, crops: list[np.ndarray | None]) -> list[np.ndarray | None]:
+        return [None if c is None or c.size == 0 else _mean_color_unit(c) for c in crops]
+
+
+def _frame(*people: tuple[tuple[int, int, int, int], tuple[int, int, int]]) -> np.ndarray:
+    frame = np.zeros((200, 400, 3), dtype=np.uint8)
+    for (x1, y1, x2, y2), color in people:
+        frame[y1:y2, x1:x2] = color
+    return frame
+
+
+def _track(tid: int, box: tuple[int, int, int, int]) -> Track:
+    return Track(track_id=tid, bbox=box, confidence=0.9, class_id=0, class_name="person")
+
+
+LEFT = (20, 20, 80, 140)
+RIGHT = (180, 20, 240, 140)
+FAR = (300, 20, 360, 140)
+
+
+def _feed(idx: TrackCardIndex, start: int, n: int, *people) -> list[dict]:
+    """Show the same people for n frames; returns all events."""
+    events = []
+    frame = _frame(*[(box, color) for _, box, color in people])
+    for f in range(start, start + n):
+        tracks = [_track(tid, box) for tid, box, _ in people]
+        events += idx.update(frame_idx=f, timestamp_s=f / 10, frame_bgr=frame, tracks=tracks)
+    return events
+
+
+def test_query_scoring_and_natural_language_search(tmp_path: Path) -> None:
+    vlm = _MockVlm()
+    idx = TrackCardIndex(vlm=vlm, query="person in red jacket", query_threshold=0.8)
+    frame = _frame((LEFT, RED), (RIGHT, BLUE))
+    tr_red, tr_blue = _track(1, LEFT), _track(2, RIGHT)
     idx.update(frame_idx=0, timestamp_s=0.0, frame_bgr=frame, tracks=[tr_red, tr_blue])
-
     assert tr_red.query_match is True
     assert tr_blue.query_match is False
 
-    # Red person exits for 10 frames, then re-enters as a fresh raw track_id=9 -> should merge to #1!
-    tr_red_reenter = Track(
-        track_id=9, bbox=(20, 20, 80, 140), confidence=0.92, class_id=0, class_name="person"
-    )
-    events = idx.update(frame_idx=12, timestamp_s=0.4, frame_bgr=frame, tracks=[tr_red_reenter])
-
-    assert tr_red_reenter.track_id == 1
-    assert tr_red_reenter.reid_merged_from == 9
-    assert idx.reid_merges == 1
-    assert any(e["type"] == "reid_cross_exit_merge" for e in events)
-    assert len(idx.cards) == 2
-
-    # Save Track Cards and run post-run natural-language search
-    cards_file = tmp_path / "track_cards.json"
-    idx.save_json(cards_file, reid_backend="clip")
-    hits = search_track_cards(tmp_path, "person in blue coat", top_k=2, embedder=embedder)
-    assert len(hits) == 2
-    assert hits[0]["track_id"] == 2
+    idx.save_json(tmp_path / "track_cards.json", vlm_backend="clip")
+    hits = search_track_cards(tmp_path, "person in blue coat", top_k=2, embedder=vlm)
+    assert [h["track_id"] for h in hits] == [2, 1]
     assert hits[0]["search_score"] > hits[1]["search_score"]
 
 
-def test_color_embedder_produces_unit_vectors() -> None:
-    emb = AppearanceEmbedder(backend="color")
+def test_query_never_merges_identities() -> None:
+    """A --query run (VLM only) must not merge different raw IDs, however similar they look."""
+    idx = TrackCardIndex(vlm=_MockVlm(), query="red")
+    _feed(idx, 0, 5, (1, LEFT, RED))
+    _feed(idx, 30, 5, (7, LEFT, RED))
+    assert idx.reid_merges == 0
+    assert sorted(idx.cards) == [1, 7]
+
+
+def test_merge_is_opt_in_and_needs_reid_model() -> None:
+    with pytest.raises(ValueError):
+        TrackCardIndex(vlm=_MockVlm(), reid_merge=True)
+
+    idx = TrackCardIndex(reid=_MockReid())  # Re-ID model but merging not enabled
+    _feed(idx, 0, 5, (1, LEFT, RED))
+    _feed(idx, 30, 10, (7, LEFT, RED))
+    assert idx.reid_merges == 0
+
+
+def test_returning_person_gets_earlier_id_after_enough_samples() -> None:
+    idx = TrackCardIndex(
+        reid=_MockReid(), reid_merge=True, merge_min_samples=3, reid_sample_every=1
+    )
+    _feed(idx, 0, 10, (1, LEFT, RED), (2, RIGHT, BLUE))
+
+    # Red person leaves, comes back 20 frames later as raw ID 9.
+    first = _feed(idx, 30, 2, (9, LEFT, RED))
+    assert first == [] and 9 in idx.cards  # not decided yet: provisional ID
+    events = _feed(idx, 32, 3, (9, LEFT, RED))
+    assert [e["type"] for e in events] == ["reid_cross_exit_merge"]
+    assert events[0]["raw_track_id"] == 9 and events[0]["canonical_track_id"] == 1
+    assert idx.canonical_id(9) == 1
+    assert sorted(idx.cards) == [1, 2]
+    assert idx.cards[1].frame_count == 15 and idx.cards[1].merged_track_ids == [9]
+
+    later = _track(9, LEFT)
+    idx.update(frame_idx=40, timestamp_s=4.0, frame_bgr=_frame((LEFT, RED)), tracks=[later])
+    assert later.track_id == 1 and later.reid_merged_from == 9
+
+
+def test_no_merge_with_someone_visible_at_the_same_time() -> None:
+    idx = TrackCardIndex(reid=_MockReid(), reid_merge=True, reid_sample_every=1)
+    # Two people in identical red clothes visible together: the second can't be the first.
+    _feed(idx, 0, 10, (1, LEFT, RED), (2, FAR, RED))
+    assert idx.reid_merges == 0 and sorted(idx.cards) == [1, 2]
+
+
+def test_ambiguous_look_alikes_are_not_merged() -> None:
+    idx = TrackCardIndex(reid=_MockReid(), reid_merge=True, reid_sample_every=1)
+    _feed(idx, 0, 10, (1, LEFT, RED), (2, FAR, RED))  # two people in red, both leave
+    _feed(idx, 50, 10, (3, LEFT, RED))  # matches #1 and #2 equally -> leave it alone
+    assert idx.reid_merges == 0 and sorted(idx.cards) == [1, 2, 3]
+
+    _feed(idx, 70, 10, (4, LEFT, GREEN))  # nobody similar -> new person
+    assert idx.reid_merges == 0
+
+
+def test_color_reid_embedder_produces_unit_vectors() -> None:
+    emb = ReidEmbedder(backend="color")
     crop = np.full((80, 40, 3), (30, 140, 220), dtype=np.uint8)
-    vec = emb.encode_image(crop)
-    assert vec is not None
-    assert vec.shape == (96,)
-    assert np.isclose(np.linalg.norm(vec), 1.0, atol=1e-4)
+    vecs = emb.encode_images([crop, None])
+    assert vecs[1] is None
+    assert vecs[0] is not None and vecs[0].shape == (96,)
+    assert np.isclose(np.linalg.norm(vecs[0]), 1.0, atol=1e-4)

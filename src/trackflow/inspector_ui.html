@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Trackflow Inspector — Visual Track Debugger & Floorplan Studio</title>
+<title>Trackflow Inspector</title>
 <style>
   :root {
     --bg: #090d1a; --panel: #11182c; --panel-2: #16203a; --border: #253358;
@@ -115,7 +115,7 @@
           <label class="hint">Height (m): <input type="number" id="worldH" value="8" step="0.5" style="width:74px;" /></label>
           <button class="btn primary" id="projectBtn">Project to Bird's-Eye</button>
         </div>
-        <div id="calibStatus" class="hint" style="margin-top:8px;">Click 4 ground-plane points to calibrate perspective homography.</div>
+        <div id="calibStatus" class="hint" style="margin-top:8px;">Click 4 ground corners to compute the homography.</div>
       </div>
       <div class="panel">
         <h2><span>2. Bird's-Eye Trajectories & Heatmap</span></h2>

@@ -214,7 +214,8 @@ def postprocess_detr_outputs(
     kept_classes = class_ids[keep]
     kept_boxes = pred_boxes[keep]
 
-    order = np.argsort(-kept_scores)[:max_detections]
+    # Stable sort so ties keep query order (web/detector.js mirrors this for parity).
+    order = np.argsort(-kept_scores, kind="stable")[:max_detections]
     orig_h, orig_w = orig_hw
 
     detections: list[Detection] = []

@@ -26,13 +26,13 @@ from trackflow.benchmark import (
     run_benchmark_suite,
 )
 from trackflow.inspector import serve_inspector
-from trackflow.models import MODEL_REGISTRY, REID_REGISTRY
+from trackflow.models import MODEL_REGISTRY, REID_REGISTRY, VLM_REGISTRY
 from trackflow.pipeline import TrackflowPipeline
 from trackflow.reid import search_track_cards
 
 app = typer.Typer(
     name="trackflow",
-    help="Modern real-time people & object tracking — queryable, debuggable, privacy-first.",
+    help="Real-time people and object tracking with ONNX detectors, ByteTrack/BoT-SORT, text search, and a local inspector.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -63,12 +63,32 @@ def run(
         str, typer.Option("--classes", "-c", help="Comma-separated class names, or 'all'.")
     ] = "person",
     reid: Annotated[
-        str, typer.Option("--reid", help="Appearance/VLM backend: none, color, clip, siglip.")
+        str,
+        typer.Option(
+            "--reid",
+            help="Person Re-ID model for BoT-SORT appearance and --reid-merge: none, osnet, color.",
+        ),
     ] = "none",
+    vlm: Annotated[
+        str | None,
+        typer.Option(
+            "--vlm",
+            help="Vision-language model for --query and `trackflow search`: none, clip, siglip "
+            "(default: clip when --query is set, else none).",
+        ),
+    ] = None,
+    reid_merge: Annotated[
+        bool,
+        typer.Option(
+            "--reid-merge/--no-reid-merge",
+            help="Give a person who leaves and comes back their earlier ID (needs --reid osnet). "
+            "Off by default: look-alikes are left unmerged, but mistakes are still possible.",
+        ),
+    ] = False,
     query: Annotated[
         str | None,
         typer.Option(
-            "--query", "-q", help='Natural-language prompt-to-track, e.g. "person in red jacket".'
+            "--query", "-q", help='Highlight tracks matching a text description, e.g. "person in red jacket".'
         ),
     ] = None,
     query_threshold: Annotated[
@@ -101,7 +121,7 @@ def run(
         bool, typer.Option("--display", help="Show live preview window if OpenCV GUI is available.")
     ] = False,
 ) -> None:
-    """Run real-time detection, tracking, optional NL querying, privacy anonymization, and exports."""
+    """Run detection and tracking on a video, image directory, or webcam."""
     class_list = [c.strip() for c in classes.split(",") if c.strip()]
     export_list = [e.strip() for e in export.split(",") if e.strip()]
 
@@ -118,6 +138,8 @@ def run(
         threshold=threshold,
         classes=class_list,
         reid=reid,  # type: ignore[arg-type]
+        vlm=vlm,  # type: ignore[arg-type]
+        reid_merge=reid_merge,
         query=query,
         query_threshold=query_threshold,
         anonymize=anonymize,  # type: ignore[arg-type]
@@ -219,7 +241,7 @@ def inspect(
         bool, typer.Option("--no-browser", help="Do not automatically open the browser.")
     ] = False,
 ) -> None:
-    """Launch the interactive Visual Track Debugger & 4-Point Floorplan Studio."""
+    """Open the local web inspector for a completed run (timeline, track cards, floorplan, compare)."""
     console.print(
         f"[bold green]Trackflow Inspector[/] running at [link=http://{host}:{port}]http://{host}:{port}[/]"
     )
@@ -250,10 +272,10 @@ def compare(
         Path, typer.Option("--output", "-o", help="Parent directory for both runs.")
     ] = Path("runs/compare"),
     open_inspector: Annotated[
-        bool, typer.Option("--inspect", help="Open Visual Track Debugger after comparing.")
+        bool, typer.Option("--inspect", help="Open the local inspector after comparing.")
     ] = False,
 ) -> None:
-    """Run two trackers on the same video and compare FPS, track counts, and ID switches side-by-side."""
+    """Run two trackers on the same video and compare FPS, track counts, and recoveries."""
     names = [t.strip() for t in trackers.split(",") if t.strip()]
     if len(names) < 2:
         raise typer.BadParameter(
@@ -308,7 +330,7 @@ def benchmark(
         bool, typer.Option("--split-screen", help="Generate a 2017 vs. 2026 split-screen MP4.")
     ] = False,
 ) -> None:
-    """Run the reproducible 2017 vs. 2026 benchmark suite."""
+    """Benchmark detector and tracker combinations on a video."""
     output.mkdir(parents=True, exist_ok=True)
     target_video = (
         video
@@ -354,7 +376,7 @@ def benchmark(
 
 @app.command()
 def models() -> None:
-    """List built-in Apache-2.0 detectors and vision-language Re-ID models."""
+    """List built-in detectors, person Re-ID models, and vision-language models."""
     det_table = Table(title="Built-in ONNX Object Detectors (Auto-Downloaded from Hugging Face)")
     det_table.add_column("Preset", style="bold cyan")
     det_table.add_column("Architecture")
@@ -372,16 +394,28 @@ def models() -> None:
         )
     console.print(det_table)
 
-    reid_table = Table(title="Built-in Vision-Language Re-ID & Query Models (--reid / --query)")
+    reid_table = Table(title="Person Re-ID Models (--reid: BoT-SORT appearance, --reid-merge)")
     reid_table.add_column("Backend", style="bold magenta")
-    reid_table.add_column("INT8 Size", justify="right")
+    reid_table.add_column("Size", justify="right")
     reid_table.add_column("License", style="green")
     reid_table.add_column("Hugging Face Repo", style="dim")
     for rspec in REID_REGISTRY.values():
         reid_table.add_row(
-            rspec.name, f"{rspec.approx_size_mb:.0f} MB", rspec.license, rspec.repo_id
+            rspec.name, f"{rspec.approx_size_mb:.1f} MB", rspec.license, rspec.repo_id
         )
+    reid_table.add_row("color", "0 MB", "-", "built-in HSV histogram (weak, no download)")
     console.print(reid_table)
+
+    vlm_table = Table(title="Vision-Language Models (--vlm: --query scoring & `trackflow search`)")
+    vlm_table.add_column("Backend", style="bold magenta")
+    vlm_table.add_column("INT8 Size", justify="right")
+    vlm_table.add_column("License", style="green")
+    vlm_table.add_column("Hugging Face Repo", style="dim")
+    for vspec in VLM_REGISTRY.values():
+        vlm_table.add_row(
+            vspec.name, f"{vspec.approx_size_mb:.0f} MB", vspec.license, vspec.repo_id
+        )
+    console.print(vlm_table)
 
 
 @app.command()

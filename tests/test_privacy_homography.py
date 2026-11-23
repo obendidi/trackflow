@@ -8,7 +8,7 @@ import numpy as np
 
 from trackflow.homography import DwellZone, FloorplanHomography
 from trackflow.privacy import PrivacyAnonymizer
-from trackflow.types import Track
+from trackflow.types import Detection, Track
 
 
 def test_privacy_modes_modify_or_remove_person_pixels() -> None:
@@ -29,6 +29,17 @@ def test_privacy_modes_modify_or_remove_person_pixels() -> None:
     # Skeleton mode removes ALL original background pixels (zero PII)
     skel = PrivacyAnonymizer(mode="skeleton").apply(frame, [track])
     assert not np.array_equal(skel[0:10, 0:10], frame[0:10, 0:10])
+
+
+def test_privacy_blurs_unconfirmed_detections_too() -> None:
+    """People who are detected but not (yet) confirmed tracks must still be anonymized."""
+    rng = np.random.default_rng(0)
+    frame = rng.integers(0, 255, size=(200, 200, 3), dtype=np.uint8)
+    det = Detection(bbox=(40, 30, 120, 170), confidence=0.2, class_id=0, class_name="person")
+    for mode in ("blur", "pixelate", "face-blur"):
+        out = PrivacyAnonymizer(mode=mode).apply(frame, [], detections=[det])  # type: ignore[arg-type]
+        assert not np.array_equal(out[35:65, 50:110], frame[35:65, 50:110]), mode
+        assert np.array_equal(out[0:10, 0:10], frame[0:10, 0:10]), mode
 
 
 def test_floorplan_homography_projection_dwell_and_render(tmp_path: Path) -> None:

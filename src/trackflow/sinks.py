@@ -78,12 +78,29 @@ def draw_tracks(
     tracks: list[Track],
     *,
     trails: dict[int, list[tuple[int, int]]],
+    coasting: list[Track] | None = None,
     fps: float | None = None,
     query: str | None = None,
     anonymize_mode: str = "none",
 ) -> np.ndarray:
     """Draw boxes, IDs, motion trails, query highlight badges, and HUD onto a frame."""
     canvas = frame_bgr.copy()
+
+    # Briefly-missed tracks at their predicted position: thin dimmed box + ID, so boxes don't blink.
+    for tr in coasting or []:
+        x1, y1, x2, y2 = [int(round(v)) for v in tr.bbox]
+        dim = tuple(int(c * 0.6) for c in _track_color(tr.track_id))
+        cv2.rectangle(canvas, (x1, y1), (x2, y2), dim, 1, cv2.LINE_AA)
+        cv2.putText(
+            canvas,
+            f"#{tr.track_id}",
+            (x1 + 2, max(12, y1 - 4)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            dim,
+            1,
+            cv2.LINE_AA,
+        )
 
     for tr in tracks:
         x1, y1, x2, y2 = [int(round(v)) for v in tr.bbox]
