@@ -196,6 +196,7 @@ class RunSummary:
     anonymize_mode: str = "none"
     output_files: dict[str, str] = field(default_factory=dict)
     zone_dwell_totals_s: dict[str, float] = field(default_factory=dict)
+    line_counts: dict[str, dict[str, int]] = field(default_factory=dict)
     frame_stride: int = 1
     model_revision: str | None = None
     precision: str | None = None
@@ -230,4 +231,5 @@ class RunSummary:
             "anonymize_mode": self.anonymize_mode,
             "output_files": self.output_files,
             "zone_dwell_totals_s": {k: round(v, 2) for k, v in self.zone_dwell_totals_s.items()},
+            "line_counts": self.line_counts,
         }

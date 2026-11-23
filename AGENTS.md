@@ -4,7 +4,7 @@ Real-time people & object tracking toolkit (Python package `trackflow-python` + 
 
 ## Layout
 
-- `src/trackflow/`: Python library and Typer CLI (`detector.py`, `models.py`, `tracker.py`, `ocsort.py`, `boosttrack.py`, `reid.py`, `pipeline.py`, `privacy.py`, `homography.py`, `inspector.py`, `inspector_ui.html`, `sinks.py`, `benchmark.py`, `cli.py`).
+- `src/trackflow/`: Python library and Typer CLI (`detector.py`, `models.py`, `tracker.py`, `ocsort.py`, `boosttrack.py`, `reid.py`, `pipeline.py`, `privacy.py`, `homography.py`, `lines.py`, `inspector.py`, `inspector_ui.html`, `sinks.py`, `benchmark.py`, `cli.py`).
 - `web/`: Static WebGPU playground (plain HTML/JS, zero build step), deployed to GitHub Pages on pushes to `main` via `.github/workflows/pages.yml`.
 - `tests/`: Pytest suite including Node-backed JS parity tests (`tests/test_web_parity.py`) and release checks (`tests/test_release.py`).
 - `scripts/release_notes.py`: Validates version/tag/changelog consistency during releases.

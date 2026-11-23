@@ -4,6 +4,10 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+### Added
+
+- `--line name=x1,y1,x2,y2` counts tracks crossing a line in each direction, with totals in the run summary, `summary.json` and the HTML report, and a `line_crossed` event per crossing.
+
 ### Fixed
 
 - `LICENSE` now has the official Apache-2.0 text word for word, so GitHub and license scanners recognize it.

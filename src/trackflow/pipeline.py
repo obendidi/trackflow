@@ -20,6 +20,7 @@ import numpy as np
 
 from trackflow.detector import Detector, _allowed_classes, _class_key, create_detector
 from trackflow.homography import FloorplanHomography
+from trackflow.lines import CountingLine, LineCounter
 from trackflow.models import Precision
 from trackflow.privacy import AnonymizeMode, PrivacyAnonymizer
 from trackflow.reid import ReidBackend, ReidEmbedder, TrackCardIndex, VlmBackend, VlmEmbedder
@@ -201,6 +202,7 @@ class TrackflowPipeline:
         query_threshold: float = 0.22,
         anonymize: AnonymizeMode = "none",
         homography: FloorplanHomography | str | Path | None = None,
+        lines: Sequence[CountingLine] = (),
         detector: Detector | None = None,
         tracker_factory: Callable[[], Tracker] | None = None,
         reid_embedder: ReidEmbedder | None = None,
@@ -288,6 +290,11 @@ class TrackflowPipeline:
             self.homography: FloorplanHomography | None = FloorplanHomography.from_json(homography)
         else:
             self.homography = homography
+        self.lines = list(lines)
+        LineCounter(self.lines)  # reject duplicate names before any frame is read
+
+    def _new_counter(self) -> LineCounter | None:
+        return LineCounter(self.lines) if self.lines else None
 
     def _new_tracker(self, frame_dt: float) -> Tracker:
         if self.tracker_factory is not None:
@@ -332,6 +339,7 @@ class TrackflowPipeline:
         tracker: Tracker,
         cards: TrackCardIndex | None,
         floorplan: FloorplanHomography | None,
+        counter: LineCounter | None = None,
         *,
         record_floorplan: bool = False,
     ) -> tuple[FrameResult, list[Detection]]:
@@ -364,6 +372,9 @@ class TrackflowPipeline:
                     tr.world_xy = floorplan.project(tr.foot_point)
                     tr.zone = floorplan.locate_zone(tr.world_xy)
         events = list(getattr(tracker, "last_events", ()))
+        if counter is not None:
+            # Raw tracker IDs: a Re-ID merge would join a track to a point from before it left.
+            events.extend(counter.update(tracks))
         if cards is not None:
             events.extend(cards.update(idx, timestamp, frame, tracks, frame_dt_s=dt))
         return FrameResult(
@@ -387,6 +398,7 @@ class TrackflowPipeline:
         dt = 1.0 / fps
         tracker = self._new_tracker(dt)
         cards = self._new_cards(tracker, 1) if self.vlm_embedder or self.reid_merge else None
+        counter = self._new_counter()
         shape = None
         for idx, frame in enumerate(frames):
             if (
@@ -403,7 +415,7 @@ class TrackflowPipeline:
                 )
             shape = frame.shape
             result, _ = self._process_frame(
-                frame, idx, idx / fps, dt, tracker, cards, self.homography
+                frame, idx, idx / fps, dt, tracker, cards, self.homography, counter
             )
             yield result
 
@@ -446,6 +458,7 @@ class TrackflowPipeline:
                 out_dir / "crops" if self.anonymize_mode == "none" else None,
             )
             floorplan = self.homography.fresh() if self.homography else None
+            counter = self._new_counter()
 
             video_writer: cv2.VideoWriter | None = None
             video_path = out_dir / "annotated.mp4"
@@ -501,6 +514,7 @@ class TrackflowPipeline:
                         tracker,
                         card_index,
                         floorplan,
+                        counter,
                         record_floorplan=True,
                     )
                     tracks = fr.tracks
@@ -554,6 +568,8 @@ class TrackflowPipeline:
                             fps=live_fps,
                             query=self.query,
                             anonymize_mode=self.anonymize_mode,
+                            lines=self.lines,
+                            line_counts=counter.counts if counter else None,
                         )
                         if video_writer is not None:
                             video_writer.write(rendered)
@@ -645,6 +661,7 @@ class TrackflowPipeline:
                 zone_dwell_totals_s=(
                     dict(floorplan.zone_dwell_totals_s) if floorplan is not None else {}
                 ),
+                line_counts=counter.counts if counter else {},
             )
 
             if "html" in export_set:

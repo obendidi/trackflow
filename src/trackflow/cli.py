@@ -30,6 +30,7 @@ from trackflow.benchmark import (
     run_benchmark_suite,
 )
 from trackflow.inspector import serve_inspector
+from trackflow.lines import CountingLine
 from trackflow.models import MODEL_REGISTRY, REID_REGISTRY, VLM_REGISTRY
 from trackflow.pipeline import TrackflowPipeline, fresh_run_dir
 from trackflow.reid import search_track_cards
@@ -130,6 +131,15 @@ def run(
     homography: Annotated[
         Path | None, typer.Option("--homography", help="4-point floorplan calibration JSON file.")
     ] = None,
+    line: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--line",
+            help="Count tracks crossing a line in image pixels: [name=]x1,y1,x2,y2. "
+            "Crossings to the right of the direction from the first point to the second count "
+            "as in. Repeat for more lines.",
+        ),
+    ] = None,
     skip: Annotated[
         int, typer.Option("--skip", min=0, help="Skip N frames between detections.")
     ] = 0,
@@ -168,6 +178,7 @@ def run(
     )
 
     with _user_errors():
+        lines = [CountingLine.parse(spec, f"line-{i}") for i, spec in enumerate(line or [], 1)]
         pipeline = TrackflowPipeline(
             model=model,
             precision=precision,  # type: ignore[arg-type]
@@ -182,6 +193,7 @@ def run(
             query_threshold=query_threshold,
             anonymize=anonymize,  # type: ignore[arg-type]
             homography=homography,
+            lines=lines,
         )
 
         with Progress(
@@ -222,6 +234,8 @@ def run(
         f"[bold]{summary.unique_tracks}[/] (recovered: {summary.recovered_tracks}, Re-ID merges: {summary.reid_merges})",
     )
     table.add_row("Frames", f"{summary.processed_frames} processed / {summary.total_frames} read")
+    for name, counts in summary.line_counts.items():
+        table.add_row(f"Line {name}", f"[bold]{counts['in']}[/] in · [bold]{counts['out']}[/] out")
     for k, v in summary.output_files.items():
         table.add_row(f"Output ({k})", f"[dim]{v}[/]")
     console.print(table)
