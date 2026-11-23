@@ -4,6 +4,8 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-23
+
 ### Fixed
 
 - `--line` counts a crossing only once the track has stayed on the new side for 0.3 seconds, so boxes that jitter across the line in crowds no longer inflate the counts.
@@ -105,7 +107,8 @@ First release of Trackflow, a rewrite of the 2017 Tracking-with-darkflow project
 
 - `trackflow run` crashes with an `AttributeError` from the progress bar. Use 0.1.1 or later.
 
-[Unreleased]: https://github.com/obendidi/trackflow/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/obendidi/trackflow/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/obendidi/trackflow/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/obendidi/trackflow/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/obendidi/trackflow/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/obendidi/trackflow/compare/v0.1.1...v0.2.0
