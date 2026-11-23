@@ -28,10 +28,10 @@ Plain `YOLO + ByteTrack` is now commoditized. **Trackflow v2** is a clean-room *
 
 ```bash
 # Run immediately with uvx (no manual weight downloads or Cython builds)
-uvx trackflow-cv run street.mp4
+uvx trackflow-python run street.mp4
 
 # Or install via pip / uv (provides the `trackflow` CLI and `import trackflow`)
-pip install trackflow-cv
+pip install trackflow-python
 trackflow run street.mp4
 ```
 

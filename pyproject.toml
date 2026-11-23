@@ -3,7 +3,7 @@ requires = ["hatchling>=1.25"]
 build-backend = "hatchling.build"
 
 [project]
-name = "trackflow-cv"
+name = "trackflow-python"
 version = "0.1.0"
 description = "Modern real-time people & object tracking toolkit — ONNX RT-DETRv2/RF-DETR/D-FINE + ByteTrack/BoT-SORT, natural-language search, visual debugger, floorplan homography & privacy-first anonymization."
 readme = "README.md"
@@ -67,7 +67,7 @@ dev = [
 
 [project.scripts]
 trackflow = "trackflow.cli:app"
-trackflow-cv = "trackflow.cli:app"
+trackflow-python = "trackflow.cli:app"
 
 [project.urls]
 Homepage = "https://obendidi.github.io/trackflow/"
