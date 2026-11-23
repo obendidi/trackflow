@@ -168,8 +168,8 @@ Most presets also have `--precision fp16` and `int8` variants. Trackflow itself 
 | `rtdetr-v2-r18` *(default)* | 45.1 | 54.0 | 40.1 |
 | `rfdetr-large` | 44.3 | 51.1 | 35.9 |
 | `rfdetr-medium` | 41.2 | 46.4 | 32.7 |
+| `yolo26n` | 37.4 | 41.5 | 27.9 |
 | `rfdetr-nano` | 36.5 | 40.5 | 28.2 |
-| `yolo26n` | 29.9 | 33.2 | 22.0 |
 
 The default scores highest here even though RF-DETR scores higher on COCO, so test on footage like yours before you switch.
 

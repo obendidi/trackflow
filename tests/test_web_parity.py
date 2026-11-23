@@ -15,7 +15,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from trackflow.detector import postprocess_detr_outputs
+from trackflow.detector import _letterbox, _unletterbox, postprocess_detr_outputs
 from trackflow.tracker import ByteTracker
 from trackflow.types import Detection
 
@@ -153,3 +153,23 @@ def test_web_multiclass_tracks_match_python(tmp_path: Path):
     assert [[t[0] for t in f["tracks"]] for f in js] == [[1, 2], [2], [1, 2]]
     for a, b in zip(js, py, strict=True):
         np.testing.assert_allclose(a["tracks"], b["tracks"])
+
+
+@pytest.mark.skipif(node is None, reason="Node.js not installed")
+def test_web_letterbox_matches_python(tmp_path: Path) -> None:
+    boxes = [[0, 0, 640, 640], [100, 150, 300, 400], [10, 5, 11, 60], [600, 300, 700, 500]]
+    sizes = [((1920, 1080), (640, 640)), ((768, 576), (640, 640)), ((1080, 1920), (640, 640))]
+    cases = [{"src": list(s), "dst": list(d), "boxes": boxes} for s, d in sizes]
+    path = tmp_path / "letterbox.json"
+    path.write_text(json.dumps({"cases": cases}), encoding="utf-8")
+    js = _run_node("letterbox", str(path))
+    for (src, dst), out in zip(sizes, js, strict=True):
+        _, placement = _letterbox(np.zeros((src[1], src[0], 3), np.uint8), (dst[1], dst[0]), 114)
+        np.testing.assert_allclose(placement, out["placement"], rtol=1e-9)
+        expected = []
+        for box in _unletterbox(np.array(boxes, float), placement):
+            x1, x2 = np.clip(box[[0, 2]], 0, src[0])
+            y1, y2 = np.clip(box[[1, 3]], 0, src[1])
+            if x2 - x1 >= 2 and y2 - y1 >= 2:
+                expected.append([x1, y1, x2, y2])
+        np.testing.assert_allclose(expected, out["boxes"], atol=1e-6)

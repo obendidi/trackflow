@@ -71,6 +71,36 @@ export function nmsClassAware(dets, iouThreshold) {
  * @param {number[]} o.logitsDims  [1, numQueries, numClasses]
  * @param {Float32Array} o.boxes   [numQueries * 4] normalized cx, cy, w, h
  */
+/** Where a srcW x srcH frame lands when letterboxed into dstW x dstH (mirrors Python's _letterbox). */
+export function letterboxPlacement(srcW, srcH, dstW, dstH) {
+  const scale = Math.min(dstW / srcW, dstH / srcH);
+  const rw = Math.max(1, Math.floor(srcW * scale));
+  const rh = Math.max(1, Math.floor(srcH * scale));
+  return {
+    left: Math.floor((dstW - rw) / 2),
+    top: Math.floor((dstH - rh) / 2),
+    rw,
+    rh,
+    sx: rw / srcW,
+    sy: rh / srcH,
+  };
+}
+
+/** Map detections on a letterboxed input back to the srcW x srcH frame, dropping slivers. */
+export function unletterbox(dets, { left, top, sx, sy }, srcW, srcH) {
+  const out = [];
+  for (const d of dets) {
+    const box = {
+      xmin: Math.min(Math.max((d.box.xmin - left) / sx, 0), srcW),
+      ymin: Math.min(Math.max((d.box.ymin - top) / sy, 0), srcH),
+      xmax: Math.min(Math.max((d.box.xmax - left) / sx, 0), srcW),
+      ymax: Math.min(Math.max((d.box.ymax - top) / sy, 0), srcH),
+    };
+    if (box.xmax - box.xmin >= 2 && box.ymax - box.ymin >= 2) out.push({ ...d, box });
+  }
+  return out;
+}
+
 export function postprocessDetr({
   logits,
   logitsDims,

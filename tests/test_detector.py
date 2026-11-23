@@ -38,6 +38,45 @@ def test_deployed_graph_reverses_padding_and_reports_native_scores():
     assert det.class_name == "bicycle" and det.confidence == 0.76
 
 
+def test_letterboxed_preset_pads_with_gray_and_maps_boxes_back():
+    from trackflow import OnnxDetrDetector
+
+    class Session:
+        def run(self, names, inputs):
+            image = inputs["pixel_values"][0]
+            assert image.shape == (3, 320, 320)
+            # A 200x100 frame fills a 320x160 band; the rest is YOLO's gray (114).
+            assert np.allclose(image[:, :80], 114 / 255) and np.allclose(image[:, 240:], 114 / 255)
+            assert np.all(image[:, 80:240] == 1)
+            # One person at (40, 100, 200, 200) on the 320x320 canvas, as normalized cxcywh.
+            logits = np.full((1, 1, 2), -10.0, np.float32)
+            logits[0, 0, 0] = 10.0
+            return logits, np.array([[[0.375, 0.46875, 0.5, 0.3125]]], np.float32)
+
+    detector = OnnxDetrDetector.__new__(OnnxDetrDetector)
+    detector.deployed, detector.letterbox, detector.softmax = False, True, False
+    detector.do_rescale, detector.do_normalize = True, False
+    detector.input_hw, detector.input_dtype = (320, 320), np.float32
+    detector.input_name, detector.raw_outputs = "pixel_values", ["logits", "pred_boxes"]
+    detector.id2label, detector.allowed_classes, detector.threshold = {0: "person"}, None, 0.2
+    detector.session = Session()
+    (det,) = detector.detect(np.full((100, 200, 3), 255, np.uint8))
+    assert det.bbox == pytest.approx((25.0, 12.5, 125.0, 75.0))
+    assert det.class_name == "person"
+
+
+def test_only_yolo_presets_are_letterboxed():
+    from trackflow.models import MODEL_REGISTRY
+
+    assert {n for n, s in MODEL_REGISTRY.items() if s.letterbox} == {
+        "yolo26n",
+        "yolo26s",
+        "yolo26m",
+        "yolo26l",
+        "yolo26x",
+    }
+
+
 def test_precision_mistakes_and_missing_extra_are_actionable(monkeypatch):
     import sys
 

@@ -27,6 +27,7 @@ class ModelSpec:
     backend: Literal["onnx", "transformers"] = "onnx"
     onnx_file: str | None = None  # standalone FP32 graph with embedded post-processing
     normalize: bool = False  # preprocessing for standalone graphs without a sidecar
+    letterbox: bool = False  # keep the aspect ratio and pad with gray, as YOLO is trained
 
     @property
     def precisions(self) -> tuple[Precision, ...]:
@@ -165,6 +166,7 @@ for size, mb, revision in (
         (640, 640),
         "COCO detector converted to logits and normalized boxes.",
         revision,
+        letterbox=True,
     )
 
 

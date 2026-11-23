@@ -3,8 +3,9 @@
 //
 //   node tests/js/replay.mjs tracker <fixture.json> <highThresh> [iouBuffer] [stride]
 //   node tests/js/replay.mjs postprocess <case.json>
+//   node tests/js/replay.mjs letterbox <case.json>
 import fs from 'node:fs';
-import { postprocessDetr } from '../../web/detector.js';
+import { letterboxPlacement, postprocessDetr, unletterbox } from '../../web/detector.js';
 import { ByteTracker } from '../../web/tracker.js';
 
 const [mode, path, arg, arg2, arg3] = process.argv.slice(2);
@@ -42,6 +43,14 @@ if (mode === 'tracker') {
     allowedLabels: input.allowed ? new Set(input.allowed) : null,
   });
   process.stdout.write(JSON.stringify(dets.map(d => [d.classId, d.score, d.box.xmin, d.box.ymin, d.box.xmax, d.box.ymax])));
+} else if (mode === 'letterbox') {
+  const out = input.cases.map(({ src, dst, boxes }) => {
+    const p = letterboxPlacement(src[0], src[1], dst[0], dst[1]);
+    const dets = boxes.map(([xmin, ymin, xmax, ymax]) => ({ box: { xmin, ymin, xmax, ymax } }));
+    const mapped = unletterbox(dets, p, src[0], src[1]).map(d => [d.box.xmin, d.box.ymin, d.box.xmax, d.box.ymax]);
+    return { placement: [p.left, p.top, p.sx, p.sy], boxes: mapped };
+  });
+  process.stdout.write(JSON.stringify(out));
 } else {
   throw new Error(`unknown mode ${mode}`);
 }

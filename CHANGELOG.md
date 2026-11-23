@@ -4,6 +4,11 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+### Fixed
+
+- YOLO26 presets keep each frame's aspect ratio and pad it with gray, as YOLO is trained, instead of stretching it to 640×640. With ByteTrack on MOT17, YOLO26 Nano goes from 29.9 to 37.4 HOTA.
+- The browser playground letterboxes YOLO26 Nano frames the same way.
+
 ## [0.4.1] - 2026-11-23
 
 ### Fixed
