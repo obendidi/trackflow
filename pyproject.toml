@@ -47,7 +47,7 @@ classifiers = [
 dependencies = [
   "huggingface-hub>=0.24",
   "numpy>=1.26",
-  "onnxruntime>=1.17",
+  "onnxruntime>=1.20",
   "opencv-python-headless>=4.9",
   "pyarrow>=15.0",
   "rich>=13.7",
@@ -63,7 +63,7 @@ transformers = [
   "torchvision>=0.21",
 ]
 cuda = [
-  "onnxruntime-gpu>=1.17",
+  "onnxruntime-gpu>=1.20",
 ]
 display = [
   "opencv-python>=4.9",

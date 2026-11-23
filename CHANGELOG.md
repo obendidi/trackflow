@@ -4,6 +4,10 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+### Fixed
+
+- `--device coreml` runs detectors and Re-ID on the Apple GPU with the same boxes as the CPU, using about a third of the CPU. YOLO26 presets no longer return wrong boxes on it.
+
 ## [0.4.2] - 2026-11-24
 
 ### Fixed

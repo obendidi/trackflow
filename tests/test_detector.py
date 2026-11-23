@@ -77,6 +77,38 @@ def test_only_yolo_presets_are_letterboxed():
     }
 
 
+def test_coreml_sessions_run_mlprogram_on_the_gpu(monkeypatch, tmp_path):
+    from trackflow import detector as detector_module
+
+    seen = {}
+
+    class Session:
+        def __init__(self, path, sess_options=None, providers=None, provider_options=None):
+            seen.update(providers=providers, provider_options=provider_options)
+
+        def get_providers(self):
+            return seen["providers"]
+
+    monkeypatch.setattr(
+        detector_module.ort,
+        "get_available_providers",
+        lambda: ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    )
+    monkeypatch.setattr(detector_module.ort, "InferenceSession", Session)
+    _, active = detector_module.create_onnx_session(tmp_path / "model.onnx", device="coreml")
+    assert active == "CoreMLExecutionProvider"
+    assert seen["provider_options"] == [
+        {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU"},
+        {},
+    ]
+    detector_module.create_onnx_session(
+        tmp_path / "model.onnx", device="coreml", coreml_format="NeuralNetwork"
+    )
+    assert seen["provider_options"][0]["ModelFormat"] == "NeuralNetwork"
+    detector_module.create_onnx_session(tmp_path / "model.onnx", device="cpu")
+    assert seen["provider_options"] == [{}]
+
+
 def test_precision_mistakes_and_missing_extra_are_actionable(monkeypatch):
     import sys
 
