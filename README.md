@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/obendidi/trackflow/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://pypi.org/project/trackflow-python/)
 
-Real-time people and object tracking in Python and in the browser. Trackflow runs current detectors (RF-DETR, RT-DETRv2, D-FINE, DEIMv2, YOLO26) with ByteTrack or BoT-SORT, streams or exports track data (Parquet, JSONL, CSV, MOTChallenge, HTML), and includes text-based track search, a local run inspector with 4-point floorplan projection, and anonymization.
+Real-time people and object tracking in Python and in the browser. Trackflow runs current detectors (RF-DETR, RT-DETRv2, D-FINE, DEIMv2, YOLO26) with ByteTrack, BoT-SORT, OC-SORT or BoostTrack, streams or exports track data (Parquet, JSONL, CSV, MOTChallenge, HTML), and includes text-based track search, a local run inspector with 4-point floorplan projection, and anonymization.
 
 Try it in the browser without installing anything: [obendidi.github.io/trackflow](https://obendidi.github.io/trackflow/).
 
@@ -50,6 +50,30 @@ GROUP BY track_id ORDER BY frames DESC;
 ```
 
 `--export mot` writes `tracks.txt` in MOTChallenge format, which [TrackEval](https://github.com/JonathonLuiten/TrackEval) scores directly (HOTA, IDF1, MOTA).
+
+### Trackers
+
+| `--tracker` | Algorithm | How it works |
+| :--- | :--- | :--- |
+| `bytetrack` *(default)* | [ByteTrack](https://arxiv.org/abs/2110.06864) (ECCV 2022) | Matches boxes by overlap, then uses low-confidence detections to keep tracks through partial occlusion. The fastest option. |
+| `botsort` | [BoT-SORT](https://arxiv.org/abs/2206.14651) (2022) | ByteTrack plus camera-motion compensation, and appearance matching with `--reid osnet`. |
+| `ocsort` | [OC-SORT](https://arxiv.org/abs/2203.14360) (CVPR 2023) | Trusts detections over motion predictions: after an occlusion it re-matches a track to its last observed box and corrects the motion model along the gap. |
+| `boosttrack` | [BoostTrack++](https://arxiv.org/abs/2408.13003) (2024) | Raises the confidence of weak detections that fit a track or look like a new object, and matches with motion, shape and, with `--reid osnet`, appearance. Compensates for camera motion. |
+
+All four keep a person and a bag in the same box as separate tracks, and only give out an ID once a track has been seen on more than one frame. OC-SORT and BoostTrack report a track again after a miss once it has matched three frames in a row; in between, the annotated video shows it as a coasting box. The browser playground uses ByteTrack.
+
+Scores on two labeled MOT17 sequences, with the default detector on CPU:
+
+| Tracker | MOT17-05 HOTA | IDF1 | MOTA | MOT17-09 HOTA | IDF1 | MOTA |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `bytetrack` | 42.7 | 57.1 | 40.8 | 47.9 | 57.9 | 51.0 |
+| `botsort` | 44.6 | 60.4 | 42.7 | 48.0 | 57.7 | 50.9 |
+| `ocsort` | 43.7 | 59.2 | 46.5 | 45.7 | 54.2 | 56.6 |
+| `boosttrack` | 43.7 | 59.2 | 43.9 | 45.4 | 52.8 | 53.5 |
+| `botsort --reid osnet` | 45.2 | 61.5 | 43.1 | 49.0 | 60.0 | 52.7 |
+| `boosttrack --reid osnet` | 45.2 | 61.7 | 43.8 | 47.0 | 55.8 | 53.8 |
+
+No tracker wins everywhere. On MOT17-05, filmed from a moving camera at 14 FPS, every newer tracker beats ByteTrack. On MOT17-09, from a static camera, ByteTrack and BoT-SORT stay ahead on HOTA. OC-SORT has the highest MOTA on both sequences. With OSNet, BoT-SORT and BoostTrack tie on MOT17-05, and BoT-SORT is best on MOT17-09. BoostTrack with `--reid osnet` is slower than BoT-SORT because it embeds every person detection, including weak ones it might boost. Two sequences are not a benchmark, so compare trackers on your own footage with `trackflow compare` or `--export mot`.
 
 ### Text search and re-identification
 
@@ -132,7 +156,7 @@ Re-ID and text-search models:
 
 | Flag | Model | Size | License | Used for |
 | :--- | :--- | ---: | :--- | :--- |
-| `--reid osnet` | OSNet-AIN x1.0 person Re-ID | ~9 MB | MIT code; weights trained on MSMT17 (check dataset terms for commercial use) | BoT-SORT appearance and `--reid-merge` |
+| `--reid osnet` | OSNet-AIN x1.0 person Re-ID | ~9 MB | MIT code; weights trained on MSMT17 (check dataset terms for commercial use) | BoT-SORT and BoostTrack appearance, and `--reid-merge` |
 | `--vlm clip` | CLIP ViT-B/32 (INT8) | ~153 MB | MIT | Default for `--query` and `search` |
 | `--vlm siglip` | SigLIP Base (INT8) | ~205 MB | Apache-2.0 | Better on fine clothing/attribute queries |
 
@@ -175,7 +199,11 @@ for result in pipeline.stream(frames(), fps=25):
         print(result.frame_idx, track.track_id, track.class_name, track.bbox)
 ```
 
-To use your own model, pass any object with a `detect(frame_bgr) -> list[Detection]` method as `detector=`. A custom tracker goes in `tracker_factory=`, which takes any object with `update(detections, frame_bgr=None) -> list[Track]`. The package ships type hints (`py.typed`), and `Detector` and `Tracker` are exported as protocols.
+To use your own model, pass any object with a `detect(frame_bgr) -> list[Detection]` method as `detector=`. A custom tracker goes in `tracker_factory=`, which takes any object with `update(detections, frame_bgr=None) -> list[Track]`. The built-in trackers are exported too (`ByteTracker`, `BotSortTracker`, `OcSortTracker`, `BoostTracker`), so you can tune one, for example `tracker_factory=lambda: BoostTracker(use_cmc=False)` for a fixed camera. The package ships type hints (`py.typed`), and `Detector` and `Tracker` are exported as protocols.
+
+## Changelog
+
+What changed in each version is in [CHANGELOG.md](https://github.com/obendidi/trackflow/blob/main/CHANGELOG.md) and on the [releases page](https://github.com/obendidi/trackflow/releases).
 
 ## License
 

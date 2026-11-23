@@ -36,7 +36,7 @@ from trackflow.reid import search_track_cards
 
 app = typer.Typer(
     name="trackflow",
-    help="Real-time people and object tracking with ONNX detectors, ByteTrack/BoT-SORT, text search, and a local inspector.",
+    help="Real-time people and object tracking with ONNX detectors, ByteTrack, BoT-SORT, OC-SORT or BoostTrack, text search, and a local inspector.",
     no_args_is_help=True,
     pretty_exceptions_show_locals=False,
     rich_markup_mode="rich",
@@ -67,7 +67,8 @@ def run(
         str, typer.Option("--precision", help="Model precision: fp32, fp16, or int8.")
     ] = "fp32",
     tracker: Annotated[
-        str, typer.Option("--tracker", "-t", help="Tracker: bytetrack or botsort.")
+        str,
+        typer.Option("--tracker", "-t", help="Tracker: bytetrack, botsort, ocsort, or boosttrack."),
     ] = "bytetrack",
     device: Annotated[
         str,
@@ -88,7 +89,7 @@ def run(
         str,
         typer.Option(
             "--reid",
-            help="Person Re-ID model for BoT-SORT appearance and --reid-merge: none, osnet, color.",
+            help="Person Re-ID model for BoT-SORT/BoostTrack appearance and --reid-merge: none, osnet, color.",
         ),
     ] = "none",
     vlm: Annotated[
@@ -476,7 +477,9 @@ def models(
         )
     console.print(det_table)
 
-    reid_table = Table(title="Person Re-ID Models (--reid: BoT-SORT appearance, --reid-merge)")
+    reid_table = Table(
+        title="Person Re-ID Models (--reid: BoT-SORT/BoostTrack appearance, --reid-merge)"
+    )
     reid_table.add_column("Backend", style="bold magenta")
     reid_table.add_column("Size", justify="right")
     reid_table.add_column("License", style="green")

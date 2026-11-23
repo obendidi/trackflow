@@ -1,34 +1,92 @@
-name: Publish to PyPI
+name: Publish
+
+# Releasing: bump the version in pyproject.toml and src/trackflow/__init__.py, move the
+# Unreleased notes in CHANGELOG.md under a new "## [X.Y.Z] - date" heading, merge, then push
+# an annotated tag vX.Y.Z on main. This workflow checks the tag against the version and the
+# changelog, publishes to PyPI, and creates the GitHub release with that version's notes.
 
 on:
-  release:
-    types: [published]
   push:
     tags:
       - "v*.*.*"
 
-permissions:
-  id-token: write
-  contents: read
-
-# A GitHub Release and its tag can both request the same immutable PyPI upload.
 concurrency:
-  group: pypi-${{ github.ref_name }}
+  group: publish-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/trackflow-python
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Check the tag, version and changelog
+        run: |
+          python3 scripts/release_notes.py "$GITHUB_REF_NAME" > release-notes.md
+          echo "previous=$(python3 scripts/release_notes.py --previous "$GITHUB_REF_NAME")" >> "$GITHUB_OUTPUT"
+        id: notes
       - name: Install uv
         uses: astral-sh/setup-uv@v5
       - name: Build distributions
         run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+    outputs:
+      previous: ${{ steps.notes.outputs.previous }}
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/trackflow-python
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          # A re-run after a failed release step finds the files already uploaded.
           skip-existing: true
+
+  github-release:
+    needs: [build, pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+      PREVIOUS: ${{ needs.build.outputs.previous }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+      - name: Create or update the GitHub release
+        run: |
+          printf '\n\nInstall with `pip install trackflow-python==%s`.\n' "${TAG#v}" >> release-notes.md
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "$TAG" \
+              --notes-file release-notes.md --generate-notes \
+              ${PREVIOUS:+--notes-start-tag "$PREVIOUS"}
+          fi

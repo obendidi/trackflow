@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trackflow-python"
-version = "0.2.0"
-description = "Stream or export multi-object tracks with ONNX and optional Transformers detectors, ByteTrack/BoT-SORT, text search, floorplan projection, and anonymization."
+version = "0.3.0"
+description = "Stream or export multi-object tracks with ONNX and optional Transformers detectors, ByteTrack, BoT-SORT, OC-SORT or BoostTrack, text search, floorplan projection, and anonymization."
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
@@ -19,6 +19,9 @@ keywords = [
   "multi-object-tracking",
   "mot",
   "bytetrack",
+  "botsort",
+  "ocsort",
+  "boosttrack",
   "rtdetr",
   "rf-detr",
   "d-fine",

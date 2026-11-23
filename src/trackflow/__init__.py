@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+from trackflow.boosttrack import BoostTracker
 from trackflow.detector import Detector, OnnxDetrDetector, create_detector
 from trackflow.homography import DwellZone, FloorplanHomography
 from trackflow.models import MODEL_REGISTRY, REID_REGISTRY, VLM_REGISTRY, ModelSpec
+from trackflow.ocsort import OcSortTracker
 from trackflow.pipeline import TrackflowPipeline
 from trackflow.privacy import PrivacyAnonymizer
 from trackflow.reid import ReidEmbedder, TrackCardIndex, VlmEmbedder
-from trackflow.tracker import BotSortTracker, ByteTracker, Tracker, create_tracker
+from trackflow.tracker import (
+    TRACKER_NAMES,
+    BotSortTracker,
+    ByteTracker,
+    Tracker,
+    create_tracker,
+)
 from trackflow.types import (
     Detection,
     FrameResult,
@@ -18,10 +26,11 @@ from trackflow.types import (
     TrackCard,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "__version__",
+    "BoostTracker",
     "BotSortTracker",
     "ByteTracker",
     "Detection",
@@ -32,6 +41,7 @@ __all__ = [
     "HomographyPoint",
     "MODEL_REGISTRY",
     "ModelSpec",
+    "OcSortTracker",
     "OnnxDetrDetector",
     "PrivacyAnonymizer",
     "REID_REGISTRY",
@@ -39,6 +49,7 @@ __all__ = [
     "RunSummary",
     "Track",
     "TrackCard",
+    "TRACKER_NAMES",
     "TrackCardIndex",
     "TrackflowPipeline",
     "Tracker",

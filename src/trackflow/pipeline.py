@@ -46,8 +46,10 @@ def fresh_run_dir(stem: str = "run", parent: str | Path = "runs") -> Path:
 def _run_directory(output_dir: str | Path | None) -> Iterator[Path]:
     if output_dir is None:
         path = fresh_run_dir()
+        created = True
     else:
         path = Path(output_dir)
+        created = not path.exists()
         path.mkdir(parents=True, exist_ok=True)
 
     # Two callers can arrive at an existing empty directory simultaneously.
@@ -62,6 +64,12 @@ def _run_directory(output_dir: str | Path | None) -> Iterator[Path]:
                 f"Output {path} is not empty. Choose a fresh output directory (-o)."
             )
         yield path
+    except BaseException:
+        # A run that fails before writing anything leaves no empty folder behind.
+        lock.unlink(missing_ok=True)
+        if created and not any(path.iterdir()):
+            path.rmdir()
+        raise
     finally:
         lock.unlink(missing_ok=True)
 
@@ -210,6 +218,8 @@ class TrackflowPipeline:
         )
         self.tracker_name = tracker
         self.tracker_factory = tracker_factory
+        if tracker_factory is None:
+            create_tracker(tracker)  # reject an unknown name before any model loads
         self.threshold = float(threshold)
         if not 0 <= self.threshold <= 1:
             raise ValueError("threshold must be between 0 and 1.")
@@ -333,15 +343,14 @@ class TrackflowPipeline:
             if self._allowed is None
             else [d for d in raw if _class_key(d.class_name) in self._allowed]
         )
-        if getattr(tracker, "name", None) == "botsort" and self.reid_embedder is not None:
-            high = [
-                d
-                for d in targets
-                if d.confidence >= self.threshold and d.class_name.lower() == "person"
+        min_conf = getattr(tracker, "embedding_min_confidence", None)
+        if min_conf is not None and self.reid_embedder is not None:
+            people = [
+                d for d in targets if d.confidence >= min_conf and d.class_name.lower() == "person"
             ]
             for det, emb in zip(
-                high,
-                self.reid_embedder.encode_images([_crop(frame, d.bbox) for d in high]),
+                people,
+                self.reid_embedder.encode_images([_crop(frame, d.bbox) for d in people]),
                 strict=True,
             ):
                 det.embedding = emb
