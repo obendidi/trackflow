@@ -5,6 +5,10 @@
 
 Real-time people and object tracking in Python and in the browser. Trackflow runs current detectors (RF-DETR, RT-DETRv2, D-FINE, DEIMv2, YOLO26) with ByteTrack, BoT-SORT, OC-SORT or BoostTrack, streams or exports track data (Parquet, JSONL, CSV, MOTChallenge, HTML), and includes text-based track search, a local run inspector with 4-point floorplan projection, and anonymization.
 
+![Trackflow tracking people crossing Yonge and Dundas in Toronto, with an ID, box and trail on each person](https://raw.githubusercontent.com/obendidi/trackflow/main/docs/demo.webp)
+
+*`trackflow run crossing.mp4` with the default settings, at 12 FPS on an Apple M4 Pro CPU. Footage: 8 seconds of [DiagonalCrosswalkYongeDundas.webm](https://commons.wikimedia.org/wiki/File:DiagonalCrosswalkYongeDundas.webm) by Raysonho, CC0.*
+
 Try it in the browser without installing anything: [obendidi.github.io/trackflow](https://obendidi.github.io/trackflow/).
 
 ## Quickstart
