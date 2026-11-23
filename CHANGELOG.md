@@ -4,6 +4,10 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+### Fixed
+
+- `LICENSE` now has the official Apache-2.0 text word for word, so GitHub and license scanners recognize it.
+
 ## [0.3.0] - 2026-11-23
 
 ### Added
