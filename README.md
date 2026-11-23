@@ -106,7 +106,7 @@ trackflow inspect runs/run-1
 ### Anonymization
 
 ```bash
-# Blur faces/heads
+# Blur the top of each person box, where the head usually is
 trackflow run lobby.mp4 --anonymize face-blur
 
 # Draw stick figures on a blank canvas (box-based, no pose model; no video pixels saved)
@@ -114,6 +114,8 @@ trackflow run lobby.mp4 --anonymize skeleton
 ```
 
 Available modes are `face-blur`, `blur`, `pixelate`, and `skeleton`. Anonymization covers every detected person box (including low-confidence detections and people briefly missed by the tracker), even when you track other classes, and anonymized runs do not write person crops or thumbnails. It is best effort: if the detector misses someone in a frame, that person is not blurred in that frame.
+
+`face-blur` runs no face detector. It blurs an ellipse over the top 30% of each person box, so it misses a face that isn't there, for example on someone lying down, bending over or holding their arms up. Use `blur` or `pixelate` to cover the whole person.
 
 ### Benchmarking
 
