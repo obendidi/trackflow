@@ -1,4 +1,4 @@
-import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1';
+import { pipeline, env, RawImage } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.2';
 import { BrowserByteTracker } from './tracker.js';
 
 env.allowLocalModels = false;
@@ -7,6 +7,9 @@ const PALETTE = ['#34d399', '#38bdf8', '#a78bfa', '#fbbf24', '#f472b6', '#60a5fa
 const video = document.getElementById('video');
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
+const offscreen = document.createElement('canvas');
+const offCtx = offscreen.getContext('2d', { willReadFrequently: true });
+
 const statusEl = document.getElementById('status');
 const fpsEl = document.getElementById('fpsVal');
 const activeEl = document.getElementById('activeVal');
@@ -19,8 +22,13 @@ const peopleOnlyChk = document.getElementById('peopleOnly');
 const threshSlider = document.getElementById('threshSlider');
 const threshVal = document.getElementById('threshVal');
 
+// Models known to use AveragePool ceil_mode=1 (unsupported in ORT WebGPU EP) run on WASM directly.
+const forceWasmModels = new Set(['onnx-community/rtdetr_v2_r18vd-ONNX']);
+
 let detector = null;
 let loadedModelId = null;
+let activeDevice = null;
+let loadingPromise = null;
 let running = false;
 let tracker = new BrowserByteTracker();
 let frameIdx = 0;
@@ -31,28 +39,48 @@ threshSlider.addEventListener('input', () => {
   tracker.highThresh = Number(threshSlider.value);
 });
 
+modelSelect.addEventListener('change', () => {
+  detector = null;
+  loadedModelId = null;
+  activeDevice = null;
+  tracker.reset();
+});
+
+async function loadDetector(modelId, forceWasm = false) {
+  const hasWebGPU = typeof navigator !== 'undefined' && 'gpu' in navigator;
+  const targetDevice = !forceWasm && hasWebGPU && !forceWasmModels.has(modelId) ? 'webgpu' : 'wasm';
+  deviceEl.textContent = targetDevice.toUpperCase();
+  statusEl.textContent = `Loading ${modelId} on ${targetDevice.toUpperCase()} (cached in browser after first download)…`;
+
+  try {
+    const det = await pipeline('object-detection', modelId, {
+      device: targetDevice,
+      dtype: targetDevice === 'webgpu' ? 'fp32' : 'q8',
+    });
+    detector = det;
+    loadedModelId = modelId;
+    activeDevice = targetDevice;
+    deviceEl.textContent = targetDevice.toUpperCase();
+    statusEl.textContent = `Ready · ${modelId} running 100% locally on ${targetDevice.toUpperCase()}.`;
+    return det;
+  } catch (err) {
+    if (targetDevice === 'webgpu') {
+      forceWasmModels.add(modelId);
+      statusEl.textContent = `WebGPU init failed (${err?.message || err}); switching to WASM…`;
+      return loadDetector(modelId, true);
+    }
+    throw err;
+  }
+}
+
 async function ensureDetector() {
   const modelId = modelSelect.value;
   if (detector && loadedModelId === modelId) return detector;
-
-  const hasWebGPU = typeof navigator !== 'undefined' && 'gpu' in navigator;
-  const device = hasWebGPU ? 'webgpu' : 'wasm';
-  deviceEl.textContent = device.toUpperCase();
-  statusEl.textContent = `Loading ${modelId} on ${device.toUpperCase()} (cached in browser after first download)…`;
-
-  try {
-    detector = await pipeline('object-detection', modelId, {
-      device,
-      dtype: device === 'webgpu' ? 'fp32' : 'q8',
-    });
-  } catch (err) {
-    deviceEl.textContent = 'WASM';
-    statusEl.textContent = `WebGPU unavailable (${err.message}); falling back to WASM…`;
-    detector = await pipeline('object-detection', modelId, { device: 'wasm', dtype: 'q8' });
-  }
-  loadedModelId = modelId;
-  statusEl.textContent = `Ready · ${modelId} running 100% locally in your browser.`;
-  return detector;
+  if (loadingPromise) return loadingPromise;
+  loadingPromise = loadDetector(modelId).finally(() => {
+    loadingPromise = null;
+  });
+  return loadingPromise;
 }
 
 function drawPrivacyBackdrop(tracks, mode) {
@@ -146,74 +174,112 @@ function renderTracks(tracks, mode) {
 
 async function loop() {
   if (!running || video.paused || video.ended) return;
-  const detFn = await ensureDetector();
 
-  const t0 = performance.now();
-  const off = document.createElement('canvas');
-  off.width = canvas.width;
-  off.height = canvas.height;
-  off.getContext('2d').drawImage(video, 0, 0, off.width, off.height);
+  try {
+    let detFn = await ensureDetector();
 
-  const rawDets = await detFn(off.toDataURL('image/jpeg', 0.8), {
-    threshold: 0.15,
-    percentage: false,
-  });
+    const t0 = performance.now();
+    if (offscreen.width !== canvas.width || offscreen.height !== canvas.height) {
+      offscreen.width = canvas.width;
+      offscreen.height = canvas.height;
+    }
+    offCtx.drawImage(video, 0, 0, offscreen.width, offscreen.height);
+    const frameImage = RawImage.fromCanvas(offscreen);
 
-  const peopleOnly = peopleOnlyChk.checked;
-  const filtered = rawDets.filter(d => !peopleOnly || d.label.toLowerCase() === 'person');
-  const tracks = tracker.update(filtered);
+    let rawDets;
+    try {
+      rawDets = await detFn(frameImage, {
+        threshold: 0.15,
+        percentage: false,
+      });
+    } catch (inferErr) {
+      // ORT WebGPU compiles kernels lazily on the first run() call; gracefully fall back to WASM.
+      if (activeDevice === 'webgpu') {
+        const modelId = modelSelect.value;
+        forceWasmModels.add(modelId);
+        detector = null;
+        loadedModelId = null;
+        statusEl.textContent = `WebGPU op unsupported for ${modelId}; falling back to WASM…`;
+        detFn = await loadDetector(modelId, true);
+        rawDets = await detFn(frameImage, {
+          threshold: 0.15,
+          percentage: false,
+        });
+      } else {
+        throw inferErr;
+      }
+    }
 
-  const dt = Math.max(1, performance.now() - t0);
-  fpsEl.textContent = (1000 / dt).toFixed(1);
-  activeEl.textContent = String(tracks.length);
-  uniqueEl.textContent = String(tracker.uniqueCount);
+    const peopleOnly = peopleOnlyChk.checked;
+    const filtered = rawDets.filter(d => !peopleOnly || d.label.toLowerCase() === 'person');
+    const tracks = tracker.update(filtered);
 
-  renderTracks(tracks, privacySelect.value);
+    const dt = Math.max(1, performance.now() - t0);
+    fpsEl.textContent = (1000 / dt).toFixed(1);
+    activeEl.textContent = String(tracks.length);
+    uniqueEl.textContent = String(tracker.uniqueCount);
 
-  for (const tr of tracks) {
-    records.push({
-      frame_idx: frameIdx,
-      track_id: tr.id,
-      class_name: tr.label,
-      confidence: Number(tr.score.toFixed(4)),
-      x1: Number(tr.box.xmin.toFixed(1)),
-      y1: Number(tr.box.ymin.toFixed(1)),
-      x2: Number(tr.box.xmax.toFixed(1)),
-      y2: Number(tr.box.ymax.toFixed(1)),
-    });
+    renderTracks(tracks, privacySelect.value);
+
+    for (const tr of tracks) {
+      records.push({
+        frame_idx: frameIdx,
+        track_id: tr.id,
+        class_name: tr.label,
+        confidence: Number(tr.score.toFixed(4)),
+        x1: Number(tr.box.xmin.toFixed(1)),
+        y1: Number(tr.box.ymin.toFixed(1)),
+        x2: Number(tr.box.xmax.toFixed(1)),
+        y2: Number(tr.box.ymax.toFixed(1)),
+      });
+    }
+    frameIdx++;
+  } catch (err) {
+    running = false;
+    statusEl.textContent = `Error: ${err?.message || err}`;
+    console.error('Trackflow WebGPU playground error:', err);
+    return;
   }
-  frameIdx++;
-  requestAnimationFrame(loop);
+
+  if (running) requestAnimationFrame(loop);
 }
 
 document.getElementById('webcamBtn').addEventListener('click', async () => {
-  await ensureDetector();
-  const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 360 } });
-  video.srcObject = stream;
-  await video.play();
-  canvas.width = video.videoWidth || 640;
-  canvas.height = video.videoHeight || 360;
-  tracker.reset();
-  records = [];
-  frameIdx = 0;
-  running = true;
-  loop();
+  try {
+    await ensureDetector();
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 360 } });
+    video.srcObject = stream;
+    await video.play();
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 360;
+    tracker.reset();
+    records = [];
+    frameIdx = 0;
+    running = true;
+    loop();
+  } catch (err) {
+    statusEl.textContent = `Webcam error: ${err?.message || err}`;
+  }
 });
 
 document.getElementById('videoFile').addEventListener('change', async e => {
   const file = e.target.files?.[0];
   if (!file) return;
-  await ensureDetector();
-  video.srcObject = null;
-  video.src = URL.createObjectURL(file);
-  await video.play();
-  canvas.width = Math.min(960, video.videoWidth || 640);
-  canvas.height = Math.round(canvas.width * ((video.videoHeight || 360) / (video.videoWidth || 640)));
-  tracker.reset();
-  records = [];
-  frameIdx = 0;
-  running = true;
-  loop();
+  try {
+    await ensureDetector();
+    video.srcObject = null;
+    video.src = URL.createObjectURL(file);
+    await video.play();
+    canvas.width = Math.min(960, video.videoWidth || 640);
+    canvas.height = Math.round(canvas.width * ((video.videoHeight || 360) / (video.videoWidth || 640)));
+    tracker.reset();
+    records = [];
+    frameIdx = 0;
+    running = true;
+    loop();
+  } catch (err) {
+    statusEl.textContent = `Video error: ${err?.message || err}`;
+  }
 });
 
 document.getElementById('stopBtn').addEventListener('click', () => {

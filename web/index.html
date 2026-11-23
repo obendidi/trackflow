@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23059669'/><circle cx='16' cy='16' r='8' fill='none' stroke='%23e6eefc' stroke-width='2.5'/><circle cx='16' cy='16' r='3' fill='%2334d399'/></svg>" />
 <title>Trackflow — Zero-Install WebGPU People Tracking Playground</title>
 <style>
   :root {
@@ -47,8 +48,9 @@
       <label class="file-btn">Load Video File <input id="videoFile" type="file" accept="video/*" /></label>
       <button id="stopBtn">Stop</button>
       <select id="modelSelect" title="Detector model">
-        <option value="onnx-community/rtdetr_v2_r18vd-ONNX" selected>RT-DETRv2 R18 (~81 MB, recommended)</option>
-        <option value="onnx-community/dfine_n_coco-ONNX">D-FINE Nano (~15 MB, ultra-light)</option>
+        <option value="Xenova/yolos-tiny" selected>YOLOS Tiny (~26 MB · WebGPU Fast)</option>
+        <option value="onnx-community/rfdetr_base-ONNX">RF-DETR Base (~108 MB · WebGPU Accurate)</option>
+        <option value="onnx-community/rtdetr_v2_r18vd-ONNX">RT-DETRv2 R18 (~21 MB Q8 · WASM)</option>
       </select>
       <select id="privacySelect" title="Privacy anonymization mode">
         <option value="none" selected>Privacy: Off</option>
