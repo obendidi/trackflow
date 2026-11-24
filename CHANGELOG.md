@@ -4,6 +4,12 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+## [0.4.3] - 2026-11-24
+
+### Changed
+
+- Requires ONNX Runtime 1.20 or later (was 1.17).
+
 ### Fixed
 
 - `--device coreml` runs detectors and Re-ID on the Apple GPU with the same boxes as the CPU, using about a third of the CPU. YOLO26 presets no longer return wrong boxes on it.
@@ -118,7 +124,8 @@ First release of Trackflow, a rewrite of the 2017 Tracking-with-darkflow project
 
 - `trackflow run` crashes with an `AttributeError` from the progress bar. Use 0.1.1 or later.
 
-[Unreleased]: https://github.com/obendidi/trackflow/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/obendidi/trackflow/compare/v0.4.3...HEAD
+[0.4.3]: https://github.com/obendidi/trackflow/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/obendidi/trackflow/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/obendidi/trackflow/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/obendidi/trackflow/compare/v0.3.0...v0.4.0
