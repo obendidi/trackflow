@@ -43,7 +43,7 @@ trackflow run crowd.mp4 \
   --export parquet,jsonl,csv,mot,html
 ```
 
-The source can be a video file, a folder of images (read in natural order, `frame_2` before `frame_10`; set the rate with `--fps`), an RTSP/HTTP stream URL, or a camera index.
+The source can be a video file, a folder of images (read in natural order, `frame_2` before `frame_10`; set the rate with `--fps`), an RTSP/HTTP stream URL, or a camera index. Press Ctrl-C to stop a run: Trackflow stops reading frames and still writes every output, including the track cards that `trackflow search` and `trackflow inspect` read. A second Ctrl-C aborts without writing them.
 
 The Parquet export can be queried directly with DuckDB:
 

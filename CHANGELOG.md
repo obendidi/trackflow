@@ -4,6 +4,10 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+### Fixed
+
+- Ctrl-C stops a run and still writes its track cards, events, summary and report, so a camera or stream run can be searched and inspected afterwards. Before, Ctrl-C kept only the track tables. A second Ctrl-C aborts.
+
 ## [0.4.3] - 2026-11-24
 
 ### Changed
