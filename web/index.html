@@ -3,8 +3,23 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="description" content="In-browser people and object tracking with Apache-2.0 ONNX detectors (RF-DETR, RT-DETRv2) and ByteTrack. Runs locally in WebGPU or WASM; video never leaves your device." />
+<link rel="canonical" href="https://obendidi.github.io/trackflow/" />
+<meta property="og:type" content="website" />
+<meta property="og:url" content="https://obendidi.github.io/trackflow/" />
+<meta property="og:title" content="Trackflow — Local WebGPU People &amp; Object Tracking" />
+<meta property="og:description" content="Apache-2.0 multi-object tracking in Python and the browser. Run RF-DETR / RT-DETRv2 + ByteTrack locally in WebGPU or WASM, with CLI text search, ID-switch inspector, and floorplan projection." />
+<meta property="og:image" content="https://obendidi.github.io/trackflow/og-card.png" />
+<meta property="og:image:width" content="1280" />
+<meta property="og:image:height" content="640" />
+<meta property="og:image:alt" content="Trackflow tracking people in real time with Apache-2.0 ONNX detectors and ByteTrack" />
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="Trackflow — Local WebGPU People &amp; Object Tracking" />
+<meta name="twitter:description" content="Apache-2.0 multi-object tracking in Python and the browser. Everything runs locally in WebGPU or WASM; video never leaves your device." />
+<meta name="twitter:image" content="https://obendidi.github.io/trackflow/og-card.png" />
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23059669'/><circle cx='16' cy='16' r='8' fill='none' stroke='%23e6eefc' stroke-width='2.5'/><circle cx='16' cy='16' r='3' fill='%2334d399'/></svg>" />
 <title>Trackflow — Browser Demo</title>
+<!-- Optional cookieless analytics: paste your GoatCounter or Cloudflare Web Analytics script tag here -->
 <style>
   :root {
     --bg: #080c18; --panel: #11182c; --border: #233154;
@@ -16,6 +31,9 @@
   header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 20px; }
   h1 { margin: 0; font-size: 24px; }
   .badge { font-size: 12px; background: #0d3b2e; color: var(--accent); padding: 4px 10px; border-radius: 999px; font-weight: 600; }
+  .header-links { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .gh-link { font-size: 12px; color: var(--text); text-decoration: none; background: #1a294d; border: 1px solid #2e457a; padding: 4px 10px; border-radius: 999px; font-weight: 600; }
+  .gh-link:hover { border-color: var(--sky); color: var(--sky); }
   .sub { color: var(--muted); font-size: 14px; margin: 6px 0 0; }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 16px; margin-bottom: 16px; }
   .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
@@ -39,7 +57,11 @@
       <h1>Trackflow</h1>
       <p class="sub">In-browser people and object tracking with ONNX models and ByteTrack. Everything runs locally in WebGPU or WASM; video never leaves your device.</p>
     </div>
-    <span class="badge">WebGPU / WASM · Local only</span>
+    <div class="header-links">
+      <span class="badge">WebGPU / WASM · Local only</span>
+      <a class="gh-link" href="https://github.com/obendidi/trackflow" target="_blank" rel="noopener noreferrer">GitHub ↗</a>
+      <a class="gh-link" href="https://pypi.org/project/trackflow-python/" target="_blank" rel="noopener noreferrer">PyPI ↗</a>
+    </div>
   </header>
 
   <div class="panel">
