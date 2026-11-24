@@ -5,7 +5,9 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+import signal
 import tempfile
+import threading
 import time
 import warnings
 from collections import defaultdict
@@ -41,6 +43,30 @@ def fresh_run_dir(stem: str = "run", parent: str | Path = "runs") -> Path:
             continue
         return path
     raise AssertionError("unreachable")
+
+
+@contextlib.contextmanager
+def _stop_on_interrupt() -> Iterator[threading.Event]:
+    """Turn the first Ctrl-C into a stop request that ``run`` checks between frames.
+
+    After that first Ctrl-C the previous handler is back, so a second one interrupts as usual.
+    Signal handlers can only be set from the main thread; elsewhere Ctrl-C keeps its default.
+    """
+    stop = threading.Event()
+    previous = signal.getsignal(signal.SIGINT)
+    if threading.current_thread() is not threading.main_thread() or previous is None:
+        yield stop
+        return
+
+    def request_stop(signum: int, frame: Any) -> None:
+        stop.set()
+        signal.signal(signal.SIGINT, previous)
+
+    signal.signal(signal.SIGINT, request_stop)
+    try:
+        yield stop
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 @contextlib.contextmanager
@@ -432,7 +458,11 @@ class TrackflowPipeline:
         display: bool = False,
         progress_callback: Callable[[int, int, float], None] | None = None,
     ) -> RunSummary:
-        """Execute tracking on ``source`` and write requested artifacts into ``output_dir``."""
+        """Execute tracking on ``source`` and write requested artifacts into ``output_dir``.
+
+        Ctrl-C stops reading frames and still writes every artifact for the frames processed so
+        far, which is how a camera or stream run ends. A second Ctrl-C aborts.
+        """
         if skip < 0 or (max_frames is not None and max_frames < 1):
             raise ValueError("skip must be nonnegative and max_frames must be positive.")
         if isinstance(exports, str):
@@ -500,8 +530,11 @@ class TrackflowPipeline:
             processed = 0
             seen_frames = 0
 
+            stop = stack.enter_context(_stop_on_interrupt())
             try:
                 for frame_idx, timestamp_s, frame_bgr in frame_iter:
+                    if stop.is_set():
+                        break
                     seen_frames += 1
                     if skip > 0 and (frame_idx % (skip + 1) != 0):
                         continue
@@ -592,6 +625,8 @@ class TrackflowPipeline:
             # Merges are decided a few frames into a returning person's new track; relabel the
             # observations recorded before that so exports use one ID per person.
             if processed == 0:
+                if stop.is_set():
+                    raise KeyboardInterrupt
                 raise RuntimeError(f"No readable frames in {source}")
             if spool is not None:
                 spool.seek(0)

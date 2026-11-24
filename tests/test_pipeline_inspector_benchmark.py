@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import signal
 import threading
 import urllib.request
 from http.server import ThreadingHTTPServer
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
+import pytest
 from typer.testing import CliRunner
 
 from trackflow.benchmark import generate_synthetic_crowd_video, run_benchmark_suite
@@ -42,6 +44,45 @@ class _SyntheticMotionDetector:
                 bbox=(x2, 100.0, x2 + 45.0, 240.0), confidence=0.88, class_id=0, class_name="person"
             ),
         ]
+
+
+class _InterruptingDetector(_SyntheticMotionDetector):
+    """Sends Ctrl-C to its own process, ``presses`` times, while detecting frame ``at_frame``."""
+
+    def __init__(self, at_frame: int, presses: int = 1) -> None:
+        super().__init__()
+        self.at_frame, self.presses = at_frame, presses
+
+    def detect(self, frame_bgr: np.ndarray) -> list[Detection]:
+        if self.step == self.at_frame:
+            for _ in range(self.presses):
+                signal.raise_signal(signal.SIGINT)
+        return super().detect(frame_bgr)
+
+
+def test_ctrl_c_stops_the_run_and_writes_every_output(tmp_path: Path) -> None:
+    vid_path = generate_synthetic_crowd_video(tmp_path / "crowd.mp4", num_frames=20)
+    handler = signal.getsignal(signal.SIGINT)
+    pipe = TrackflowPipeline(model="synthetic", detector=_InterruptingDetector(at_frame=5))
+
+    summary = pipe.run(
+        str(vid_path), output_dir=tmp_path / "run", save_video=False, exports=("jsonl",)
+    )
+
+    assert summary.processed_frames == 6
+    for name in ("tracks.jsonl", "track_cards.json", "events.json", "summary.json"):
+        assert (tmp_path / "run" / name).is_file()
+    assert signal.getsignal(signal.SIGINT) is handler
+
+
+def test_second_ctrl_c_aborts_the_run(tmp_path: Path) -> None:
+    vid_path = generate_synthetic_crowd_video(tmp_path / "crowd.mp4", num_frames=20)
+    pipe = TrackflowPipeline(model="synthetic", detector=_InterruptingDetector(5, presses=2))
+
+    with pytest.raises(KeyboardInterrupt):
+        pipe.run(str(vid_path), output_dir=tmp_path / "run", save_video=False, exports=("jsonl",))
+
+    assert not (tmp_path / "run" / "summary.json").exists()
 
 
 def test_end_to_end_pipeline_inspector_and_benchmark(tmp_path: Path) -> None:
