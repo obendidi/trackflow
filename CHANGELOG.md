@@ -4,6 +4,10 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+### Changed
+
+- Runs with `--query` or `--vlm` embed each track when it first appears and then at ages 1, 2, 4, 8 seconds and so on, and average those crops, instead of embedding every track every 5 frames. Runs with them are 2.3 to 2.5 times faster on busy scenes (3.0 to 6.9 FPS on a crowded street with SigLIP on an Apple M4 Pro), with search results about the same. `TrackCardIndex` no longer takes `embed_every_n_frames`.
+
 ### Fixed
 
 - Ctrl-C stops a run and still writes its track cards, events, summary and report, so a camera or stream run can be searched and inspected afterwards. Before, Ctrl-C kept only the track tables. A second Ctrl-C aborts.
