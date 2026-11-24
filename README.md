@@ -79,7 +79,7 @@ Scores on MOT17, over the second half of each of its 7 training sequences (2,652
 
 The four trackers are within 1.4 HOTA of each other. BoT-SORT with `--reid osnet` scores highest and has the fewest ID switches. BoostTrack with `--reid osnet` comes close but is slower, because it embeds every person detection, including weak ones it might boost. The detector matters more than the tracker (see [Models](#models)). Published MOT17 results of 60 HOTA and above use detectors trained on MOT17, while these presets are trained on COCO only.
 
-Each score comes from `trackflow run <sequence>/img1 --fps <frame rate> --device cpu --no-video --export mot`, plus the tracker options, scored with TrackEval over all 7 sequences. Scenes differ a lot (ByteTrack ranges from 33.8 HOTA on MOT17-02 to 49.3 on MOT17-09), so compare trackers on footage like yours with `trackflow compare` or `--export mot`.
+[`scripts/eval_mot17.py`](https://github.com/obendidi/trackflow/blob/main/scripts/eval_mot17.py) reproduces these scores. It runs each sequence as `trackflow run <sequence>/img1 --fps <frame rate> --device cpu --no-video --export mot` would, then scores all 7 sequences together with Roboflow's `trackers eval`, which gives the same numbers as TrackEval. Scenes differ a lot (ByteTrack ranges from 33.8 HOTA on MOT17-02 to 49.3 on MOT17-09), so compare trackers on footage like yours with `trackflow compare` or `--export mot`.
 
 ### Text search and re-identification
 
@@ -168,7 +168,7 @@ Most presets also have `--precision fp16` and `int8` variants. Trackflow itself 
 | `rtdetr-v2-r18` *(default)* | 45.1 | 54.0 | 40.1 |
 | `rfdetr-large` | 44.3 | 51.1 | 35.9 |
 | `rfdetr-medium` | 41.2 | 46.4 | 32.7 |
-| `yolo26n` | 37.4 | 41.5 | 27.9 |
+| `yolo26n` | 37.4 | 41.4 | 27.9 |
 | `rfdetr-nano` | 36.5 | 40.5 | 28.2 |
 
 The default scores highest here even though RF-DETR scores higher on COCO, so test on footage like yours before you switch.

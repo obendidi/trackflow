@@ -8,6 +8,7 @@ Real-time people & object tracking toolkit (Python package `trackflow-python` + 
 - `web/`: Static WebGPU playground (plain HTML/JS, zero build step), deployed to GitHub Pages on pushes to `main` via `.github/workflows/pages.yml`.
 - `tests/`: Pytest suite including Node-backed JS parity tests (`tests/test_web_parity.py`) and release checks (`tests/test_release.py`).
 - `scripts/release_notes.py`: Validates version/tag/changelog consistency during releases.
+- `scripts/eval_mot17.py`: Scores presets and trackers on MOT17 (the README's accuracy tables).
 
 ## Commands
 
@@ -15,6 +16,7 @@ Real-time people & object tracking toolkit (Python package `trackflow-python` + 
 - **Lint**: `uv run ruff check src tests scripts`
 - **Test**: `uv run pytest` (requires Node.js on `PATH` for `tests/test_web_parity.py`)
 - **Weight smoke tests** (downloads HF weights): `TRACKFLOW_TEST_WEIGHTS=1 uv run pytest tests/test_model_weights.py`
+- **MOT17 accuracy** (downloads about 425 MB once; needs `uvx`): `uv run python scripts/eval_mot17.py --models rtdetr-v2-r18 --trackers bytetrack,botsort+osnet`; on Apple Silicon add `--device coreml` to run on the GPU, which gives the same scores. Rerun it after changing a tracker, a detector or preprocessing, and update the README tables.
 - **Build**: `uv build`
 - **Web playground preview**: `python3 -m http.server 4173 --bind 127.0.0.1 --directory web`
 
