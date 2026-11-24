@@ -27,6 +27,9 @@ class ModelSpec:
     backend: Literal["onnx", "transformers"] = "onnx"
     onnx_file: str | None = None  # standalone FP32 graph with embedded post-processing
     normalize: bool = False  # preprocessing for standalone graphs without a sidecar
+    # CoreML graph format for --device coreml. MLProgram covers more operators and gives the same
+    # boxes as the CPU; NeuralNetwork is for graphs that MLProgram can't compile or crashes on.
+    coreml_format: Literal["MLProgram", "NeuralNetwork"] = "MLProgram"
     letterbox: bool = False  # keep the aspect ratio and pad with gray, as YOLO is trained
 
     @property
@@ -92,6 +95,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         default_input_size=(560, 560),
         description="Higher-accuracy 560x560 detection transformer.",
         revision="7b18fa82ba7b1d6bc9446518cf2cc1d991097a3f",
+        coreml_format="NeuralNetwork",  # MLProgram aborts the process in Metal's graph compiler
     ),
     "rfdetr-small": ModelSpec(
         "rfdetr-small",
@@ -134,6 +138,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         "HGNetv2 COCO edge detector.",
         "e1514db73b6a64566560cc54a2c28f3bf25a31da",
         onnx_file="deimv2_hgnetv2_atto_coco.onnx",
+        coreml_format="NeuralNetwork",  # MLProgram rejects its GridSample coordinates
     ),
     "deimv2-s": ModelSpec(
         "deimv2-s",
@@ -146,6 +151,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         "e1514db73b6a64566560cc54a2c28f3bf25a31da",
         onnx_file="deimv2_dinov3_s_coco.onnx",
         normalize=True,
+        coreml_format="NeuralNetwork",  # MLProgram rejects its GridSample coordinates
     ),
 }
 

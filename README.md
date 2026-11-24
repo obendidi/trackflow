@@ -29,7 +29,7 @@ trackflow inspect          # opens the most recent run
 
 Each run writes to a new folder (`runs/run-1`, `runs/run-2`, …). Pass `-o <dir>` to choose one yourself; it must be empty, so a new run never mixes with files from an old one.
 
-Model weights download from Hugging Face on first run and are cached locally. Every preset is pinned to a specific model revision, so the same command gives the same weights later. ONNX Runtime picks CUDA or CPU automatically; `--device cpu|cuda|coreml|tensorrt` forces one and fails loudly if it isn't available.
+Model weights download from Hugging Face on first run and are cached locally. Every preset is pinned to a specific model revision, so the same command gives the same weights later. ONNX Runtime picks CUDA or CPU automatically; `--device cpu|cuda|coreml|tensorrt` forces one and fails loudly if it isn't available. On Apple Silicon, `--device coreml` runs detection on the GPU: the default model runs at about CPU speed with a third of the CPU load, while RF-DETR runs slower than on the CPU.
 
 ## Usage
 

@@ -151,9 +151,9 @@ def select_providers(device: str = "auto") -> list[str]:
             )
         return [p for p in options[req] if p in available]
 
-    # Auto-selection: prefer NVIDIA CUDA if present, else multi-threaded CPU.
-    # (DETR/RF-DETR graphs split into 75–135 partitions on CoreML EP, making CPU 1.4x–3x faster on Apple Silicon;
-    # users can still explicitly opt in with --device coreml.)
+    # Auto-selection: prefer NVIDIA CUDA if present, else multi-threaded CPU. On Apple Silicon,
+    # CoreML runs part of each DETR graph on the CPU: it frees most CPU cores but is slower for
+    # RF-DETR, so it stays opt-in with --device coreml.
     preferred = [
         "CUDAExecutionProvider",
         "CPUExecutionProvider",
@@ -167,14 +167,28 @@ def create_onnx_session(
     device: str = "auto",
     *,
     optimization: ort.GraphOptimizationLevel = ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
+    coreml_format: str | None = "MLProgram",
 ) -> tuple[ort.InferenceSession, str]:
     """Create an ONNX Runtime session with safe fallback to CPU if an EP fails."""
     providers = select_providers(device)
+    # CoreML runs on the GPU, not the Neural Engine, so results match the CPU's fp32.
+    # ``coreml_format=None`` keeps ONNX Runtime's default CoreML setup.
+    provider_options = [
+        {"ModelFormat": coreml_format, "MLComputeUnits": "CPUAndGPU"}
+        if p == "CoreMLExecutionProvider" and coreml_format is not None
+        else {}
+        for p in providers
+    ]
     sess_opts = ort.SessionOptions()
     sess_opts.graph_optimization_level = optimization
 
     try:
-        session = ort.InferenceSession(str(onnx_path), sess_options=sess_opts, providers=providers)
+        session = ort.InferenceSession(
+            str(onnx_path),
+            sess_options=sess_opts,
+            providers=providers,
+            provider_options=provider_options,
+        )
     except Exception:
         if device.strip().lower() != "auto" or providers == ["CPUExecutionProvider"]:
             raise
@@ -372,7 +386,10 @@ class OnnxDetrDetector:
         ):
             optimization = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
         self.session, self.active_provider = create_onnx_session(
-            onnx_path, device=effective_device, optimization=optimization
+            onnx_path,
+            device=effective_device,
+            optimization=optimization,
+            coreml_format=spec.coreml_format if spec else "MLProgram",
         )
 
         self.input_name = self.session.get_inputs()[0].name

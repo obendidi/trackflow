@@ -155,8 +155,14 @@ class VlmEmbedder:
 
         artifacts = resolve_vlm_artifacts(backend=backend, precision=precision, cache_dir=cache_dir)
         eff_dev = "cpu" if (device == "auto" and precision == "int8") else device
-        self._vision_sess, _ = create_onnx_session(artifacts["vision_onnx"], device=eff_dev)
-        self._text_sess, _ = create_onnx_session(artifacts["text_onnx"], device=eff_dev)
+        # ONNX Runtime's default CoreML setup: MLProgram can't load these INT8 graphs, and
+        # NeuralNetwork limited to CPU and GPU returns NaN for some CLIP crops.
+        self._vision_sess, _ = create_onnx_session(
+            artifacts["vision_onnx"], device=eff_dev, coreml_format=None
+        )
+        self._text_sess, _ = create_onnx_session(
+            artifacts["text_onnx"], device=eff_dev, coreml_format=None
+        )
         self._tokenizer = Tokenizer.from_file(str(artifacts["tokenizer"]))
         self._load_preprocess(artifacts["preprocessor"], artifacts["config"])
 
