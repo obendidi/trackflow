@@ -68,14 +68,15 @@ trackflow run entrance.mp4 --line "door=640,300,640,720"
 ### 3. Natural-language track search (and Re-ID caveat)
 
 ```bash
-# Compute CLIP/SigLIP embeddings during the run (--vlm siglip for finer clothing attributes)
-trackflow run mall.mp4 --query "person in red jacket with a backpack" --vlm siglip
+# Embed track crops during the run (--vlm embeddinggemma needs `pip install "trackflow-python[transformers]"`)
+trackflow run mall.mp4 --query "person in red jacket with a backpack" --vlm embeddinggemma
 
 # Re-query the saved run later without re-running detection
 trackflow search runs/run-1 "person carrying a suitcase"
 ```
 
-- **Keep search and identity separate**: CLIP/SigLIP match text to track crops and are never used for track IDs. Use `--reid osnet` (and opt-in `--reid-merge` for re-entry linking) for appearance identity.
+- **Pick the search model**: `--vlm embeddinggemma` (EmbeddingGemma 2, PyTorch) is the most accurate on clothing and accessories; `--vlm siglip` is the best ONNX-only choice; CLIP, the default with `--query`, is the weakest. Each has its own `--query-threshold` default (0.71, 0.08, 0.27), so don't carry a threshold over from another model.
+- **Keep search and identity separate**: CLIP, SigLIP and EmbeddingGemma 2 match text to track crops and are never used for track IDs. Use `--reid osnet` (and opt-in `--reid-merge` for re-entry linking) for appearance identity.
 
 ### 4. Visual debugging, comparison, and floorplan homography
 
