@@ -95,6 +95,27 @@ def test_query_scoring_and_natural_language_search(tmp_path: Path) -> None:
     assert hits[0]["search_score"] > hits[1]["search_score"]
 
 
+def test_track_is_embedded_when_first_seen_then_at_doubling_ages() -> None:
+    class _CountingVlm(_MockVlm):
+        def __init__(self) -> None:
+            super().__init__()
+            self.ages: list[float] = []
+
+        def encode_image(self, crop_bgr: np.ndarray | None) -> np.ndarray | None:
+            self.ages.append(self.now)
+            return super().encode_image(crop_bgr)
+
+    vlm = _CountingVlm()
+    idx = TrackCardIndex(vlm=vlm)
+    frame = _frame((LEFT, RED))
+    for f in range(100):  # 10 s at 10 FPS
+        vlm.now = f / 10
+        idx.update(frame_idx=f, timestamp_s=f / 10, frame_bgr=frame, tracks=[_track(1, LEFT)])
+
+    assert vlm.ages == pytest.approx([0.0, 1.0, 2.0, 4.0, 8.0])
+    assert idx.cards[1].embedding == pytest.approx([1.0, 0.0, 0.0], abs=0.05)
+
+
 def test_query_never_merges_identities() -> None:
     """A --query run (VLM only) must not merge different raw IDs, however similar they look."""
     idx = TrackCardIndex(vlm=_MockVlm(), query="red")

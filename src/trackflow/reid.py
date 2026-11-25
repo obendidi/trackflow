@@ -297,7 +297,6 @@ class TrackCardIndex:
         reid_sample_every: int = 3,
         min_reid_height: float = 48.0,
         min_exit_gap_frames: int = 8,
-        embed_every_n_frames: int = 5,
         crops_dir: Path | None = None,
     ) -> None:
         if reid_merge and reid is None:
@@ -313,7 +312,6 @@ class TrackCardIndex:
         self.reid_sample_every = max(1, int(reid_sample_every))
         self.min_reid_height = float(min_reid_height)
         self.min_exit_gap_frames = int(min_exit_gap_frames)
-        self.embed_every_n_frames = max(1, int(embed_every_n_frames))
         self.crops_dir = crops_dir
 
         self._query_vec: np.ndarray | None = None
@@ -321,7 +319,9 @@ class TrackCardIndex:
             self._query_vec = self.vlm.encode_text(self.query)
 
         self.cards: dict[int, TrackCard] = {}
-        self._vlm_emb: dict[int, np.ndarray] = {}
+        self._vlm_sum: dict[int, np.ndarray] = {}  # sum of a card's sampled crop embeddings
+        self._vlm_emb: dict[int, np.ndarray] = {}  # its normalized mean
+        self._next_embed_s: dict[int, float] = {}
         self._reid_sum: dict[int, np.ndarray] = {}
         self._alias: dict[int, int] = {}  # raw tracker ID -> canonical card ID
         self._raw_first_frame: dict[int, int] = {}
@@ -388,13 +388,10 @@ class TrackCardIndex:
 
         if src_id in self._reid_sum:
             self._reid_sum[dst_id] = self._reid_sum.get(dst_id, 0.0) + self._reid_sum.pop(src_id)
-        if src_id in self._vlm_emb:
-            if dst_id in self._vlm_emb:
-                self._vlm_emb[dst_id] = _l2_normalize(
-                    self._vlm_emb[dst_id] + self._vlm_emb.pop(src_id)
-                )
-            else:
-                self._vlm_emb[dst_id] = self._vlm_emb.pop(src_id)
+        if src_id in self._vlm_sum:
+            self._vlm_sum[dst_id] = self._vlm_sum.get(dst_id, 0.0) + self._vlm_sum.pop(src_id)
+            self._vlm_emb.pop(src_id, None)
+            self._vlm_emb[dst_id] = _l2_normalize(self._vlm_sum[dst_id])
             dst.embedding = [round(float(x), 5) for x in self._vlm_emb[dst_id].tolist()]
 
     def update(
@@ -438,7 +435,6 @@ class TrackCardIndex:
         for tr, crop, remb in zip(tracks, crops, reid_embs, strict=True):
             raw = tr.track_id
             cid = self.canonical_id(raw)
-            is_new_card = cid not in self.cards
 
             card = self.cards.get(cid)
             if card is None:
@@ -501,19 +497,18 @@ class TrackCardIndex:
                     card.zones_visited.append(tr.zone)
                 card.dwell_seconds[tr.zone] = card.dwell_seconds.get(tr.zone, 0.0) + frame_dt_s
 
-            # Text-aligned embedding for --query scoring and post-run search.
-            if (
-                self.vlm is not None
-                and crop is not None
-                and (is_new_card or frame_idx % self.embed_every_n_frames == 0)
-            ):
+            # Text-aligned embedding for --query scoring and post-run search: the mean of crops
+            # taken when the track is first seen and at ages 1, 2, 4, 8 s and so on, so a long
+            # track costs a few encoder calls instead of one every few frames.
+            due = self._next_embed_s.get(cid)
+            if self.vlm is not None and crop is not None and (due is None or timestamp_s >= due):
                 vemb = self.vlm.encode_image(crop)
                 if vemb is not None:
-                    prev = self._vlm_emb.get(cid)
-                    self._vlm_emb[cid] = (
-                        vemb if prev is None else _l2_normalize(0.8 * prev + 0.2 * vemb)
-                    )
+                    self._vlm_sum[cid] = self._vlm_sum.get(cid, 0.0) + vemb
+                    self._vlm_emb[cid] = _l2_normalize(self._vlm_sum[cid])
                     card.embedding = [round(float(x), 5) for x in self._vlm_emb[cid].tolist()]
+                    age_s = timestamp_s - card.first_timestamp_s
+                    self._next_embed_s[cid] = timestamp_s + max(1.0, age_s)
 
             if self._query_vec is not None and cid in self._vlm_emb:
                 score = cosine_similarity(self._vlm_emb[cid], self._query_vec)
