@@ -34,7 +34,7 @@ from trackflow.types import Track, TrackCard
 ReidBackend = Literal["none", "color", "osnet"]
 VlmBackend = Literal["none", "clip", "siglip", "embeddinggemma"]
 # Default --query cut-off per model: text-image cosine scores sit on a different scale for each.
-QUERY_THRESHOLDS: dict[str, float] = {"clip": 0.22, "siglip": 0.22, "embeddinggemma": 0.71}
+QUERY_THRESHOLDS: dict[str, float] = {"clip": 0.27, "siglip": 0.08, "embeddinggemma": 0.71}
 
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -379,7 +379,7 @@ class TrackCardIndex:
         vlm: VlmEmbedder | None = None,
         reid: ReidEmbedder | None = None,
         query: str | None = None,
-        query_threshold: float = 0.22,
+        query_threshold: float | None = None,
         reid_merge: bool = False,
         reid_merge_threshold: float = 0.80,
         reid_merge_margin: float = 0.05,
@@ -394,6 +394,8 @@ class TrackCardIndex:
         self.vlm = vlm
         self.reid = reid
         self.query = query.strip() if query else None
+        if query_threshold is None:
+            query_threshold = QUERY_THRESHOLDS.get(vlm.backend if vlm else "none", 0.22)
         self.query_threshold = float(query_threshold)
         self.reid_merge = bool(reid_merge)
         self.reid_merge_threshold = float(reid_merge_threshold)

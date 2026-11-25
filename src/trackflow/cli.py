@@ -123,7 +123,7 @@ def run(
         typer.Option(
             "--query-threshold",
             help="Cosine similarity threshold for --query matches "
-            "(default: 0.71 for embeddinggemma, else 0.22).",
+            "(default: 0.27 for clip, 0.08 for siglip, 0.71 for embeddinggemma).",
         ),
     ] = None,
     anonymize: Annotated[
