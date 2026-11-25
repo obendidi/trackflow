@@ -9,6 +9,10 @@ Real-time people and object tracking in Python and in the browser. Trackflow run
 
 *`trackflow run crossing.mp4` with the default settings, at 12 FPS on an Apple M4 Pro CPU. Footage: 8 seconds of [DiagonalCrosswalkYongeDundas.webm](https://commons.wikimedia.org/wiki/File:DiagonalCrosswalkYongeDundas.webm) by Raysonho, CC0.*
 
+![Trackflow Inspector showing live video playback, recovery jumps, two natural-language track searches ("person in white shirt" and "woman in pink shirt"), and ByteTrack vs BoT-SORT comparison](https://raw.githubusercontent.com/obendidi/trackflow/main/docs/inspect-demo.webp)
+
+*`trackflow inspect` on the same clip: scrubbing with live video frames, jumping to recovery events, searching Track Cards with natural language, and comparing ByteTrack against BoT-SORT.*
+
 Try it in the browser without installing anything: [obendidi.github.io/trackflow](https://obendidi.github.io/trackflow/).
 
 ## Quickstart
