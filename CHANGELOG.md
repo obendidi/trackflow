@@ -4,6 +4,8 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-25
+
 ### Added
 
 - `--vlm embeddinggemma` scores `--query` and powers `trackflow search` with Google's EmbeddingGemma 2 (install `trackflow-python[transformers]`). On 4,000 human-labelled pedestrian crops it ranked people matching clothing and accessory queries above SigLIP on 33 of 34 queries, and runs at 6.3 FPS against SigLIP's 6.9 on a crowded street clip. Its `--query-threshold` defaults to 0.71 to match its score scale.
@@ -11,13 +13,11 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 ### Changed
 
 - The `transformers` extra now requires transformers 5.18 or later and installs sentence-transformers.
-
 - Runs with `--query` or `--vlm` embed each track when it first appears and then at ages 1, 2, 4, 8 seconds and so on, and average those crops, instead of embedding every track every 5 frames. Runs with them are 2.3 to 2.5 times faster on busy scenes (3.0 to 6.9 FPS on a crowded street with SigLIP on an Apple M4 Pro), with search results about the same. `TrackCardIndex` no longer takes `embed_every_n_frames`.
 
 ### Fixed
 
 - `--query` with `--vlm siglip` flags matching tracks instead of none, and `--query` with CLIP, the default, no longer flags nearly every track. `--query-threshold` now defaults to 0.08 for SigLIP and 0.27 for CLIP instead of 0.22 for both, and `TrackCardIndex` uses the same per-model default.
-
 - Ctrl-C stops a run and still writes its track cards, events, summary and report, so a camera or stream run can be searched and inspected afterwards. Before, Ctrl-C kept only the track tables. A second Ctrl-C aborts.
 
 ## [0.4.3] - 2026-11-24
@@ -140,7 +140,8 @@ First release of Trackflow, a rewrite of the 2017 Tracking-with-darkflow project
 
 - `trackflow run` crashes with an `AttributeError` from the progress bar. Use 0.1.1 or later.
 
-[Unreleased]: https://github.com/obendidi/trackflow/compare/v0.4.3...HEAD
+[Unreleased]: https://github.com/obendidi/trackflow/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/obendidi/trackflow/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/obendidi/trackflow/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/obendidi/trackflow/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/obendidi/trackflow/compare/v0.4.0...v0.4.1
