@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
 import shutil
+import threading
 import webbrowser
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import cv2
 import pyarrow.csv as pcsv
 import pyarrow.parquet as pq
 
@@ -21,6 +24,130 @@ from trackflow.reid import search_track_cards
 from trackflow.sinks import PARQUET_SCHEMA
 
 UI_HTML_PATH = Path(__file__).with_name("inspector_ui.html")
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+_MAX_FRAME_WIDTH = 960
+_FRAME_CACHE_SIZE = 64
+
+
+def _natural_order(path: Path) -> list[int | str]:
+    return [
+        int(part) if part.isdecimal() else part for part in re.split(r"(\d+)", path.name.casefold())
+    ]
+
+
+def _resolve_frame_source(
+    run_dir: Path, summary: dict[str, Any]
+) -> tuple[str, Path | list[Path], int] | None:
+    """Pick a safe local frame source for the inspector, respecting ``anonymize_mode``.
+
+    Anonymized runs never read the raw source file; they only serve frames from ``annotated.mp4``.
+    """
+    outputs = summary.get("output_files")
+    annotated = run_dir / "annotated.mp4"
+    has_annotated = (outputs is None or "video" in outputs) and annotated.is_file()
+    stride = max(1, int(summary.get("frame_stride") or 1))
+
+    if summary.get("anonymize_mode", "none") != "none":
+        return ("video", annotated, stride) if has_annotated else None
+
+    raw_source = summary.get("source")
+    if isinstance(raw_source, str) and not raw_source.lower().startswith(
+        ("rtsp://", "rtsps://", "http://", "https://")
+    ):
+        src_path = Path(raw_source)
+        if src_path.is_file():
+            return ("video", src_path, 1)
+        if src_path.is_dir():
+            images = sorted(
+                (p for p in src_path.iterdir() if p.is_file() and p.suffix.lower() in _IMAGE_EXTS),
+                key=_natural_order,
+            )
+            if images:
+                return ("images", images, 1)
+
+    return ("video", annotated, stride) if has_annotated else None
+
+
+class _FrameStore:
+    """Thread-safe on-demand JPEG decoder for inspector video/image backgrounds."""
+
+    def __init__(self, run_dir: Path) -> None:
+        summary_path = run_dir / "summary.json"
+        summary = (
+            json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.is_file() else {}
+        )
+        resolved = _resolve_frame_source(run_dir, summary)
+        self._kind: str | None = resolved[0] if resolved else None
+        self._target: Path | list[Path] | None = resolved[1] if resolved else None
+        self._stride: int = resolved[2] if resolved else 1
+        self._cap: cv2.VideoCapture | None = None
+        self._next_pos: int | None = None
+        self._lock = threading.Lock()
+        self._cache: OrderedDict[int, bytes] = OrderedDict()
+
+    @property
+    def available(self) -> bool:
+        return self._kind is not None
+
+    def get_jpeg(self, frame_idx: int) -> bytes | None:
+        if not self.available or frame_idx < 0:
+            return None
+        with self._lock:
+            cached = self._cache.get(frame_idx)
+            if cached is not None:
+                self._cache.move_to_end(frame_idx)
+                return cached
+
+            frame = self._read_frame(frame_idx)
+            if frame is None:
+                return None
+
+            h, w = frame.shape[:2]
+            if w > _MAX_FRAME_WIDTH:
+                new_h = max(1, int(round(h * (_MAX_FRAME_WIDTH / w))))
+                frame = cv2.resize(frame, (_MAX_FRAME_WIDTH, new_h), interpolation=cv2.INTER_AREA)
+
+            ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+            if not ok:
+                return None
+            jpeg = encoded.tobytes()
+            self._cache[frame_idx] = jpeg
+            if len(self._cache) > _FRAME_CACHE_SIZE:
+                self._cache.popitem(last=False)
+            return jpeg
+
+    def _read_frame(self, frame_idx: int) -> Any:
+        if self._kind == "images" and isinstance(self._target, list):
+            if frame_idx >= len(self._target):
+                return None
+            return cv2.imread(str(self._target[frame_idx]))
+
+        if self._kind == "video" and isinstance(self._target, Path):
+            if self._cap is None:
+                cap = cv2.VideoCapture(str(self._target))
+                if not cap.isOpened():
+                    return None
+                self._cap = cap
+                self._next_pos = 0
+            pos = frame_idx // self._stride
+            if self._next_pos != pos:
+                self._cap.set(cv2.CAP_PROP_POS_FRAMES, float(pos))
+            ok, frame = self._cap.read()
+            if not ok or frame is None:
+                self._next_pos = None
+                return None
+            self._next_pos = pos + 1
+            return frame
+
+        return None
+
+    def close(self) -> None:
+        with self._lock:
+            if self._cap is not None:
+                self._cap.release()
+                self._cap = None
+            self._next_pos = None
+            self._cache.clear()
 
 
 def load_run_payload(run_dir: Path) -> dict[str, Any]:
@@ -101,6 +228,7 @@ def load_run_payload(run_dir: Path) -> dict[str, Any]:
         "homography": homography,
         "frames": frames_sorted,
         "has_video": present("video", run_dir / "annotated.mp4"),
+        "has_frames": _resolve_frame_source(run_dir, summary) is not None,
         "has_floorplan": (run_dir / "floorplan.png").is_file(),
     }
 
@@ -160,12 +288,17 @@ def compute_homography_projection(
 def make_inspector_handler(
     run_dir: Path,
     compare_dir: Path | None = None,
+    *,
+    frame_store: _FrameStore | None = None,
 ) -> type[BaseHTTPRequestHandler]:
     """Create an HTTP handler bound to ``run_dir`` (and optional ``compare_dir``)."""
     root_dir = run_dir.resolve()
     cmp_dir = compare_dir.resolve() if compare_dir is not None else None
+    frames = frame_store if frame_store is not None else _FrameStore(root_dir)
 
     class InspectorHandler(BaseHTTPRequestHandler):
+        frame_store = frames
+
         def log_message(self, format: str, *args: Any) -> None:
             _ = (format, args)
 
@@ -208,6 +341,23 @@ def make_inspector_handler(
                 if cmp_dir is not None and cmp_dir.is_dir():
                     payload["compare"] = load_run_payload(cmp_dir)
                 self._send_json(payload)
+                return
+
+            if route.startswith("/api/frame/"):
+                raw_idx = route.removeprefix("/api/frame/")
+                if not raw_idx.isdigit():
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                jpeg = frames.get_jpeg(int(raw_idx))
+                if jpeg is None:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Cache-Control", "private, max-age=300")
+                self.send_header("Content-Length", str(len(jpeg)))
+                self.end_headers()
+                self.wfile.write(jpeg)
                 return
 
             if route.startswith("/crops/"):
@@ -312,10 +462,10 @@ def serve_inspector(
     open_browser: bool = True,
 ) -> None:
     """Start the Trackflow Visual Track Debugger HTTP server."""
-    handler = make_inspector_handler(
-        Path(run_dir),
-        Path(compare_dir) if compare_dir is not None else None,
-    )
+    root = Path(run_dir).resolve()
+    cmp_root = Path(compare_dir).resolve() if compare_dir is not None else None
+    store = _FrameStore(root)
+    handler = make_inspector_handler(root, cmp_root, frame_store=store)
     server = ThreadingHTTPServer((host, port), handler)
     url = f"http://{host}:{port}"
     if open_browser:
@@ -325,4 +475,5 @@ def serve_inspector(
     except KeyboardInterrupt:
         pass
     finally:
+        store.close()
         server.server_close()

@@ -79,6 +79,7 @@
         <div class="controls">
           <button class="btn primary" id="playBtn">Play</button>
           <input type="range" id="scrubber" min="0" max="0" value="0" />
+          <label class="hint"><input type="checkbox" id="showVideo" checked /> Video</label>
           <label class="hint"><input type="checkbox" id="showTrails" checked /> Trails</label>
         </div>
         <div class="hint" style="margin-top:10px;">Diagnostic Event Markers (click to jump):</div>
@@ -142,8 +143,44 @@ let playing = false;
 let playTimer = null;
 let selectedTrackId = null;
 let calibPoints = [];
+const FRAME_IMG_CACHE = new Map();
+const FRAME_IMG_LIMIT = 120;
+let lastLoadedFrameImg = null;
 
 function colorFor(id) { return PALETTE[id % PALETTE.length]; }
+
+function getFrameImage(frameIdx, onReady) {
+  if (!DATA || !DATA.has_frames) return null;
+  const cached = FRAME_IMG_CACHE.get(frameIdx);
+  if (cached) {
+    if (cached.complete && cached.naturalWidth > 0) return cached;
+    if (onReady && !cached._failed) cached._callbacks.push(onReady);
+    return null;
+  }
+  const img = new Image();
+  img._callbacks = onReady ? [onReady] : [];
+  img._failed = false;
+  img.onload = () => {
+    lastLoadedFrameImg = img;
+    const cbs = img._callbacks.splice(0);
+    cbs.forEach(fn => fn());
+  };
+  img.onerror = () => { img._failed = true; img._callbacks.length = 0; };
+  img.src = `/api/frame/${frameIdx}`;
+  FRAME_IMG_CACHE.set(frameIdx, img);
+  if (FRAME_IMG_CACHE.size > FRAME_IMG_LIMIT) {
+    FRAME_IMG_CACHE.delete(FRAME_IMG_CACHE.keys().next().value);
+  }
+  return null;
+}
+
+function prefetchFrames(pos) {
+  if (!DATA || !DATA.has_frames || !DATA.frames.length) return;
+  for (let offset = 1; offset <= 3; offset++) {
+    const nextPos = (pos + offset) % DATA.frames.length;
+    getFrameImage(DATA.frames[nextPos].frame_idx, null);
+  }
+}
 
 document.querySelectorAll('nav button').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -169,6 +206,18 @@ async function init() {
   scrubber.max = Math.max(0, DATA.frames.length - 1);
   scrubber.addEventListener('input', e => { frameIdxPos = Number(e.target.value); drawFrame(); });
   document.getElementById('showTrails').addEventListener('change', drawFrame);
+  const showVideoEl = document.getElementById('showVideo');
+  if (!DATA.has_frames) {
+    showVideoEl.checked = false;
+    showVideoEl.disabled = true;
+  }
+  showVideoEl.addEventListener('change', drawFrame);
+
+  const fw = s.frame_width || 800;
+  const fh = s.frame_height || 450;
+  const trackCanvas = document.getElementById('trackCanvas');
+  trackCanvas.height = Math.max(240, Math.round(trackCanvas.width * (fh / fw)));
+  calibCanvas.height = Math.max(240, Math.round(calibCanvas.width * (fh / fw)));
 
   if (DATA.homography && DATA.homography.image_points) {
     calibPoints = DATA.homography.image_points.map(p => [...p]);
@@ -251,6 +300,13 @@ function selectTrack(tid, bestFrame) {
   renderCards(DATA.cards);
 }
 
+function drawGrid(ctx, width, height) {
+  ctx.strokeStyle = '#141d36';
+  ctx.lineWidth = 1;
+  for (let x = 0; x < width; x += 64) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,height); ctx.stroke(); }
+  for (let y = 0; y < height; y += 64) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(width,y); ctx.stroke(); }
+}
+
 function drawFrame() {
   const canvas = document.getElementById('trackCanvas');
   const ctx = canvas.getContext('2d');
@@ -258,15 +314,30 @@ function drawFrame() {
   const fh = DATA.summary.frame_height || 450;
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-  // Subtle coordinate grid
-  ctx.strokeStyle = '#141d36';
-  ctx.lineWidth = 1;
-  for (let x = 0; x < canvas.width; x += 64) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,canvas.height); ctx.stroke(); }
-  for (let y = 0; y < canvas.height; y += 64) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke(); }
-
-  if (!DATA.frames.length) return;
+  if (!DATA.frames.length) {
+    drawGrid(ctx, canvas.width, canvas.height);
+    return;
+  }
   const frame = DATA.frames[frameIdxPos];
   document.getElementById('frameInfo').textContent = `Frame ${frame.frame_idx} · ${frame.tracks.length} tracks`;
+
+  const wantVideo = DATA.has_frames && document.getElementById('showVideo').checked;
+  if (wantVideo) {
+    const img = getFrameImage(frame.frame_idx, () => {
+      if (DATA.frames[frameIdxPos]?.frame_idx === frame.frame_idx) drawFrame();
+    });
+    const bg = img || lastLoadedFrameImg;
+    if (bg) {
+      ctx.drawImage(bg, 0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = 'rgba(9, 13, 26, 0.14)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    } else {
+      drawGrid(ctx, canvas.width, canvas.height);
+    }
+    if (playing) prefetchFrames(frameIdxPos);
+  } else {
+    drawGrid(ctx, canvas.width, canvas.height);
+  }
 
   const sx = canvas.width / fw;
   const sy = canvas.height / fh;
@@ -366,8 +437,18 @@ function drawCalibCanvas() {
   const sx = calibCanvas.width / fw, sy = calibCanvas.height / fh;
   ctx.clearRect(0, 0, calibCanvas.width, calibCanvas.height);
 
+  if (DATA.has_frames && DATA.frames.length) {
+    const firstIdx = DATA.frames[0].frame_idx;
+    const bg = getFrameImage(firstIdx, drawCalibCanvas);
+    if (bg) {
+      ctx.drawImage(bg, 0, 0, calibCanvas.width, calibCanvas.height);
+      ctx.fillStyle = 'rgba(9, 13, 26, 0.30)';
+      ctx.fillRect(0, 0, calibCanvas.width, calibCanvas.height);
+    }
+  }
+
   // Draw all foot points in image space as spatial reference
-  ctx.fillStyle = 'rgba(56, 189, 248, 0.28)';
+  ctx.fillStyle = 'rgba(56, 189, 248, 0.38)';
   for (const f of DATA.frames) {
     for (const tr of f.tracks) {
       ctx.fillRect(((tr.x1 + tr.x2) * 0.5) * sx - 1.5, tr.y2 * sy - 1.5, 3, 3);

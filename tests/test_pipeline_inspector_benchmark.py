@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import signal
 import threading
+import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pyarrow.parquet as pq
 import pytest
@@ -230,3 +232,89 @@ def test_cli_smoke_commands(tmp_path: Path, monkeypatch) -> None:
     res = runner.invoke(app, ["run", str(tmp_path / "missing.mp4")])
     assert res.exit_code == 2
     assert not (tmp_path / "runs" / "run-3").exists()
+
+
+def test_inspector_serves_source_frames_and_respects_anonymization(tmp_path: Path) -> None:
+    vid_path = generate_synthetic_crowd_video(tmp_path / "crowd.mp4", num_frames=6)
+
+    def _serve(run_dir: Path):
+        handler = make_inspector_handler(run_dir)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, server.server_address[1], handler
+
+    # 1. Normal --no-video run serves JPEG frames directly from the local source video.
+    run_plain = tmp_path / "plain"
+    TrackflowPipeline(model="synthetic", detector=_SyntheticMotionDetector()).run(
+        str(vid_path), output_dir=run_plain, save_video=False, exports=("jsonl",)
+    )
+    server, port, handler = _serve(run_plain)
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/run") as resp:
+            assert json.loads(resp.read().decode("utf-8"))["has_frames"] is True
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/frame/0") as resp:
+            assert resp.status == 200
+            assert resp.headers.get_content_type() == "image/jpeg"
+            assert resp.read()[:2] == b"\xff\xd8"
+        for bad in ("999", "not-an-int"):
+            with pytest.raises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/api/frame/{bad}")
+            assert exc.value.code == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        handler.frame_store.close()
+
+    # 2. Anonymized --no-video run must never leak raw source frames.
+    run_anon_novid = tmp_path / "anon_novid"
+    TrackflowPipeline(
+        model="synthetic", anonymize="face-blur", detector=_SyntheticMotionDetector()
+    ).run(str(vid_path), output_dir=run_anon_novid, save_video=False, exports=("jsonl",))
+    server, port, handler = _serve(run_anon_novid)
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/run") as resp:
+            assert json.loads(resp.read().decode("utf-8"))["has_frames"] is False
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/frame/0")
+        assert exc.value.code == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        handler.frame_store.close()
+
+    # 3. Anonymized run with annotated.mp4 serves frames from annotated.mp4 (not raw source).
+    run_anon_vid = tmp_path / "anon_vid"
+    TrackflowPipeline(
+        model="synthetic", anonymize="blur", detector=_SyntheticMotionDetector()
+    ).run(str(vid_path), output_dir=run_anon_vid, save_video=True, exports=("jsonl",))
+    vid_path.unlink()  # proves frames come from annotated.mp4, not the raw source
+    server, port, handler = _serve(run_anon_vid)
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/run") as resp:
+            assert json.loads(resp.read().decode("utf-8"))["has_frames"] is True
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/frame/0") as resp:
+            assert resp.status == 200 and resp.read()[:2] == b"\xff\xd8"
+    finally:
+        server.shutdown()
+        server.server_close()
+        handler.frame_store.close()
+
+    # 4. Image-folder source serves frames in natural order.
+    img_dir = tmp_path / "frames"
+    img_dir.mkdir()
+    for i in (1, 2, 10):
+        frame = np.full((120, 160, 3), i * 20, dtype=np.uint8)
+        cv2.imwrite(str(img_dir / f"frame_{i}.png"), frame)
+    run_dir_src = tmp_path / "dir_src"
+    TrackflowPipeline(model="synthetic", detector=_SyntheticMotionDetector()).run(
+        str(img_dir), output_dir=run_dir_src, save_video=False, exports=("jsonl",), fps=10.0
+    )
+    server, port, handler = _serve(run_dir_src)
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/frame/2") as resp:
+            assert resp.status == 200 and resp.read()[:2] == b"\xff\xd8"
+    finally:
+        server.shutdown()
+        server.server_close()
+        handler.frame_store.close()
