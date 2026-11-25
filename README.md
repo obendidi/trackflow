@@ -241,6 +241,11 @@ Use Trackflow from Claude Code, Codex, Antigravity, Cursor, or OpenCode by insta
 npx skills add obendidi/trackflow
 ```
 
+## Migration guides
+
+- [Migrating from Google Cloud Video Intelligence (`OBJECT_TRACKING`)](docs/migrate-google-video-intelligence.md)
+- [Migrating from AWS Rekognition (`StartPersonTracking` / People Pathing)](docs/migrate-aws-rekognition.md)
+
 ## Changelog
 
 What changed in each version is in [CHANGELOG.md](https://github.com/obendidi/trackflow/blob/main/CHANGELOG.md) and on the [releases page](https://github.com/obendidi/trackflow/releases).
