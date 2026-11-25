@@ -97,8 +97,9 @@ def run(
         str | None,
         typer.Option(
             "--vlm",
-            help="Vision-language model for --query and `trackflow search`: none, clip, siglip "
-            "(default: clip when --query is set, else none).",
+            help="Vision-language model for --query and `trackflow search`: none, clip, siglip, "
+            "embeddinggemma (needs the [transformers] extra) (default: clip when --query is set, "
+            "else none).",
         ),
     ] = None,
     reid_merge: Annotated[
@@ -118,9 +119,13 @@ def run(
         ),
     ] = None,
     query_threshold: Annotated[
-        float,
-        typer.Option("--query-threshold", help="Cosine similarity threshold for --query matches."),
-    ] = 0.22,
+        float | None,
+        typer.Option(
+            "--query-threshold",
+            help="Cosine similarity threshold for --query matches "
+            "(default: 0.71 for embeddinggemma, else 0.22).",
+        ),
+    ] = None,
     anonymize: Annotated[
         str,
         typer.Option(
@@ -508,7 +513,7 @@ def models(
 
     vlm_table = Table(title="Vision-Language Models (--vlm: --query scoring & `trackflow search`)")
     vlm_table.add_column("Backend", style="bold magenta")
-    vlm_table.add_column("INT8 Size", justify="right")
+    vlm_table.add_column("Download", justify="right")
     vlm_table.add_column("License", style="green")
     vlm_table.add_column("Hugging Face Repo", style="dim")
     for vspec in VLM_REGISTRY.values():

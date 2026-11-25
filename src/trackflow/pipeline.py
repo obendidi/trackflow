@@ -25,7 +25,15 @@ from trackflow.homography import FloorplanHomography
 from trackflow.lines import CountingLine, LineCounter
 from trackflow.models import Precision
 from trackflow.privacy import AnonymizeMode, PrivacyAnonymizer
-from trackflow.reid import ReidBackend, ReidEmbedder, TrackCardIndex, VlmBackend, VlmEmbedder
+from trackflow.reid import (
+    QUERY_THRESHOLDS,
+    ReidBackend,
+    ReidEmbedder,
+    TrackCardIndex,
+    VlmBackend,
+    VlmEmbedder,
+    create_vlm_embedder,
+)
 from trackflow.sinks import ObservationWriter, draw_tracks, write_run_report
 from trackflow.tracker import Tracker, create_tracker, iou_buffer_for_interval
 from trackflow.types import Detection, FrameResult, RunSummary
@@ -225,7 +233,7 @@ class TrackflowPipeline:
         vlm: VlmBackend | None = None,
         reid_merge: bool = False,
         query: str | None = None,
-        query_threshold: float = 0.22,
+        query_threshold: float | None = None,
         anonymize: AnonymizeMode = "none",
         homography: FloorplanHomography | str | Path | None = None,
         lines: Sequence[CountingLine] = (),
@@ -254,7 +262,6 @@ class TrackflowPipeline:
         self._allowed = _allowed_classes(classes)
         self.classes = sorted(self._allowed) if self._allowed is not None else ["all"]
         self.query = query.strip() if query else None
-        self.query_threshold = float(query_threshold)
         self.anonymize_mode: AnonymizeMode = anonymize
 
         if reid in ("clip", "siglip"):
@@ -274,9 +281,16 @@ class TrackflowPipeline:
 
         self.reid_backend: ReidBackend = reid_embedder.backend if reid_embedder else reid
         self.vlm_backend: VlmBackend = vlm_embedder.backend if vlm_embedder else vlm
+        self.query_threshold = float(
+            QUERY_THRESHOLDS.get(self.vlm_backend, 0.22)
+            if query_threshold is None
+            else query_threshold
+        )
         self.reid_merge = bool(reid_merge)
         if self.query and self.vlm_backend == "none":
-            raise ValueError("A text query needs a vision-language model. Choose clip or siglip.")
+            raise ValueError(
+                "A text query needs a vision-language model. Choose clip, siglip or embeddinggemma."
+            )
 
         detect_classes = self._allowed
         if detect_classes is not None and anonymize in ("blur", "pixelate", "face-blur"):
@@ -303,11 +317,7 @@ class TrackflowPipeline:
             else None
         )
         self.vlm_embedder = vlm_embedder or (
-            VlmEmbedder(
-                backend=self.vlm_backend,
-                device="cpu" if device == "mps" else device,
-                cache_dir=cache_dir,
-            )
+            create_vlm_embedder(self.vlm_backend, device=device, cache_dir=cache_dir)
             if self.vlm_backend != "none"
             else None
         )

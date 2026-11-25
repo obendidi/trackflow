@@ -4,7 +4,13 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+### Added
+
+- `--vlm embeddinggemma` scores `--query` and powers `trackflow search` with Google's EmbeddingGemma 2 (install `trackflow-python[transformers]`). On 4,000 human-labelled pedestrian crops it ranked people matching clothing and accessory queries above SigLIP on 33 of 34 queries, and runs at 6.3 FPS against SigLIP's 6.9 on a crowded street clip. Its `--query-threshold` defaults to 0.71 to match its score scale.
+
 ### Changed
+
+- The `transformers` extra now requires transformers 5.18 or later and installs sentence-transformers.
 
 - Runs with `--query` or `--vlm` embed each track when it first appears and then at ages 1, 2, 4, 8 seconds and so on, and average those crops, instead of embedding every track every 5 frames. Runs with them are 2.3 to 2.5 times faster on busy scenes (3.0 to 6.9 FPS on a crowded street with SigLIP on an Apple M4 Pro), with search results about the same. `TrackCardIndex` no longer takes `embed_every_n_frames`.
 
