@@ -53,3 +53,18 @@ def test_checkpoint_detects_people_in_source_coordinates(crowd_frame, model, pre
     expected = np.array([[640, 238, 684, 322], [499, 156, 531, 231], [251, 221, 284, 309]])
     iou = compute_iou_matrix(expected, np.array([p.bbox for p in people]))
     assert sum(iou.max(axis=1) > 0.4) >= 2
+
+
+def test_embeddinggemma_ranks_the_matching_crop_first():
+    pytest.importorskip("sentence_transformers")
+    from trackflow.reid import create_vlm_embedder
+
+    vlm = create_vlm_embedder("embeddinggemma", device="cpu")
+    red = np.zeros((160, 80, 3), np.uint8)
+    red[:] = (30, 30, 220)  # BGR
+    blue = red[:, :, ::-1].copy()
+    query = vlm.encode_text("a red picture")
+    red_emb, blue_emb = vlm.encode_image(red), vlm.encode_image(blue)
+    assert red_emb.shape == (768,)
+    assert abs(float(np.linalg.norm(red_emb)) - 1) < 1e-3
+    assert float(red_emb @ query) > float(blue_emb @ query)

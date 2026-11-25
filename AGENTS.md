@@ -12,7 +12,7 @@ Real-time people & object tracking toolkit (Python package `trackflow-python` + 
 
 ## Commands
 
-- **Setup**: `uv sync --extra dev` (add `--extra transformers` when working on `rfdetr-large` or `hf:` detectors)
+- **Setup**: `uv sync --extra dev` (add `--extra transformers` when working on `rfdetr-large`, `hf:` detectors or `--vlm embeddinggemma`)
 - **Lint**: `uv run ruff check src tests scripts`
 - **Test**: `uv run pytest` (requires Node.js on `PATH` for `tests/test_web_parity.py`)
 - **Weight smoke tests** (downloads HF weights): `TRACKFLOW_TEST_WEIGHTS=1 uv run pytest tests/test_model_weights.py`
@@ -24,7 +24,7 @@ Real-time people & object tracking toolkit (Python package `trackflow-python` + 
 
 - **Web playground parity**: `web/tracker.js` mirrors `ByteTracker`. Keep `tests/test_web_parity.py` passing whenever ByteTrack matching, thresholds, or track lifecycle rules change.
 - **Pinned weights & licenses**: Pin every preset in `src/trackflow/models.py` to an exact Hugging Face revision and list its weight license in `README.md` (the package is Apache-2.0, while some detector weights are AGPL-3.0 or non-commercial).
-- **Text search vs. identity**: Keep CLIP/SigLIP (`--vlm`) strictly for text-to-image queries (`--query` / `search`); use `--reid osnet` for appearance matching and `--reid-merge`.
+- **Text search vs. identity**: Keep the `--vlm` models (CLIP, SigLIP, EmbeddingGemma 2) strictly for text-to-image queries (`--query` / `search`); use `--reid osnet` for appearance matching and `--reid-merge`.
 - **Privacy & anonymization**: `src/trackflow/privacy.py` must mask every detected person box (including low-confidence detections and coasting tracks) and suppress writing person crops or thumbnails on anonymized runs.
 - **Releasing**: Bump `__version__` in both `pyproject.toml` and `src/trackflow/__init__.py`, move `Unreleased` entries in `CHANGELOG.md` under `## [X.Y.Z] - YYYY-MM-DD`, merge to `main`, then push annotated tag `vX.Y.Z`. `.github/workflows/publish.yml` validates via `scripts/release_notes.py` and publishes to PyPI + GitHub Releases.
 - **Legacy branch**: Keep `legacy-2017` and tag `v1.0-legacy-2017` (the original GPL-3.0 `Tracking-with-darkflow` codebase) untouched.

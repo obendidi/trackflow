@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from trackflow.reid import ReidEmbedder, TrackCardIndex, VlmEmbedder, search_track_cards
+from trackflow import reid
+from trackflow.reid import (
+    ReidEmbedder,
+    TrackCardIndex,
+    VlmEmbedder,
+    create_vlm_embedder,
+    search_track_cards,
+)
 from trackflow.types import Track
 
 RED = (10, 10, 230)  # BGR
@@ -93,6 +101,50 @@ def test_query_scoring_and_natural_language_search(tmp_path: Path) -> None:
     hits = search_track_cards(tmp_path, "person in blue coat", top_k=2, embedder=vlm)
     assert [h["track_id"] for h in hits] == [2, 1]
     assert hits[0]["search_score"] > hits[1]["search_score"]
+
+
+def test_search_loads_the_embedder_the_run_was_indexed_with(tmp_path: Path, monkeypatch) -> None:
+    vlm = _MockVlm()
+    idx = TrackCardIndex(vlm=vlm)
+    idx.update(
+        frame_idx=0,
+        timestamp_s=0.0,
+        frame_bgr=_frame((LEFT, RED), (RIGHT, BLUE)),
+        tracks=[_track(1, LEFT), _track(2, RIGHT)],
+    )
+    idx.save_json(tmp_path / "track_cards.json", vlm_backend="embeddinggemma")
+    loaded: list[str] = []
+
+    def fake_create(backend: str, **_: object) -> VlmEmbedder:
+        loaded.append(backend)
+        return vlm
+
+    monkeypatch.setattr(reid, "create_vlm_embedder", fake_create)
+    hits = search_track_cards(tmp_path, "person in red", top_k=1)
+    assert loaded == ["embeddinggemma"]
+    assert hits[0]["track_id"] == 1
+
+
+def test_query_threshold_defaults_to_the_models_score_scale() -> None:
+    from trackflow.pipeline import TrackflowPipeline
+
+    class _GemmaScaleVlm(_MockVlm):
+        def __init__(self) -> None:
+            super().__init__()
+            self.backend = "embeddinggemma"
+
+    def pipe(**kwargs: object) -> TrackflowPipeline:
+        return TrackflowPipeline(model="mock", detector=object(), query="person in red", **kwargs)
+
+    assert pipe(vlm_embedder=_MockVlm()).query_threshold == 0.22
+    assert pipe(vlm_embedder=_GemmaScaleVlm()).query_threshold == 0.71
+    assert pipe(vlm_embedder=_GemmaScaleVlm(), query_threshold=0.5).query_threshold == 0.5
+
+
+def test_embeddinggemma_explains_the_missing_extra(monkeypatch) -> None:
+    monkeypatch.setitem(sys.modules, "sentence_transformers", None)
+    with pytest.raises(ImportError, match=r"trackflow-python\[transformers\]"):
+        create_vlm_embedder("embeddinggemma")
 
 
 def test_track_is_embedded_when_first_seen_then_at_doubling_ages() -> None:

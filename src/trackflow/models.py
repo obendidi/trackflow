@@ -244,6 +244,17 @@ VLM_REGISTRY: dict[str, VlmModelSpec] = {
         description="SigLIP Base vision+text ONNX; stronger on clothing and attribute queries.",
         revision="4649052661e53c7000355844105f8a1792088239",
     ),
+    # PyTorch through sentence-transformers (the [transformers] extra), so no ONNX files.
+    "embeddinggemma": VlmModelSpec(
+        name="embeddinggemma",
+        repo_id="google/embeddinggemma-2",
+        license="Apache-2.0",
+        approx_size_mb=1489.0,
+        vision_files={},
+        text_files={},
+        description="EmbeddingGemma 2 text+image embeddings (PyTorch); best on attribute search.",
+        revision="f9972ac22e696a105c482202646979e33e4b5a1e",
+    ),
 }
 
 PRECISION_TO_FILENAME: dict[str, str] = {

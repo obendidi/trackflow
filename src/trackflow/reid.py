@@ -4,7 +4,8 @@ Two different kinds of embeddings live here and must not be mixed up:
 
 * :class:`ReidEmbedder` (``--reid osnet|color``) produces *identity* embeddings trained to tell
   people apart. Only these are used for BoT-SORT appearance matching and cross-exit merges.
-* :class:`VlmEmbedder` (``--vlm clip|siglip``) produces image/text-aligned embeddings. They are
+* :class:`VlmEmbedder` (``--vlm clip|siglip``) and :class:`EmbeddingGemmaEmbedder`
+  (``--vlm embeddinggemma``) produce image/text-aligned embeddings. They are
   great for "person in a red jacket" queries and post-run search, but they barely separate
   individuals (on vtest.avi, different people scored 0.83 cosine on average vs 0.86 for the same
   person), so they are never used to decide identity.
@@ -23,6 +24,7 @@ from tokenizers import Tokenizer
 from trackflow.detector import create_onnx_session
 from trackflow.models import (
     REID_REGISTRY,
+    VLM_REGISTRY,
     Precision,
     resolve_reid_model,
     resolve_vlm_artifacts,
@@ -30,7 +32,9 @@ from trackflow.models import (
 from trackflow.types import Track, TrackCard
 
 ReidBackend = Literal["none", "color", "osnet"]
-VlmBackend = Literal["none", "clip", "siglip"]
+VlmBackend = Literal["none", "clip", "siglip", "embeddinggemma"]
+# Default --query cut-off per model: text-image cosine scores sit on a different scale for each.
+QUERY_THRESHOLDS: dict[str, float] = {"clip": 0.22, "siglip": 0.22, "embeddinggemma": 0.71}
 
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -140,7 +144,9 @@ class VlmEmbedder:
         cache_dir: str | Path | None = None,
     ) -> None:
         if backend not in ("clip", "siglip"):
-            raise ValueError(f"Unknown VLM backend '{backend}'. Choose 'clip' or 'siglip'.")
+            raise ValueError(
+                f"Unknown VLM backend '{backend}'. Choose 'clip', 'siglip' or 'embeddinggemma'."
+            )
         self.backend: VlmBackend = backend
         self.precision = precision
         self._vision_sess = None
@@ -270,6 +276,90 @@ class VlmEmbedder:
     @staticmethod
     def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
         return cosine_similarity(a, b)
+
+
+class EmbeddingGemmaEmbedder(VlmEmbedder):
+    """EmbeddingGemma 2 image+text embeddings in PyTorch, for ``--vlm embeddinggemma``.
+
+    Needs ``trackflow-python[transformers]``. The audio encoder is not loaded, and each crop is
+    encoded with 70 vision tokens instead of the model's default 280: on person crops that is
+    about 5 times faster and at least as accurate. Weights load in bfloat16 on MPS and on CUDA
+    GPUs that support it, else in float32.
+    """
+
+    _VISION_TOKENS = 70
+
+    def __init__(self, *, device: str = "auto", cache_dir: str | Path | None = None) -> None:
+        try:
+            import torch
+            from PIL import Image
+            from sentence_transformers import SentenceTransformer
+        except ImportError as exc:
+            raise ImportError(
+                "Install 'trackflow-python[transformers]' to use --vlm embeddinggemma."
+            ) from exc
+        if device == "auto":
+            device = (
+                "cuda"
+                if torch.cuda.is_available()
+                else "mps"
+                if torch.backends.mps.is_available()
+                else "cpu"
+            )
+        elif device == "coreml":
+            device = "mps"
+        if device not in ("cpu", "cuda", "mps"):
+            raise ValueError(
+                "--vlm embeddinggemma supports --device auto, cpu, cuda, mps or coreml."
+            )
+        bf16 = device == "mps" or (device == "cuda" and torch.cuda.is_bf16_supported())
+        spec = VLM_REGISTRY["embeddinggemma"]
+        self.backend = "embeddinggemma"
+        self._image_cls = Image
+        self._text_cache = {}
+        self._model = SentenceTransformer(
+            spec.repo_id,
+            revision=spec.revision,
+            device=device,
+            cache_folder=str(cache_dir) if cache_dir is not None else None,
+            config_kwargs={"audio_config": None},
+            model_kwargs={"dtype": torch.bfloat16 if bf16 else torch.float32},
+        )
+        processor = self._model[0].processor
+        processor.image_processor.max_soft_tokens = self._VISION_TOKENS
+        processor.image_processor.image_seq_length = self._VISION_TOKENS
+        processor.image_seq_length = self._VISION_TOKENS
+
+    @property
+    def supports_text(self) -> bool:
+        return True
+
+    def encode_image(self, crop_bgr: np.ndarray | None) -> np.ndarray | None:
+        """Encode a BGR crop into an L2-normalized image embedding (text-aligned)."""
+        if crop_bgr is None or crop_bgr.size == 0:
+            return None
+        image = self._image_cls.fromarray(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB))
+        emb = self._model.encode([{"image": image}], show_progress_bar=False)
+        return _l2_normalize(emb[0])
+
+    def encode_text(self, query: str) -> np.ndarray:
+        """Encode a natural-language query with the model's search-query prompt."""
+        cleaned = query.strip()
+        if cleaned not in self._text_cache:
+            emb = self._model.encode([cleaned], prompt_name="SearchQuery", show_progress_bar=False)
+            self._text_cache[cleaned] = _l2_normalize(emb[0])
+        return self._text_cache[cleaned]
+
+
+def create_vlm_embedder(
+    backend: str, *, device: str = "auto", cache_dir: str | Path | None = None
+) -> VlmEmbedder:
+    """Load the ``--vlm`` embedder: CLIP and SigLIP in ONNX Runtime, EmbeddingGemma 2 in PyTorch."""
+    if backend == "embeddinggemma":
+        return EmbeddingGemmaEmbedder(device=device, cache_dir=cache_dir)
+    # ONNX Runtime has no MPS provider; CLIP and SigLIP fall back to the CPU there.
+    onnx_device = "cpu" if device == "mps" else device
+    return VlmEmbedder(backend, device=onnx_device, cache_dir=cache_dir)  # type: ignore[arg-type]
 
 
 class TrackCardIndex:
@@ -566,12 +656,13 @@ def search_track_cards(
     cards: list[dict[str, Any]] = payload.get("cards", [])
 
     if embedder is None:
-        if backend not in ("clip", "siglip"):
+        if backend not in ("clip", "siglip", "embeddinggemma"):
             raise ValueError(
                 "This run has no text-aligned embeddings. Re-run with `--vlm clip` (or "
-                "`--vlm siglip`, or any `--query`) to enable natural-language search."
+                "`--vlm siglip`, `--vlm embeddinggemma`, or any `--query`) to enable "
+                "natural-language search."
             )
-        embedder = VlmEmbedder(backend=backend)
+        embedder = create_vlm_embedder(backend)
 
     q_vec = embedder.encode_text(query)
     scored: list[dict[str, Any]] = []
