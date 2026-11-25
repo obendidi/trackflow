@@ -4,6 +4,13 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-25
+
+### Added
+
+- `trackflow inspect` renders the actual video or image-folder frames behind Track Debugger boxes/trails (with a `Video` toggle) and behind the 4-Point Floorplan calibration cloud via `GET /api/frame/<frame_idx>`. Anonymized runs never serve raw source frames and only read from `annotated.mp4` when present.
+- Migration guides for [Google Cloud Video Intelligence (`OBJECT_TRACKING`)](docs/migrate-google-video-intelligence.md) and [AWS Rekognition (`StartPersonTracking` / People Pathing)](docs/migrate-aws-rekognition.md), plus an animated `trackflow inspect` walkthrough in the README.
+
 ## [0.5.0] - 2026-11-25
 
 ### Added
@@ -140,7 +147,8 @@ First release of Trackflow, a rewrite of the 2017 Tracking-with-darkflow project
 
 - `trackflow run` crashes with an `AttributeError` from the progress bar. Use 0.1.1 or later.
 
-[Unreleased]: https://github.com/obendidi/trackflow/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/obendidi/trackflow/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/obendidi/trackflow/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/obendidi/trackflow/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/obendidi/trackflow/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/obendidi/trackflow/compare/v0.4.1...v0.4.2
