@@ -128,17 +128,25 @@ def test_search_loads_the_embedder_the_run_was_indexed_with(tmp_path: Path, monk
 def test_query_threshold_defaults_to_the_models_score_scale() -> None:
     from trackflow.pipeline import TrackflowPipeline
 
-    class _GemmaScaleVlm(_MockVlm):
-        def __init__(self) -> None:
-            super().__init__()
-            self.backend = "embeddinggemma"
+    def vlm(backend: str) -> _MockVlm:
+        embedder = _MockVlm()
+        embedder.backend = backend
+        return embedder
 
-    def pipe(**kwargs: object) -> TrackflowPipeline:
-        return TrackflowPipeline(model="mock", detector=object(), query="person in red", **kwargs)
+    def pipe(backend: str, **kwargs: object) -> float:
+        return TrackflowPipeline(
+            model="mock",
+            detector=object(),
+            query="person in red",
+            vlm_embedder=vlm(backend),
+            **kwargs,
+        ).query_threshold
 
-    assert pipe(vlm_embedder=_MockVlm()).query_threshold == 0.22
-    assert pipe(vlm_embedder=_GemmaScaleVlm()).query_threshold == 0.71
-    assert pipe(vlm_embedder=_GemmaScaleVlm(), query_threshold=0.5).query_threshold == 0.5
+    assert pipe("clip") == 0.27
+    assert pipe("siglip") == 0.08
+    assert pipe("embeddinggemma") == 0.71
+    assert pipe("embeddinggemma", query_threshold=0.5) == 0.5
+    assert TrackCardIndex(vlm=vlm("siglip"), query="red").query_threshold == 0.08
 
 
 def test_embeddinggemma_explains_the_missing_extra(monkeypatch) -> None:

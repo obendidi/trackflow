@@ -16,6 +16,8 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ### Fixed
 
+- `--query` with `--vlm siglip` flags matching tracks instead of none, and `--query` with CLIP, the default, no longer flags nearly every track. `--query-threshold` now defaults to 0.08 for SigLIP and 0.27 for CLIP instead of 0.22 for both, and `TrackCardIndex` uses the same per-model default.
+
 - Ctrl-C stops a run and still writes its track cards, events, summary and report, so a camera or stream run can be searched and inspected afterwards. Before, Ctrl-C kept only the track tables. A second Ctrl-C aborts.
 
 ## [0.4.3] - 2026-11-24
