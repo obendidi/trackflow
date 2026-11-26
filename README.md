@@ -237,9 +237,12 @@ for result in pipeline.stream(frames(), fps=25):
 
 To use your own model, pass any object with a `detect(frame_bgr) -> list[Detection]` method as `detector=`. A custom tracker goes in `tracker_factory=`, which takes any object with `update(detections, frame_bgr=None) -> list[Track]`. The built-in trackers are exported too (`ByteTracker`, `BotSortTracker`, `OcSortTracker`, `BoostTracker`), so you can tune one, for example `tracker_factory=lambda: BoostTracker(use_cmc=False)` for a fixed camera. The package ships type hints (`py.typed`), and `Detector` and `Tracker` are exported as protocols.
 
-## Agent skill
+## Agent skills
 
-Use Trackflow from Claude Code, Codex, Antigravity, Cursor, or OpenCode by installing the bundled [agent skill](skills/trackflow/SKILL.md):
+Use Trackflow — and its ONNX computer-vision deployment checklist — from Claude Code, Codex, Antigravity, Cursor, or OpenCode by installing the bundled skills:
+
+- [`trackflow`](skills/trackflow/SKILL.md): run local tracking, line counting, text search, floorplan projection, anonymization, and exports.
+- [`onnx-vision-deploy`](skills/onnx-vision-deploy/SKILL.md): empirical checklist for ONNX vision deployment across CPU, CUDA, Apple Silicon CoreML, and browser WebGPU/WASM parity.
 
 ```bash
 npx skills add obendidi/trackflow
