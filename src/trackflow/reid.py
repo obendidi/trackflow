@@ -32,9 +32,14 @@ from trackflow.models import (
 from trackflow.types import Track, TrackCard
 
 ReidBackend = Literal["none", "color", "osnet"]
-VlmBackend = Literal["none", "clip", "siglip", "embeddinggemma"]
+VlmBackend = Literal["none", "clip", "siglip", "siglip2", "embeddinggemma"]
 # Default --query cut-off per model: text-image cosine scores sit on a different scale for each.
-QUERY_THRESHOLDS: dict[str, float] = {"clip": 0.27, "siglip": 0.08, "embeddinggemma": 0.71}
+QUERY_THRESHOLDS: dict[str, float] = {
+    "clip": 0.27,
+    "siglip": 0.08,
+    "siglip2": 0.09,
+    "embeddinggemma": 0.71,
+}
 
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -146,9 +151,9 @@ class VlmEmbedder:
         device: str = "auto",
         cache_dir: str | Path | None = None,
     ) -> None:
-        if backend not in ("clip", "siglip"):
+        if backend not in ("clip", "siglip", "siglip2"):
             raise ValueError(
-                f"Unknown VLM backend '{backend}'. Choose 'clip', 'siglip' or 'embeddinggemma'."
+                f"Unknown VLM backend '{backend}'. Choose 'clip', 'siglip', 'siglip2' or 'embeddinggemma'."
             )
         self.backend: VlmBackend = backend
         self.precision = precision
@@ -247,12 +252,16 @@ class VlmEmbedder:
             return self._text_cache[cleaned]
         assert self._tokenizer is not None and self._text_sess is not None
         self._tokenizer.enable_truncation(max_length=self._max_length)
+        text = cleaned
         if self.backend == "siglip":
             self._tokenizer.enable_padding(length=self._max_length, pad_id=1)
+        elif self.backend == "siglip2":
+            self._tokenizer.enable_padding(length=self._max_length, pad_id=0)
+            text = cleaned.lower()
         else:
             self._tokenizer.no_padding()
 
-        enc = self._tokenizer.encode(cleaned)
+        enc = self._tokenizer.encode(text)
         input_ids = np.array([enc.ids], dtype=np.int64)
         attention_mask = np.array([enc.attention_mask], dtype=np.int64)
 
@@ -661,11 +670,11 @@ def search_track_cards(
     cards: list[dict[str, Any]] = payload.get("cards", [])
 
     if embedder is None:
-        if backend not in ("clip", "siglip", "embeddinggemma"):
+        if backend not in ("clip", "siglip", "siglip2", "embeddinggemma"):
             raise ValueError(
                 "This run has no text-aligned embeddings. Re-run with `--vlm clip` (or "
-                "`--vlm siglip`, `--vlm embeddinggemma`, or any `--query`) to enable "
-                "natural-language search."
+                "`--vlm siglip`, `--vlm siglip2`, `--vlm embeddinggemma`, or any `--query`) "
+                "to enable natural-language search."
             )
         embedder = create_vlm_embedder(backend)
 
@@ -683,3 +692,90 @@ def search_track_cards(
 
     scored.sort(key=lambda r: r["search_score"], reverse=True)
     return scored[:top_k]
+
+
+def export_search_prompts(
+    run_dir: str | Path,
+    query: str,
+    hits: list[dict[str, Any]],
+    output_path: str | Path,
+    *,
+    pad_s: float = 0.0,
+) -> Path:
+    """Export top search hits as a prompt manifest for downstream mask models (e.g., SAM 3) or VLMs.
+
+    Uses only metadata already recorded in ``summary.json`` and ``track_cards.json``, adding zero
+    external dependencies. Each hit includes pixel ``bbox_xyxy``, normalized ``[0, 1]``
+    ``sam3_box_xywh_norm`` and ``sam3_point_xy_norm`` at ``prompt_frame`` (the track's highest-
+    confidence observation), plus padded time/frame bounds for windowed video propagation.
+    """
+    run_path = Path(run_dir)
+    if run_path.is_file():
+        run_path = run_path.parent
+    summary_path = run_path / "summary.json"
+    if not summary_path.is_file():
+        raise FileNotFoundError(
+            f"Exporting prompts requires summary.json with video dimensions and FPS at {summary_path}."
+        )
+    summary: dict[str, Any] = json.loads(summary_path.read_text(encoding="utf-8"))
+    width = float(summary.get("frame_width") or 0.0)
+    height = float(summary.get("frame_height") or 0.0)
+    fps = float(summary.get("source_fps") or 0.0)
+    if width <= 0.0 or height <= 0.0 or fps <= 0.0:
+        raise ValueError(
+            f"{summary_path} must contain positive frame_width, frame_height, and source_fps."
+        )
+    total_frames = int(summary.get("total_frames") or 0)
+    pad_frames = int(round(max(0.0, pad_s) * fps))
+
+    prompts: list[dict[str, Any]] = []
+    for h in hits:
+        first_f = int(h["first_frame"])
+        last_f = int(h["last_frame"])
+        start_f = max(0, first_f - pad_frames)
+        end_f = min(total_frames - 1, last_f + pad_frames) if total_frames > 0 else last_f + pad_frames
+        rx1, ry1, rx2, ry2 = [float(v) for v in h["best_bbox"]]
+        # Clip Kalman/raw boxes strictly inside the frame so SAM 3 normalized coordinates stay in [0, 1].
+        x1 = float(np.clip(rx1, 0.0, width))
+        y1 = float(np.clip(ry1, 0.0, height))
+        x2 = float(np.clip(rx2, 0.0, width))
+        y2 = float(np.clip(ry2, 0.0, height))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        prompts.append(
+            {
+                "track_id": int(h["track_id"]),
+                "class_name": str(h["class_name"]),
+                "search_score": float(h["search_score"]),
+                "start_frame": start_f,
+                "end_frame": end_f,
+                "start_s": round(start_f / fps, 3),
+                "end_s": round(end_f / fps, 3),
+                "prompt_frame": int(h["best_frame"]),
+                "bbox_xyxy": [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
+                "sam3_box_xywh_norm": [
+                    round(x1 / width, 6),
+                    round(y1 / height, 6),
+                    round((x2 - x1) / width, 6),
+                    round((y2 - y1) / height, 6),
+                ],
+                "sam3_point_xy_norm": [
+                    round(0.5 * (x1 + x2) / width, 6),
+                    round(0.5 * (y1 + y2) / height, 6),
+                ],
+            }
+        )
+
+    manifest = {
+        "schema": "trackflow.prompts.v1",
+        "query": query,
+        "source": summary.get("source"),
+        "frame_width": int(width) if width > 0 else None,
+        "frame_height": int(height) if height > 0 else None,
+        "source_fps": fps if fps > 0 else None,
+        "prompts": prompts,
+    }
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return out

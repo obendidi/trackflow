@@ -33,7 +33,7 @@ from trackflow.inspector import serve_inspector
 from trackflow.lines import CountingLine
 from trackflow.models import MODEL_REGISTRY, REID_REGISTRY, VLM_REGISTRY
 from trackflow.pipeline import TrackflowPipeline, fresh_run_dir
-from trackflow.reid import search_track_cards
+from trackflow.reid import export_search_prompts, search_track_cards
 
 app = typer.Typer(
     name="trackflow",
@@ -98,8 +98,8 @@ def run(
         typer.Option(
             "--vlm",
             help="Vision-language model for --query and `trackflow search`: none, clip, siglip, "
-            "embeddinggemma (needs the [transformers] extra) (default: clip when --query is set, "
-            "else none).",
+            "siglip2, embeddinggemma (needs the [transformers] extra) (default: clip when --query "
+            "is set, else none).",
         ),
     ] = None,
     reid_merge: Annotated[
@@ -123,7 +123,7 @@ def run(
         typer.Option(
             "--query-threshold",
             help="Cosine similarity threshold for --query matches "
-            "(default: 0.27 for clip, 0.08 for siglip, 0.71 for embeddinggemma).",
+            "(default: 0.27 for clip, 0.08 for siglip, 0.09 for siglip2, 0.71 for embeddinggemma).",
         ),
     ] = None,
     anonymize: Annotated[
@@ -261,10 +261,27 @@ def search(
     min_score: Annotated[
         float, typer.Option("--min-score", help="Minimum cosine similarity score.")
     ] = -1.0,
+    export_prompts: Annotated[
+        Path | None,
+        typer.Option(
+            "--export-prompts",
+            help="Write top hits as a JSON prompt manifest (time windows + pixel/normalized boxes for SAM 3 or VLMs).",
+        ),
+    ] = None,
+    pad_s: Annotated[
+        float,
+        typer.Option(
+            "--pad-s",
+            min=0.0,
+            help="Seconds of context to pad before/after each hit window in --export-prompts.",
+        ),
+    ] = 0.0,
 ) -> None:
     """Search saved Track Cards in a completed run using natural language."""
     with _user_errors():
         hits = search_track_cards(run_dir, query, top_k=top_k, min_score=min_score)
+        if export_prompts is not None:
+            out_path = export_search_prompts(run_dir, query, hits, export_prompts, pad_s=pad_s)
     table = Table(title=f'Track Card Search: "{query}"')
     table.add_column("Track ID", style="bold cyan")
     table.add_column("Score", justify="right", style="bold green")
@@ -283,6 +300,8 @@ def search(
             str(h.get("thumbnail") or "-"),
         )
     console.print(table)
+    if export_prompts is not None:
+        console.print(f"[dim]Exported {len(hits)} prompt(s) to {out_path}[/]")
 
 
 @app.command()

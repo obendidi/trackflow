@@ -91,8 +91,11 @@ BoT-SORT, OC-SORT and BoostTrack++ share foreground-masked camera-motion compens
 trackflow run mall.mp4 --query "person in red jacket with a backpack"
 
 # Search a completed run later without re-running detection
-# (requires a run created with --query or --vlm clip|siglip|embeddinggemma)
+# (requires a run created with --query or --vlm clip|siglip|siglip2|embeddinggemma)
 trackflow search runs/run-1 "person carrying a suitcase"
+
+# Export top search hits as time windows + normalized boxes for SAM 3 or a VLM
+trackflow search runs/run-1 "person in red jacket" --top-k 5 --pad-s 1.0 --export-prompts prompts.json
 
 # Give people who leave and come back their earlier ID (opt-in, uses person Re-ID)
 trackflow run mall.mp4 --reid osnet --reid-merge
@@ -162,6 +165,8 @@ Weights download automatically from Hugging Face on first use. `trackflow models
 | `rfdetr-base` | RF-DETR Base (560×560) | ~108 MB | Apache-2.0 | |
 | `rfdetr-large` | RF-DETR Large (704×704) | ~136 MB | Apache-2.0 | Most accurate preset; needs the `transformers` extra |
 | `dfine-n` | D-FINE Nano (640×640) | ~15 MB | Apache-2.0 | Small download |
+| `dfine-s` | D-FINE Small (640×640) | ~42 MB | Apache-2.0 | Compact COCO-only ONNX |
+| `dfine-m` | D-FINE Medium (640×640) | ~79 MB | Apache-2.0 | Highest Apache-2.0 ONNX MOT17 HOTA |
 | `yolo26n` … `yolo26x` | YOLO26 Nano to XLarge (640×640) | 10–223 MB | **AGPL-3.0** | Commercial use needs an Ultralytics license |
 | `deimv2-atto` | DEIMv2 Atto (320×320) | ~2 MB | **Non-commercial** | Tiny edge model, FP32 only |
 | `deimv2-s` | DEIMv2 Small, DINOv3 backbone (640×640) | ~41 MB | **Non-commercial** + DINOv3 | FP32 only |
@@ -170,9 +175,10 @@ Most presets also have `--precision fp16` and `int8` variants. Trackflow itself 
 
 | Preset | HOTA | IDF1 | MOTA |
 | :--- | ---: | ---: | ---: |
-| `rtdetr-v2-r18` *(default)* | 45.1 | 54.0 | 40.1 |
+| `dfine-m` | 46.5 | 55.1 | 39.2 |
+| `rtdetr-v2-r18` *(default)* | 45.1 | 53.9 | 39.8 |
 | `rfdetr-large` | 44.3 | 51.1 | 35.9 |
-| `rfdetr-medium` | 41.2 | 46.4 | 32.7 |
+| `rfdetr-medium` | 42.9 | 49.7 | 34.8 |
 | `yolo26n` | 37.4 | 41.4 | 27.9 |
 | `rfdetr-nano` | 36.5 | 40.5 | 28.2 |
 
@@ -193,6 +199,7 @@ Re-ID and text-search models:
 | `--reid osnet` | OSNet-AIN x1.0 person Re-ID | ~9 MB | MIT code; weights trained on MSMT17 (check dataset terms for commercial use) | BoT-SORT and BoostTrack appearance, and `--reid-merge` |
 | `--vlm clip` | CLIP ViT-B/32 (INT8) | ~153 MB | MIT | Default for `--query` and `search` |
 | `--vlm siglip` | SigLIP Base (INT8) | ~205 MB | Apache-2.0 | Better on fine clothing/attribute queries |
+| `--vlm siglip2` | SigLIP 2 Base (INT8) | ~378 MB | Apache-2.0 | Strongest pure-ONNX search (no PyTorch) |
 | `--vlm embeddinggemma` | EmbeddingGemma 2 (PyTorch, needs `[transformers]`) | ~1.5 GB | Apache-2.0 | Best on clothing and accessory queries |
 
 ## Python API
@@ -247,10 +254,11 @@ Use Trackflow — and its ONNX computer-vision deployment checklist — from Cla
 npx skills add obendidi/trackflow
 ```
 
-## Migration guides
+## Migration & integration guides
 
 - [Migrating from Google Cloud Video Intelligence (`OBJECT_TRACKING`)](docs/migrate-google-video-intelligence.md)
 - [Migrating from AWS Rekognition (`StartPersonTracking` / People Pathing)](docs/migrate-aws-rekognition.md)
+- [Using Trackflow alongside SAM 3 (track & filter locally, segment selectively)](docs/sam3-handoff.md)
 
 ## Changelog
 

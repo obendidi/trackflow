@@ -26,7 +26,7 @@ class ModelSpec:
     revision: str | None = None
     backend: Literal["onnx", "transformers"] = "onnx"
     onnx_file: str | None = None  # standalone FP32 graph with embedded post-processing
-    normalize: bool = False  # preprocessing for standalone graphs without a sidecar
+    normalize: bool = False  # force ImageNet normalization when sidecar omits or disables it
     # CoreML graph format for --device coreml. MLProgram covers more operators and gives the same
     # boxes as the CPU; NeuralNetwork is for graphs that MLProgram can't compile or crashes on.
     coreml_format: Literal["MLProgram", "NeuralNetwork"] = "MLProgram"
@@ -65,6 +65,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         default_input_size=(384, 384),
         description="384x384 DINOv2 detection transformer; fast on Apple Silicon and WebGPU.",
         revision="eae21cee0687a91bcf9fa071605c48d7705d2d91",
+        normalize=True,  # onnx-community sidecar sets do_normalize=False, but RF-DETR expects ImageNet norm
     ),
     "dfine-n": ModelSpec(
         name="dfine-n",
@@ -75,6 +76,26 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         default_input_size=(640, 640),
         description="Compact 15 MB end-to-end transformer detector.",
         revision="380d2839c327efaf65dd0fe0c2c10ab7fadd5473",
+    ),
+    "dfine-s": ModelSpec(
+        name="dfine-s",
+        repo_id="onnx-community/dfine_s_coco-ONNX",
+        architecture="D-FINE Small",
+        license="Apache-2.0",
+        approx_size_mb=41.5,
+        default_input_size=(640, 640),
+        description="42 MB COCO-only D-FINE transformer detector (Apache-2.0).",
+        revision="a3cf03147a9b86c78475139115c8ac142577352d",
+    ),
+    "dfine-m": ModelSpec(
+        name="dfine-m",
+        repo_id="onnx-community/dfine_m_coco-ONNX",
+        architecture="D-FINE Medium",
+        license="Apache-2.0",
+        approx_size_mb=78.6,
+        default_input_size=(640, 640),
+        description="79 MB COCO-only D-FINE detector; higher MOT recall than rtdetr-v2-r18.",
+        revision="489756db2825cb068a588fe930af239a656d1fe1",
     ),
     "rtdetr-v2-r18": ModelSpec(
         name="rtdetr-v2-r18",
@@ -95,6 +116,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         default_input_size=(560, 560),
         description="Higher-accuracy 560x560 detection transformer.",
         revision="7b18fa82ba7b1d6bc9446518cf2cc1d991097a3f",
+        normalize=True,
         coreml_format="NeuralNetwork",  # MLProgram aborts the process in Metal's graph compiler
     ),
     "rfdetr-small": ModelSpec(
@@ -106,6 +128,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         (512, 512),
         "512px COCO detector.",
         "63463b68b200177d1fea7015f11f3cebb0ba4eeb",
+        normalize=True,
     ),
     "rfdetr-medium": ModelSpec(
         "rfdetr-medium",
@@ -116,6 +139,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         (576, 576),
         "576px COCO detector.",
         "8553cefdd984bbaeb9d9ca8743d6a6a1c3e29dce",
+        normalize=True,
     ),
     "rfdetr-large": ModelSpec(
         "rfdetr-large",
@@ -243,6 +267,24 @@ VLM_REGISTRY: dict[str, VlmModelSpec] = {
         },
         description="SigLIP Base vision+text ONNX; stronger on clothing and attribute queries.",
         revision="4649052661e53c7000355844105f8a1792088239",
+    ),
+    "siglip2": VlmModelSpec(
+        name="siglip2",
+        repo_id="onnx-community/siglip2-base-patch16-224-ONNX",
+        license="Apache-2.0",
+        approx_size_mb=378.0,
+        vision_files={
+            "int8": "onnx/vision_model_int8.onnx",
+            "fp16": "onnx/vision_model_fp16.onnx",
+            "fp32": "onnx/vision_model.onnx",
+        },
+        text_files={
+            "int8": "onnx/text_model_int8.onnx",
+            "fp16": "onnx/text_model_fp16.onnx",
+            "fp32": "onnx/text_model.onnx",
+        },
+        description="SigLIP 2 Base vision+text ONNX; strongest pure-ONNX preset (no PyTorch).",
+        revision="ba1f3b0843f24bc5417d38e19c37b287d719b2f4",
     ),
     # PyTorch through sentence-transformers (the [transformers] extra), so no ONNX files.
     "embeddinggemma": VlmModelSpec(

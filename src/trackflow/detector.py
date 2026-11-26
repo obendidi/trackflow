@@ -372,6 +372,8 @@ class OnnxDetrDetector:
         self.input_hw, self.do_rescale, self.do_normalize, self.mean, self.std = (
             self._load_preprocess_config(prep_path)
         )
+        if spec and spec.normalize:
+            self.do_normalize = True
 
         # CoreML EP on int8 quantized DETR graphs can occasionally fail or degrade; prefer CPU for int8.
         effective_device = "cpu" if (device == "auto" and precision == "int8") else device
@@ -403,8 +405,6 @@ class OnnxDetrDetector:
         }
         if self.deployed:
             self.input_name = "images"
-            if spec and spec.normalize:
-                self.do_normalize = True
         elif len(inputs) == 1 and {"logits", "pred_boxes"}.issubset(self.output_names):
             self.raw_outputs = ["logits", "pred_boxes"]
         elif len(inputs) == 1 and len(self.output_names) == 2:
