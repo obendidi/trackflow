@@ -70,19 +70,32 @@ GROUP BY track_id ORDER BY frames DESC;
 
 All four keep a person and a bag in the same box as separate tracks, and only give out an ID once a track has been seen on more than one frame. OC-SORT and BoostTrack report a track again after a miss once it has matched three frames in a row; in between, the annotated video shows it as a coasting box. The browser playground uses ByteTrack.
 
-Scores on MOT17, over the second half of each of its 7 training sequences (2,652 frames, the `val` split of Roboflow's [MOT17 download](https://trackers.roboflow.com/develop/evaluations/download/)), with the default detector on CPU:
+#### Benchmarks across 4 official datasets (81 videos, ~59,800 frames)
 
-| Tracker | HOTA | IDF1 | MOTA | ID switches |
-| :--- | ---: | ---: | ---: | ---: |
-| `bytetrack` | 45.1 | 53.9 | 39.8 | 284 |
-| `botsort` | 46.5 | 55.8 | 41.1 | 167 |
-| `ocsort` | 46.3 | 55.8 | 41.9 | 129 |
-| `boosttrack` | 46.9 | 56.4 | 42.0 | 136 |
-| `botsort --reid osnet` | 46.9 | 56.2 | 41.1 | 179 |
+![Trackflow vs. Roboflow trackers speed and quality Pareto frontier and per-benchmark academic SOTA context](https://raw.githubusercontent.com/obendidi/trackflow/main/docs/benchmarks-trackers.png)
 
-BoT-SORT, OC-SORT and BoostTrack++ share foreground-masked camera-motion compensation and lift MOT17 HOTA by +1.2 to +1.8 over ByteTrack while cutting ID switches roughly in half (129–179 vs 284). On faster non-linear motion and panning cameras (DanceTrack and SportsMOT), OC-SORT and BoostTrack++ improve HOTA by +3.4 to +7.7 over baseline without Re-ID. The detector still sets the upper bound (see [Models](#models)): published MOT17 results of 60 HOTA and above use detectors trained on MOT17, while these presets are trained on COCO only.
+Every tracker below receives the exact same detections from Trackflow's default Apache-2.0 detector (`rtdetr-v2-r18`, confidence threshold `0.45`, Apple M4 Pro) so the comparison isolates the tracking algorithm.
 
-[`scripts/eval_mot17.py`](https://github.com/obendidi/trackflow/blob/main/scripts/eval_mot17.py) reproduces these scores. It runs each sequence as `trackflow run <sequence>/img1 --fps <frame rate> --device cpu --no-video --export mot` would, then scores all 7 sequences together with Roboflow's `trackers eval`, which gives the same numbers as TrackEval. Scenes differ a lot (ByteTrack ranges from 33.8 HOTA on MOT17-02 to 49.3 on MOT17-09), so compare trackers on footage like yours with `trackflow compare` or `--export mot`.
+| Tracker | DanceTrack (25) | SportsMOT (45) | MOT17 (7) | MOT20 (4) | Mean HOTA | Total ID switches | Tracker FPS | End-to-End FPS |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **`botsort --reid osnet`** | **39.0** | 45.0 | **46.9** | **24.4** | **38.8** | 6,435 | 205 | 5.5 |
+| **`ocsort`** *(no Re-ID)* | 37.9 | **46.0** | 46.3 | 23.3 | **38.4** | **5,501** | 203 | 9.2 |
+| **`boosttrack`** *(no Re-ID)* | 37.5 | 44.4 | **46.9** | 24.0 | **38.2** | 5,549 | 201 | 9.2 |
+| **`botsort`** *(no Re-ID)* | 36.7 | 44.3 | 46.5 | 24.3 | **37.9** | 6,475 | 221 | 9.3 |
+| `bytetrack` *(also in browser)* | 33.1 | 39.8 | 45.1 | 23.5 | 35.4 | 7,038 | **2,900** | **9.7** |
+| *Roboflow `cbiou` (`0.45/0.50`)* | 36.0 | 43.4 | 46.4 | 24.2 | 37.5 | 7,533 | 2,072 | 9.6 |
+| *Roboflow `botsort` (`0.45/0.50`)* | 35.9 | 43.6 | 46.3 | 24.0 | 37.4 | 6,922 | 194 | 9.2 |
+| *Roboflow `ocsort+cmc` (`0.45`)* | 33.4 | 43.8 | 44.2 | 15.9 | 34.3 | 8,057 | 196 | 9.2 |
+| *Roboflow `botsort` (defaults `0.60/0.70`)* | 39.6 | 50.0 | 42.6 | 13.6 | 36.4 | 4,349 | 207 | 9.2 |
+
+**How to read this chart and table:**
+- **HOTA (0–100, higher is better)**: Overall tracking accuracy. It combines two halves equally: finding the right people in each frame and keeping the same ID on each person as they move and cross paths.
+- **ID switches (lower is better)**: How many times a tracker accidentally swaps or resets a person's ID mid-video.
+- **Tracker FPS vs. End-to-End FPS**: Tracker FPS is the matching step alone; End-to-End FPS includes running the object detector (and person Re-ID crops when enabled) on every frame on a laptop.
+- **The 4 benchmarks**: **DanceTrack** (25 videos of dancers wearing identical outfits—tests motion tracking when appearance doesn't help), **SportsMOT** (45 fast-moving basketball, football, and volleyball clips with panning cameras), **MOT17** (7 busy street scenes), and **MOT20** (4 dense pedestrian crowds, second halves).
+- **Why academic SOTA is higher (~66–77 HOTA)**: Leaderboard papers train a specialist detector (usually YOLOX-X) directly on each benchmark—so it learns, for example, to ignore spectators in SportsMOT stands—and often fill gaps offline after the video ends. Trackflow runs one off-the-shelf, general-purpose Apache-2.0 COCO detector live, frame by frame. On SportsMOT, Roboflow's high default threshold (`0.60/0.70`) similarly filters out blurry spectators (`50.0` HOTA), at the cost of dropping occluded pedestrians on MOT17 (`42.6`) and MOT20 (`13.6`). Pass `--threshold 0.6` in Trackflow on sports broadcasts if you want the same crowd filtering.
+
+[`scripts/eval_benchmarks.py`](https://github.com/obendidi/trackflow/blob/main/scripts/eval_benchmarks.py) reproduces all four datasets and the Roboflow `trackers==2.7.0` controls (scored with `trackers eval`, which matches TrackEval). Scenes vary widely, so test on footage like yours with `trackflow compare` or `--export mot`.
 
 ### Text search and re-identification
 
@@ -101,9 +114,15 @@ trackflow search runs/run-1 "person in red jacket" --top-k 5 --pad-s 1.0 --expor
 trackflow run mall.mp4 --reid osnet --reid-merge
 ```
 
-`--vlm embeddinggemma` runs Google's EmbeddingGemma 2 in PyTorch and needs `pip install "trackflow-python[transformers]"`. On two human-labelled pedestrian attribute sets (PETA and PA-100K, 2,000 people each), it ranked matching people above SigLIP on 33 of 34 clothing and accessory queries (mean average precision 0.42 vs 0.28). It is a little slower: 6.3 FPS against SigLIP's 6.9 on a crowded street clip on an Apple M4 Pro.
+![Natural-language track search quality vs. speed across 23,287 labeled pedestrian crops](https://raw.githubusercontent.com/obendidi/trackflow/main/docs/benchmarks-search.png)
 
-CLIP, SigLIP and EmbeddingGemma 2 match images to *text*; they cannot reliably distinguish two people in similar clothes, so they are never used for identity. `--reid osnet` runs a dedicated person re-identification model. Re-entry merging only considers people who left before the new track appeared and stayed gone longer than the tracker's own recovery window, and merges only when one earlier person is clearly the best match; look-alikes stay separate. It can still make mistakes on low-resolution footage, which is why it is off by default.
+Tested across all **23,287 labeled pedestrian crops** in the PA-100K (10,000 crops, 18 clothing/accessory queries) and UPAR (13,287 crops, 20 color/attribute queries) validation sets, measured with **mAP** (Mean Average Precision, 0–1: how accurately matching people rank at the top of search results) via [`scripts/eval_text_search.py`](https://github.com/obendidi/trackflow/blob/main/scripts/eval_text_search.py):
+
+- **`--vlm embeddinggemma`** *(PyTorch, needs `pip install "trackflow-python[transformers]"`)*: highest accuracy (**0.507** PA-100K / **0.561** UPAR mAP, ~10 crops/s on M4 Pro MPS).
+- **`--vlm siglip2`** *(pure ONNX INT8, zero PyTorch)*: best lightweight choice (**0.442** PA-100K / **0.488** UPAR mAP at ~45 crops/s on CPU—both faster and more accurate than SigLIP 1 at `0.420 / 0.459` and ~28 crops/s).
+- **`--vlm clip`** *(default, pure ONNX INT8)*: fastest option (**146 crops/s** on CPU, `0.288 / 0.357` mAP).
+
+CLIP, SigLIP, SigLIP 2 and EmbeddingGemma 2 match images to *text*; they cannot reliably distinguish two people in similar clothes, so they are never used for identity. `--reid osnet` runs a dedicated person re-identification model. Re-entry merging only considers people who left before the new track appeared and stayed gone longer than the tracker's own recovery window, and merges only when one earlier person is clearly the best match; look-alikes stay separate. It can still make mistakes on low-resolution footage, which is why it is off by default.
 
 ### Inspector, tracker comparison, and floorplan projection
 
@@ -182,7 +201,7 @@ Most presets also have `--precision fp16` and `int8` variants. Trackflow itself 
 | `yolo26n` | 37.4 | 41.4 | 27.9 |
 | `rfdetr-nano` | 36.5 | 40.5 | 28.2 |
 
-The default scores highest here even though RF-DETR scores higher on COCO, so test on footage like yours before you switch.
+`dfine-m` scores highest here (`46.5` HOTA with ByteTrack, `46.9` with BoT-SORT) while `rtdetr-v2-r18` remains the faster default (`10.0` vs `7.3` FPS on M4 Pro CoreML). Test on footage like yours before switching.
 
 You aren't limited to presets. `-m` also takes any compatible ONNX repo on Hugging Face (`owner/repo`), a local `.onnx` file, or, with the extra installed, any Transformers object-detection checkpoint as `hf:owner/repo`:
 
