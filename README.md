@@ -74,14 +74,13 @@ Scores on MOT17, over the second half of each of its 7 training sequences (2,652
 
 | Tracker | HOTA | IDF1 | MOTA | ID switches |
 | :--- | ---: | ---: | ---: | ---: |
-| `bytetrack` | 45.1 | 54.0 | 40.1 | 281 |
-| `botsort` | 45.7 | 55.0 | 40.2 | 193 |
-| `ocsort` | 44.7 | 53.6 | 39.3 | 244 |
-| `boosttrack` | 45.3 | 54.2 | 40.2 | 240 |
-| `botsort --reid osnet` | 46.1 | 55.7 | 40.5 | 170 |
-| `boosttrack --reid osnet` | 45.9 | 55.6 | 40.2 | 240 |
+| `bytetrack` | 45.1 | 53.9 | 39.8 | 284 |
+| `botsort` | 46.5 | 55.8 | 41.1 | 167 |
+| `ocsort` | 46.3 | 55.8 | 41.9 | 129 |
+| `boosttrack` | 46.9 | 56.4 | 42.0 | 136 |
+| `botsort --reid osnet` | 46.9 | 56.2 | 41.1 | 179 |
 
-The four trackers are within 1.4 HOTA of each other. BoT-SORT with `--reid osnet` scores highest and has the fewest ID switches. BoostTrack with `--reid osnet` comes close but is slower, because it embeds every person detection, including weak ones it might boost. The detector matters more than the tracker (see [Models](#models)). Published MOT17 results of 60 HOTA and above use detectors trained on MOT17, while these presets are trained on COCO only.
+BoT-SORT, OC-SORT and BoostTrack++ share foreground-masked camera-motion compensation and lift MOT17 HOTA by +1.2 to +1.8 over ByteTrack while cutting ID switches roughly in half (129–179 vs 284). On faster non-linear motion and panning cameras (DanceTrack and SportsMOT), OC-SORT and BoostTrack++ improve HOTA by +3.4 to +7.7 over baseline without Re-ID. The detector still sets the upper bound (see [Models](#models)): published MOT17 results of 60 HOTA and above use detectors trained on MOT17, while these presets are trained on COCO only.
 
 [`scripts/eval_mot17.py`](https://github.com/obendidi/trackflow/blob/main/scripts/eval_mot17.py) reproduces these scores. It runs each sequence as `trackflow run <sequence>/img1 --fps <frame rate> --device cpu --no-video --export mot` would, then scores all 7 sequences together with Roboflow's `trackers eval`, which gives the same numbers as TrackEval. Scenes differ a lot (ByteTrack ranges from 33.8 HOTA on MOT17-02 to 49.3 on MOT17-09), so compare trackers on footage like yours with `trackflow compare` or `--export mot`.
 

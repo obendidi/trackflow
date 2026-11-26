@@ -147,3 +147,98 @@ def test_botsort_cmc_reference_frame_never_goes_stale() -> None:
     frame[30:200:20, 30:280:20] = 255
     tracker.update([], frame_bgr=frame)  # no tracks yet, CMC must still see this frame
     assert tracker._cmc is not None and tracker._cmc._prev_gray is not None
+
+
+def test_cmc_masks_foreground_motion_and_tracks_camera_pan() -> None:
+    from trackflow.tracker import SparseOpticalFlowCMC
+
+    rng = np.random.default_rng(0)
+    bg = rng.integers(0, 255, size=(240, 320, 3), dtype=np.uint8)
+    # Static textured background + large bright foreground rectangle moving right by 20px.
+    f0 = bg.copy()
+    f0[60:200, 80:180] = rng.integers(0, 255, size=(140, 100, 3), dtype=np.uint8)
+    f1 = bg.copy()
+    f1[60:200, 100:200] = f0[60:200, 80:180]
+
+    cmc = SparseOpticalFlowCMC(downscale=2)
+    assert cmc.estimate(f0, exclude_boxes=np.array([[80.0, 60.0, 180.0, 200.0]])) is None
+    warp = cmc.estimate(f1, exclude_boxes=np.array([[100.0, 60.0, 200.0, 200.0]]))
+    # Background did not move, so masked CMC must report ~zero translation (not +20px foreground drift).
+    assert warp is not None
+    assert abs(float(warp[0, 2])) < 1.5 and abs(float(warp[1, 2])) < 1.5
+
+
+def test_hmiou_prefers_matching_height_band() -> None:
+    from trackflow.tracker import compute_hmiou_matrix
+
+    a = np.array([[0.0, 100.0, 40.0, 200.0]])
+    same_y = np.array([[10.0, 100.0, 50.0, 200.0]])
+    shifted_y = np.array([[0.0, 125.0, 40.0, 225.0]])
+    # Both have identical 0.60 plain IoU, but shifted_y has lower vertical overlap.
+    assert float(compute_hmiou_matrix(a, same_y)[0, 0]) > float(
+        compute_hmiou_matrix(a, shifted_y)[0, 0]
+    )
+
+
+def test_cmc_handles_frame_resize_and_full_foreground_occlusion() -> None:
+    from trackflow.tracker import SparseOpticalFlowCMC
+
+    rng = np.random.default_rng(1)
+    small = rng.integers(0, 255, size=(128, 128, 3), dtype=np.uint8)
+    large = rng.integers(0, 255, size=(192, 192, 3), dtype=np.uint8)
+    cmc = SparseOpticalFlowCMC(downscale=2)
+    assert cmc.estimate(small) is None
+    # Frame size change must reset reference instead of raising an OpenCV assertion.
+    assert cmc.estimate(large) is None
+    # Full-frame foreground box leaves zero eligible background pixels -> must return None.
+    assert cmc.estimate(large, exclude_boxes=np.array([[0.0, 0.0, 192.0, 192.0]])) is None
+
+
+def test_xywh_kalman_confidence_one_and_botsort_lost_width_velocity() -> None:
+    from trackflow.tracker import XywhKalmanFilter
+
+    kf = XywhKalmanFilter((10.0, 20.0, 50.0, 120.0), min_nsa=0.0)
+    # Consecutive confidence=1.0 updates must not create a singular innovation matrix.
+    for _ in range(3):
+        kf.predict()
+        kf.update((12.0, 20.0, 52.0, 120.0), confidence=1.0)
+    assert np.isfinite(kf.mean).all()
+
+    tr = BotSortTracker(use_cmc=False, track_high_thresh=0.5, new_track_thresh=0.55)
+    tr.update([_det(10, 20, 50, 120, 0.9)])
+    tr.update([_det(10, 20, 70, 120, 0.9)])  # growing width
+    for _ in range(7):  # lost past brief-occlusion window: width velocity must be zeroed
+        tr.update([])
+    assert tr._tracks[0].kf.mean[6] == 0.0
+
+
+def test_create_tracker_forwards_new_track_thresh_to_all_trackers() -> None:
+    from trackflow.tracker import create_tracker
+
+    for name in ("bytetrack", "botsort", "ocsort", "boosttrack"):
+        tr = create_tracker(name, track_high_thresh=0.5, new_track_thresh=0.95)
+        assert tr.update([_det(10, 20, 60, 140, 0.60)]) == []
+
+
+def test_boosttrack_duplicate_removal_preserves_matched_confirmed_track() -> None:
+    from trackflow.boosttrack import BoostTracker
+
+    def emb_det(x1: float, emb: list[float]) -> Detection:
+        return Detection(
+            bbox=(x1, 20.0, x1 + 50.0, 140.0),
+            confidence=0.9,
+            class_id=0,
+            class_name="person",
+            embedding=np.array(emb, dtype=np.float32),
+        )
+
+    tr = BoostTracker(det_thresh=0.5, new_track_thresh=0.55, use_cmc=False, min_hits=1)
+    # Track 1 spawns earlier (older age) at x=10; track 2 spawns later at x=80 and confirms.
+    assert [t.track_id for t in tr.update([emb_det(10, [1.0, 0.0])])] == [1]
+    tr.update([emb_det(10, [1.0, 0.0]), emb_det(80, [0.0, 1.0])])
+    out = tr.update([emb_det(10, [1.0, 0.0]), emb_det(70, [0.0, 1.0])])
+    assert [t.track_id for t in out] == [1, 2]
+    # Track 1 goes lost at x=10 while confirmed track 2 (distinct appearance) moves onto x=10.
+    for x in (50, 30, 11):
+        out = tr.update([emb_det(x, [0.0, 1.0])])
+        assert [t.track_id for t in out] == [2]

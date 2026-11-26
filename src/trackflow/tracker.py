@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from typing import Any, Protocol
 
 import cv2
@@ -215,50 +216,114 @@ class _TrackState:
 
 
 class SparseOpticalFlowCMC:
-    """Fast sparse optical-flow Camera Motion Compensation (BoT-SORT style)."""
+    """Sparse optical-flow camera motion estimate from background corners (BoT-SORT style).
 
-    def __init__(self, downscale: int = 2) -> None:
-        self.downscale = max(1, downscale)
+    Corners are only taken from the background: ``exclude_boxes`` (the objects being tracked) and
+    a thin frame border are masked out, so a crowd moving together can't pass for camera motion.
+    The estimate falls back to "no camera motion" (``None``) when too few background corners
+    survive, when RANSAC keeps too small a share of them, or when the warp is implausible for one
+    frame step. ``drop_foreground_flow`` also discards corners whose flow lands inside this
+    frame's ``exclude_boxes``.
+    """
+
+    def __init__(self, downscale: int = 2, *, drop_foreground_flow: bool = True) -> None:
+        self.downscale = max(1, int(downscale))
+        self.drop_foreground_flow = drop_foreground_flow
         self._prev_gray: np.ndarray | None = None
         self._prev_pts: np.ndarray | None = None
 
-    def estimate(self, frame_bgr: np.ndarray | None) -> np.ndarray | None:
+    def _background_mask(self, gray: np.ndarray, boxes: np.ndarray) -> np.ndarray:
+        h, w = gray.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        bh, bw = max(1, int(0.02 * h)), max(1, int(0.02 * w))
+        mask[bh : h - bh, bw : w - bw] = 255
+        if len(boxes):
+            b = np.round(np.asarray(boxes, dtype=np.float64) / self.downscale).astype(np.int64)
+            b[:, [0, 2]] = np.clip(b[:, [0, 2]], 0, w)
+            b[:, [1, 3]] = np.clip(b[:, [1, 3]], 0, h)
+            for x1, y1, x2, y2 in b.tolist():
+                mask[y1:y2, x1:x2] = 0
+        return mask
+
+    def estimate(
+        self, frame_bgr: np.ndarray | None, exclude_boxes: np.ndarray | None = None
+    ) -> np.ndarray | None:
+        """2x3 affine warp from the previous frame to ``frame_bgr``, or ``None``."""
         if frame_bgr is None:
             return None
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         if self.downscale > 1:
             h, w = gray.shape[:2]
             gray = cv2.resize(gray, (max(32, w // self.downscale), max(32, h // self.downscale)))
-
-        pts = cv2.goodFeaturesToTrack(
-            gray,
-            maxCorners=200,
-            qualityLevel=0.01,
-            minDistance=8,
-            blockSize=3,
+        mask = self._background_mask(
+            gray, np.zeros((0, 4)) if exclude_boxes is None else exclude_boxes
+        )
+        has_bg = cv2.countNonZero(mask) >= 0.1 * mask.size
+        pts = (
+            cv2.goodFeaturesToTrack(
+                gray, maxCorners=1000, qualityLevel=0.01, minDistance=1, blockSize=3, mask=mask
+            )
+            if has_bg
+            else None
         )
 
-        if self._prev_gray is None or self._prev_pts is None or len(self._prev_pts) < 6:
-            self._prev_gray = gray
-            self._prev_pts = pts
-            return None
-
-        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(self._prev_gray, gray, self._prev_pts, None)
         warp: np.ndarray | None = None
-        if curr_pts is not None and status is not None:
-            valid = status.ravel() == 1
-            p0 = self._prev_pts[valid]
-            p1 = curr_pts[valid]
-            if len(p0) >= 6:
-                mat, _ = cv2.estimateAffinePartial2D(p0, p1, method=cv2.RANSAC)
-                if mat is not None:
-                    mat = mat.astype(np.float64)
-                    mat[:2, 2] *= float(self.downscale)
-                    warp = mat
+        if (
+            has_bg
+            and self._prev_gray is not None
+            and self._prev_gray.shape == gray.shape
+            and self._prev_pts is not None
+            and len(self._prev_pts) >= 10
+        ):
+            curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+                self._prev_gray, gray, self._prev_pts, None
+            )
+            if curr_pts is not None and status is not None:
+                valid = status.ravel() == 1
+                p0, p1 = self._prev_pts[valid].reshape(-1, 2), curr_pts[valid].reshape(-1, 2)
+                gh, gw = gray.shape[:2]
+                if self.drop_foreground_flow:
+                    x, y = np.rint(p1).astype(np.int64).T
+                    inside = (x >= 0) & (x < gw) & (y >= 0) & (y < gh)
+                    in_bg = inside & (mask[np.clip(y, 0, gh - 1), np.clip(x, 0, gw - 1)] > 0)
+                    p0, p1 = p0[in_bg], p1[in_bg]
+                if len(p0) >= 10:
+                    mat, inliers = cv2.estimateAffinePartial2D(p0, p1, method=cv2.RANSAC)
+                    if mat is not None and inliers is not None:
+                        warp = self._checked(
+                            mat.astype(np.float64), inliers.sum() / len(p0), gh, gw
+                        )
 
         self._prev_gray = gray
         self._prev_pts = pts
         return warp
+
+    def _checked(self, mat: np.ndarray, inlier_ratio: float, h: int, w: int) -> np.ndarray | None:
+        if not np.isfinite(mat).all() or inlier_ratio < 0.5:
+            return None
+        scale = float(np.sqrt(abs(np.linalg.det(mat[:, :2]))))
+        if not 0.9 <= scale <= 1.1 or np.abs(mat[:, 2]).max() > 0.15 * max(h, w):
+            return None
+        mat[:2, 2] *= float(self.downscale)
+        return mat
+
+
+def compute_hmiou_matrix(
+    boxes_a: np.ndarray, boxes_b: np.ndarray, iou: np.ndarray | None = None
+) -> np.ndarray:
+    """Height-modulated IoU (Hybrid-SORT): ``iou * (0.75 + 0.25 * vertical IoU)``.
+
+    The vertical overlap separates people who cross at different depths in the image. ``iou``
+    defaults to the plain IoU of the boxes; pass a soft or buffered IoU of the same pairs to
+    modulate that instead.
+    """
+    a = np.asarray(boxes_a, dtype=np.float64).reshape(-1, 4)
+    b = np.asarray(boxes_b, dtype=np.float64).reshape(-1, 4)
+    if iou is None:
+        iou = compute_iou_matrix(a, b)
+    inter = np.minimum(a[:, None, 3], b[None, :, 3]) - np.maximum(a[:, None, 1], b[None, :, 1])
+    union = np.maximum(a[:, None, 3], b[None, :, 3]) - np.minimum(a[:, None, 1], b[None, :, 1])
+    return iou * (0.75 + 0.25 * np.maximum(inter, 0.0) / np.maximum(union, 1e-6))
 
 
 def _linear_assignment(
@@ -622,8 +687,127 @@ class ByteTracker:
         return out
 
 
+def _xyxy_to_xywh(bbox: tuple[float, float, float, float]) -> np.ndarray:
+    x1, y1, x2, y2 = bbox
+    w = max(1.0, x2 - x1)
+    h = max(1.0, y2 - y1)
+    return np.array([x1 + 0.5 * w, y1 + 0.5 * h, w, h], dtype=np.float64)
+
+
+def _xywh_to_xyxy(xywh: np.ndarray) -> tuple[float, float, float, float]:
+    cx, cy = float(xywh[0]), float(xywh[1])
+    w, h = max(1.0, float(xywh[2])), max(1.0, float(xywh[3]))
+    return (cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h)
+
+
+class XywhKalmanFilter:
+    """Constant-velocity Kalman filter on ``[cx, cy, w, h, vx, vy, vw, vh]`` (BoT-SORT state).
+
+    Tracking width directly (instead of aspect ratio) and scaling every noise term by the box's
+    own size gives tighter boxes for people whose silhouette changes quickly. Each measurement's
+    noise shrinks with detector confidence (NSA Kalman), floored at ``min_nsa``, so a confident
+    detection pulls the state harder than a marginal one.
+
+    By default x terms scale with the width and y terms with the height. ``height_scaled`` scales
+    both position terms by the height and the width terms by ``max(w, 0.35 h)``, with a 10 px
+    floor, which keeps thin or partly visible boxes from being trusted too much (BoostTrack++).
+    """
+
+    _std_pos = 1.0 / 20.0
+    _std_vel = 1.0 / 160.0
+
+    def __init__(
+        self,
+        initial_bbox: tuple[float, float, float, float],
+        *,
+        height_scaled: bool = False,
+        min_nsa: float = 0.0,
+    ) -> None:
+        self.height_scaled = height_scaled
+        self.min_nsa = float(min_nsa)
+        self.mean = np.zeros(8, dtype=np.float64)
+        self.mean[:4] = _xyxy_to_xywh(initial_bbox)
+        s = self._size_scales()
+        self.cov = np.diag(
+            np.square(np.concatenate([2 * self._std_pos * s, 10 * self._std_vel * s]))
+        )
+
+    @property
+    def box(self) -> tuple[float, float, float, float]:
+        return _xywh_to_xyxy(self.mean[:4])
+
+    def _size_scales(self) -> np.ndarray:
+        w = max(1.0, float(self.mean[2]))
+        h = max(1.0, float(self.mean[3]))
+        if self.height_scaled:
+            h = max(10.0, h)
+            return np.array([h, h, max(10.0, w, 0.35 * h), h])
+        return np.array([w, h, w, h])
+
+    def measurement_var(self) -> np.ndarray:
+        """Diagonal measurement variance before the NSA confidence factor."""
+        return np.square(self._std_pos * self._size_scales())
+
+    def predict(self) -> None:
+        s = self._size_scales()
+        q = np.square(np.concatenate([self._std_pos * s, self._std_vel * s]))
+        m = self.mean
+        m[:4] += m[4:]
+        for i in (2, 3):
+            if m[i] < 1.0:
+                m[i] = 1.0
+                m[i + 4] = 0.0
+        # F @ P @ F.T for the constant-velocity F = [[I, I], [0, I]], written out blockwise.
+        c = self.cov
+        pp, pv, vv = c[:4, :4], c[:4, 4:], c[4:, 4:]
+        new_pv = pv + vv
+        c[:4, :4] = pp + pv + pv.T + vv
+        c[:4, 4:] = new_pv
+        c[4:, :4] = new_pv.T
+        c[np.diag_indices(8)] += q
+
+    def update(self, bbox: tuple[float, float, float, float], confidence: float = 1.0) -> None:
+        r = self.measurement_var() * max(self.min_nsa, 1e-4, 1.0 - float(confidence))
+        s = self.cov[:4, :4] + np.diag(r)
+        gain = np.linalg.solve(s, self.cov[:, :4].T).T
+        self.mean = self.mean + gain @ (_xyxy_to_xywh(bbox) - self.mean[:4])
+        self.cov = self.cov - gain @ s @ gain.T
+        np.maximum(self.mean[2:4], 1.0, out=self.mean[2:4])
+
+    def apply_camera_warp(self, warp_2x3: np.ndarray) -> None:
+        """Move the state into the current frame: rotate/translate the center, rotate the
+        velocity, scale the box size by the warp's zoom, and transform the covariance alike."""
+        rot = warp_2x3[:2, :2]
+        scale = float(np.sqrt(abs(np.linalg.det(rot))))
+        t = np.zeros((8, 8), dtype=np.float64)
+        t[0:2, 0:2] = rot
+        t[2, 2] = t[3, 3] = scale
+        t[4:6, 4:6] = rot
+        t[6, 6] = t[7, 7] = scale
+        self.mean = t @ self.mean
+        self.mean[:2] += warp_2x3[:2, 2]
+        self.cov = t @ self.cov @ t.T
+
+
+@dataclass
+class _BotSortTrackState(_TrackState):
+    kf: Any  # XywhKalmanFilter
+
+    @property
+    def bbox(self) -> tuple[float, float, float, float]:
+        return _xywh_to_xyxy(self.kf.mean[:4])
+
+
 class BotSortTracker(ByteTracker):
-    """BoT-SORT tracker: ByteTrack + Sparse Optical Flow CMC + appearance Re-ID fusion.
+    """BoT-SORT tracker: ByteTrack + camera motion compensation + appearance Re-ID fusion.
+
+    Differs from :class:`ByteTracker` in three ways:
+
+    - a Kalman filter on ``[cx, cy, w, h]`` with confidence-scaled measurement noise (see
+      :class:`XywhKalmanFilter`);
+    - camera motion estimated from background corners only (see :class:`SparseOpticalFlowCMC`),
+      warping each track's position, size, velocity and covariance into the current frame;
+    - optional appearance fusion with person Re-ID embeddings.
 
     Appearance only helps when embeddings come from a person Re-ID model (``--reid osnet``);
     CLIP/SigLIP image embeddings barely separate different people and must not be used here.
@@ -661,20 +845,57 @@ class BotSortTracker(ByteTracker):
         self.use_cmc = use_cmc
         self.proximity_thresh = float(proximity_thresh)
         self.appearance_thresh = float(appearance_thresh)
-        self._cmc = SparseOpticalFlowCMC() if use_cmc else None
+        self._cmc = SparseOpticalFlowCMC(drop_foreground_flow=False) if use_cmc else None
+        self._frame_boxes = np.zeros((0, 4), dtype=np.float64)
         # Appearance is fused into the first association, which only sees high-score detections.
         self.embedding_min_confidence = self.track_high_thresh
 
     def reset(self) -> None:
         super().reset()
         if self.use_cmc:
-            self._cmc = SparseOpticalFlowCMC()
+            self._cmc = SparseOpticalFlowCMC(drop_foreground_flow=False)
+
+    def update(
+        self,
+        detections: list[Detection],
+        frame_bgr: np.ndarray | None = None,
+    ) -> list[Track]:
+        self._frame_boxes = _boxes(detections)
+        # ByteTracker zeros mean[7] (vh) for lost tracks; XywhKalmanFilter also tracks width rate
+        # in mean[6]. Keep it across brief occlusions, then zero it to prevent long-gap ballooning.
+        for tr in self._tracks:
+            if (
+                tr.state != "tracked"
+                and tr.time_since_update > 5
+                and isinstance(tr, _BotSortTrackState)
+            ):
+                tr.kf.mean[6] = 0.0
+        outputs = super().update(detections, frame_bgr)
+        # ByteTracker spawns tracks with its own [cx, cy, a, h] filter; switch new ones to the
+        # BoT-SORT filter. Both start at the detection box, so this frame's outputs are unchanged.
+        for i, tr in enumerate(self._tracks):
+            if not isinstance(tr, _BotSortTrackState):
+                state = {f.name: getattr(tr, f.name) for f in dataclass_fields(tr)}
+                state["kf"] = XywhKalmanFilter(tr.bbox)
+                self._tracks[i] = _BotSortTrackState(**state)
+        return outputs
+
+    @staticmethod
+    def _apply_detection(tr: _TrackState, det: Detection, *, update_class: bool) -> None:
+        tr.kf.update(det.bbox, det.confidence)
+        tr.confidence = det.confidence
+        if update_class:
+            tr.class_id = det.class_id
+            tr.class_name = det.class_name
+        tr.hits += 1
+        tr.time_since_update = 0
+        tr.update_embedding(det.embedding)
 
     def _apply_cmc(self, frame_bgr: np.ndarray | None) -> None:
         if self._cmc is None or frame_bgr is None:
             return
         # Estimate on every frame (even with no tracks) so the reference frame never goes stale.
-        warp = self._cmc.estimate(frame_bgr)
+        warp = self._cmc.estimate(frame_bgr, self._frame_boxes)
         if warp is None:
             return
         for tr in self._tracks:
@@ -913,12 +1134,7 @@ def create_tracker(
     track_buffer: int = 30,
     iou_buffer: float = 0.0,
 ) -> Tracker:
-    """Factory for the built-in multi-object trackers, named as in :data:`TRACKER_NAMES`.
-
-    OC-SORT and BoostTrack start a track from any unmatched detection at or above
-    ``track_high_thresh``, as their reference implementations do, so they ignore
-    ``new_track_thresh``.
-    """
+    """Factory for the built-in multi-object trackers, named as in :data:`TRACKER_NAMES`."""
     key = tracker_name.lower().strip().replace("-", "_")
     if key in ("bytetrack", "byte"):
         return ByteTracker(
@@ -942,6 +1158,7 @@ def create_tracker(
         return OcSortTracker(
             det_thresh=track_high_thresh,
             low_thresh=track_low_thresh,
+            new_track_thresh=new_track_thresh,
             max_age=track_buffer,
             iou_buffer=iou_buffer,
         )
@@ -949,7 +1166,10 @@ def create_tracker(
         from trackflow.boosttrack import BoostTracker
 
         return BoostTracker(
-            det_thresh=track_high_thresh, max_age=track_buffer, iou_buffer=iou_buffer
+            det_thresh=track_high_thresh,
+            new_track_thresh=new_track_thresh,
+            max_age=track_buffer,
+            iou_buffer=iou_buffer,
         )
     raise ValueError(
         f"Unknown tracker '{tracker_name}'. Choose one of: {', '.join(TRACKER_NAMES)}."

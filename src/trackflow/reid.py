@@ -100,8 +100,11 @@ class ReidEmbedder:
         if backend == "osnet":
             spec = REID_REGISTRY["osnet"]
             self._input_hw = spec.input_hw
+            # ONNX Runtime has no MPS provider, and CoreML MLProgram recompiles on each dynamic
+            # per-frame crop batch size and stalls; CPU runs the 8.7 MB graph in a few ms.
+            eff_dev = "cpu" if device.lower().strip() in ("mps", "coreml") else device
             self._sess, _ = create_onnx_session(
-                resolve_reid_model("osnet", cache_dir=cache_dir), device=device
+                resolve_reid_model("osnet", cache_dir=cache_dir), device=eff_dev
             )
             self._input_name = self._sess.get_inputs()[0].name
 
