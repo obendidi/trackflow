@@ -144,9 +144,11 @@ def test_query_threshold_defaults_to_the_models_score_scale() -> None:
 
     assert pipe("clip") == 0.27
     assert pipe("siglip") == 0.08
+    assert pipe("siglip2") == 0.09
     assert pipe("embeddinggemma") == 0.71
     assert pipe("embeddinggemma", query_threshold=0.5) == 0.5
     assert TrackCardIndex(vlm=vlm("siglip"), query="red").query_threshold == 0.08
+    assert TrackCardIndex(vlm=vlm("siglip2"), query="red").query_threshold == 0.09
 
 
 def test_embeddinggemma_explains_the_missing_extra(monkeypatch) -> None:
@@ -240,3 +242,63 @@ def test_color_reid_embedder_produces_unit_vectors() -> None:
     assert vecs[1] is None
     assert vecs[0] is not None and vecs[0].shape == (96,)
     assert np.isclose(np.linalg.norm(vecs[0]), 1.0, atol=1e-4)
+
+
+def test_export_search_prompts_writes_sam3_compatible_manifest(tmp_path: Path) -> None:
+    import json
+
+    from trackflow.reid import export_search_prompts
+
+    vlm = _MockVlm()
+    idx = TrackCardIndex(vlm=vlm)
+    _feed(idx, 10, 5, (1, LEFT, RED), (2, RIGHT, BLUE))
+    idx.save_json(tmp_path / "track_cards.json", vlm_backend="clip")
+    (tmp_path / "summary.json").write_text(
+        json.dumps(
+            {
+                "source": "lobby.mp4",
+                "frame_width": 400,
+                "frame_height": 200,
+                "source_fps": 10.0,
+                "total_frames": 100,
+            }
+        ),
+        encoding="utf-8",
+    )
+    hits = search_track_cards(tmp_path, "person in red", top_k=1, embedder=vlm)
+    out_file = export_search_prompts(tmp_path, "person in red", hits, tmp_path / "prompts.json", pad_s=0.5)
+    manifest = json.loads(out_file.read_text(encoding="utf-8"))
+    assert manifest["schema"] == "trackflow.prompts.v1"
+    assert manifest["source"] == "lobby.mp4"
+    assert len(manifest["prompts"]) == 1
+    item = manifest["prompts"][0]
+    assert item["track_id"] == 1
+    assert item["start_frame"] == 5 and item["end_frame"] == 19
+    assert item["prompt_frame"] == 10
+    assert item["bbox_xyxy"] == [20.0, 20.0, 80.0, 140.0]
+    assert item["sam3_box_xywh_norm"] == pytest.approx([0.05, 0.1, 0.15, 0.6], abs=1e-6)
+    assert item["sam3_point_xy_norm"] == pytest.approx([0.125, 0.4], abs=1e-6)
+
+    # Overhanging Kalman box must be clipped strictly to [0, 1] for SAM 3, and missing summary errors.
+    hits_overhang = [{**hits[0], "best_bbox": [-10.0, -5.0, 420.0, 210.0]}]
+    out_clip = export_search_prompts(tmp_path, "red", hits_overhang, tmp_path / "clipped.json")
+    clipped = json.loads(out_clip.read_text(encoding="utf-8"))["prompts"][0]
+    assert clipped["sam3_box_xywh_norm"] == [0.0, 0.0, 1.0, 1.0]
+    assert clipped["sam3_point_xy_norm"] == [0.5, 0.5]
+
+    with pytest.raises(FileNotFoundError, match="summary.json"):
+        export_search_prompts(tmp_path / "missing_run", "red", hits, tmp_path / "fail.json")
+
+
+def test_new_apache2_presets_are_pinned_and_rfdetr_normalizes() -> None:
+    from trackflow.models import MODEL_REGISTRY, VLM_REGISTRY
+
+    for name in ("dfine-s", "dfine-m"):
+        spec = MODEL_REGISTRY[name]
+        assert spec.license == "Apache-2.0"
+        assert spec.revision and len(spec.revision) == 40
+    for name in ("rfdetr-nano", "rfdetr-small", "rfdetr-medium", "rfdetr-base"):
+        assert MODEL_REGISTRY[name].normalize is True
+    sig2 = VLM_REGISTRY["siglip2"]
+    assert sig2.license == "Apache-2.0"
+    assert sig2.revision and len(sig2.revision) == 40
