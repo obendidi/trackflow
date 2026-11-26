@@ -4,6 +4,26 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-26
+
+### Added
+
+- Apache-2.0 ONNX detector presets `dfine-s` and `dfine-m` (`dfine-m` reaches 46.5 HOTA on MOT17 with ByteTrack and 46.9 with BoT-SORT).
+- Pure-ONNX INT8 `--vlm siglip2` preset for natural-language track search without PyTorch (0.442 mAP on PA-100K / 0.488 on UPAR at ~45 crops/s on CPU, outperforming SigLIP 1 in both speed and accuracy).
+- `trackflow search <run> "<query>" --export-prompts prompts.json [--pad-s 1.0]` to export top search hits as time windows and clipped normalized `[0, 1]` boxes/points for downstream mask models like SAM 3 ([docs/sam3-handoff.md](docs/sam3-handoff.md)).
+- Bundled `onnx-vision-deploy` coding-agent skill (`skills/onnx-vision-deploy/SKILL.md`).
+- Full 4-dataset benchmark harnesses (`scripts/eval_benchmarks.py` and `scripts/eval_text_search.py`) and speed-vs-quality Pareto charts in the README across DanceTrack (25 videos), SportsMOT (45), MOT17 (7), MOT20 (4), PA-100K (10,000 crops), and UPAR (13,287 crops).
+
+### Changed
+
+- Unified foreground-masked RANSAC camera-motion compensation (`SparseOpticalFlowCMC`), direct `[cx, cy, w, h]` noise-scaled Kalman filtering (`XywhKalmanFilter`), and height-modulated IoU (`compute_hmiou_matrix`) across BoT-SORT, OC-SORT, and BoostTrack++, while keeping ByteTrack bit-exact with the browser playground. Across all 4 official MOT validation sets (81 videos, identical `rtdetr-v2-r18` detections), Trackflow outperforms matched-threshold Roboflow `trackers==2.7.0` on every dataset (37.9–38.8 vs 34.3–37.5 mean HOTA).
+
+### Fixed
+
+- Enabled ImageNet normalization on `rfdetr-nano`, `rfdetr-small`, `rfdetr-medium`, and `rfdetr-base` (overriding `do_normalize: false` in the upstream ONNX preprocessor sidecar), lifting `rfdetr-medium` on MOT17 from 41.2 to 42.9 HOTA (+3.3 IDF1).
+- Routed `ReidEmbedder(backend="osnet")` to CPU when `--device coreml` or `mps` is passed, avoiding CoreML MLProgram recompilation stalls on dynamic per-frame crop batch sizes.
+- Preserved matched active track IDs during BoostTrack duplicate pruning and forwarded `new_track_thresh` through `create_tracker`.
+
 ## [0.5.1] - 2026-11-25
 
 ### Added
