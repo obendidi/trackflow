@@ -12,11 +12,14 @@ from typing import Any
 import numpy as np
 
 from trackflow.tracker import (
+    SparseOpticalFlowCMC,
     _assign,
     _boxes,
     _expand_boxes,
     _SortStyleTracker,
     _SortTrack,
+    compute_hmiou_matrix,
+    compute_ioa_matrix,
     compute_iou_matrix,
 )
 from trackflow.types import Detection, Track
@@ -59,6 +62,19 @@ def _transition(n: int) -> np.ndarray:
     return f
 
 
+def _soft_iou(tracks: np.ndarray, detections: np.ndarray) -> np.ndarray:
+    """Blend IoU with expanded IoU to tolerate small prediction errors."""
+    raw = compute_iou_matrix(tracks, detections)
+    buffered = compute_iou_matrix(_expand_boxes(tracks, 0.15), _expand_boxes(detections, 0.15))
+    return (raw + buffered) / 2
+
+
+def _hm_soft_iou(tracks: np.ndarray, detections: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Soft IoU for gating and its height-modulated version (Hybrid-SORT HMIoU) for cost."""
+    iou = _soft_iou(tracks, detections)
+    return iou, compute_hmiou_matrix(tracks, detections, iou)
+
+
 class _OcSortMotion:
     """SORT's Kalman filter on ``[cx, cy, area, w/h]`` plus the observations OC-SORT uses.
 
@@ -92,6 +108,29 @@ class _OcSortMotion:
         if self.x[6] + self.x[2] <= 0:
             self.x[6] = 0.0
         self._predict()
+
+    def compensate(self, warp: np.ndarray, jacobian: np.ndarray, scale: float) -> None:
+        """Map the filter and its stored observations into the current frame."""
+        shift = warp[:, 2]
+        linear = warp[:, :2]
+        self.x = jacobian @ self.x
+        self.x[:2] += shift
+        self.P = jacobian @ self.P @ jacobian.T
+        if self._frozen is not None:
+            state, covariance = self._frozen
+            state = jacobian @ state
+            state[:2] += shift
+            self._frozen = (state, jacobian @ covariance @ jacobian.T)
+        self.direction = (linear @ self.direction[::-1])[::-1] / scale
+
+        def move(box: Box) -> Box:
+            x1, y1, x2, y2 = box
+            cx, cy = linear @ ((x1 + x2) / 2, (y1 + y2) / 2) + shift
+            hw, hh = (x2 - x1) * scale / 2, (y2 - y1) * scale / 2
+            return (cx - hw, cy - hh, cx + hw, cy + hh)
+
+        self.last_observation = move(self.last_observation)
+        self.observations = {age: move(box) for age, box in self.observations.items()}
 
     def _predict(self) -> None:
         self.x = self._F @ self.x
@@ -148,15 +187,17 @@ class OcSortTracker(_SortStyleTracker):
 
     Each frame:
 
-    1. high-score detections <-> every track's predicted box, by IoU plus observation-centric
+    1. high-score detections <-> confirmed tracks' predicted boxes, by IoU plus observation-centric
        momentum (OCM): a bonus, weighted by ``inertia`` and the detection score, when the
        direction from the track's observation ``delta_t`` frames back to the detection agrees
        with the track's recent direction of motion;
-    2. with ``use_byte``, low-score detections <-> remaining tracks by IoU (ByteTrack's second
-       stage);
-    3. observation-centric recovery (OCR): remaining high-score detections <-> remaining
+    2. observation-centric recovery (OCR): remaining high-score detections <-> remaining
        tracks' *last observed* boxes by IoU, which recovers tracks the filter has drifted off;
-    4. unmatched high-score detections spawn tracks.
+    3. with ``use_byte``, low-score detections <-> remaining confirmed tracks seen on the
+       previous frame, by IoU;
+    4. remaining high-score detections <-> tentative (not yet confirmed) tracks, by IoU;
+    5. unmatched detections at or above ``new_track_thresh`` spawn tracks, unless mostly
+       covered by a box matched this frame. A tentative track that misses a frame is dropped.
 
     A track that matches again after missing frames is re-updated along a virtual trajectory
     (ORU). Confirmed tracks report the matched detection's box.
@@ -174,18 +215,46 @@ class OcSortTracker(_SortStyleTracker):
         min_hits: int = 3,
         delta_t: int = 3,
         inertia: float = 0.2,
-        use_byte: bool = False,
+        use_byte: bool = True,
         iou_buffer: float = 0.0,
+        use_cmc: bool = True,
+        new_track_thresh: float | None = None,
     ) -> None:
         self.det_thresh = float(det_thresh)
+        self.new_track_thresh = (
+            float(new_track_thresh)
+            if new_track_thresh is not None
+            else max(self.det_thresh, min(0.95, self.det_thresh + 0.05))
+        )
         self.low_thresh = float(low_thresh)
         self.iou_threshold = float(iou_threshold)
         self.delta_t = int(delta_t)
         self.inertia = float(inertia)
         self.use_byte = bool(use_byte)
+        self.use_cmc = bool(use_cmc)
         # Buffered IoU for the first association (see iou_buffer_for_interval).
         self.iou_buffer = float(iou_buffer)
         super().__init__(max_age=max_age, min_hits=min_hits)
+
+    def reset(self) -> None:
+        super().reset()
+        self._cmc = SparseOpticalFlowCMC() if self.use_cmc else None
+
+    def _compensate(self, frame: np.ndarray, detections: list[Detection]) -> None:
+        assert self._cmc is not None
+        warp = self._cmc.estimate(frame, _boxes(detections))
+        if warp is None:
+            return
+        linear = warp[:, :2]
+        area_scale = float(np.sum(linear[0] ** 2))
+        if area_scale <= 1e-6:
+            return
+        jacobian = np.eye(7)
+        jacobian[:2, :2] = jacobian[4:6, 4:6] = linear
+        jacobian[2, 2] = jacobian[6, 6] = area_scale
+        scale = float(np.sqrt(area_scale))
+        for track in self._tracks:
+            track.motion.compensate(warp, jacobian, scale)
 
     def _gate(self, iou: np.ndarray, tracks: list[_SortTrack], dets: list[Detection]) -> np.ndarray:
         same_class = np.equal.outer([t.class_id for t in tracks], [d.class_id for d in dets])
@@ -213,11 +282,17 @@ class OcSortTracker(_SortStyleTracker):
         frame_bgr: np.ndarray | None = None,
     ) -> list[Track]:
         """Advance the tracker by one frame and return the tracks reported on it."""
-        _ = frame_bgr
         self._frame_id += 1
         events: list[dict[str, Any]] = []
+        if self._cmc is not None:
+            if frame_bgr is None:
+                self._cmc = SparseOpticalFlowCMC()
+            else:
+                self._compensate(frame_bgr, detections)
         self._predict()
-        tracks = list(self._tracks)
+        # Confirmed tracks associate first; tentative tracks only get the leftover detections.
+        tracks = [t for t in self._tracks if t.track_id]
+        tentative = [t for t in self._tracks if not t.track_id]
 
         high = [d for d in detections if d.confidence >= self.det_thresh]
         u_det = list(range(len(high)))
@@ -225,46 +300,67 @@ class OcSortTracker(_SortStyleTracker):
 
         # 1. High-score detections <-> predicted boxes, IoU plus direction consistency.
         if tracks and high:
-            iou = compute_iou_matrix(
+            iou, cost = _hm_soft_iou(
                 _expand_boxes(np.array([t.motion.box for t in tracks]), self.iou_buffer),
                 _expand_boxes(_boxes(high), self.iou_buffer),
             )
             matches, u_trk, u_det = _assign(
-                iou + self._momentum(tracks, high), self._gate(iou, tracks, high)
+                cost + self._momentum(tracks, high), self._gate(iou, tracks, high)
             )
             for ti, di in matches:
                 self._match(tracks[ti], high[di])
 
-        # 2. Optional BYTE stage: low-score detections <-> remaining predicted boxes.
-        low = (
-            [d for d in detections if self.low_thresh <= d.confidence < self.det_thresh]
-            if self.use_byte
-            else []
-        )
-        if low and u_trk:
-            rest = [tracks[i] for i in u_trk]
-            iou = compute_iou_matrix(np.array([t.motion.box for t in rest]), _boxes(low))
-            matches, left, _ = _assign(iou, self._gate(iou, rest, low))
-            for ti, di in matches:
-                self._match(rest[ti], low[di])
-            u_trk = [u_trk[i] for i in left]
-
-        # 3. OCR: remaining high-score detections <-> last observed boxes.
+        # 2. OCR: remaining high-score detections <-> last observed boxes.
         if u_det and u_trk:
             rest = [tracks[i] for i in u_trk]
             dets = [high[i] for i in u_det]
-            iou = compute_iou_matrix(
+            iou, cost = _hm_soft_iou(
                 np.array([t.motion.last_observation for t in rest], dtype=np.float64),
                 _boxes(dets),
             )
-            matches, left_t, left_d = _assign(iou, self._gate(iou, rest, dets))
+            matches, left_t, left_d = _assign(cost, self._gate(iou, rest, dets))
             for ti, di in matches:
                 self._match(rest[ti], dets[di])
             u_trk = [u_trk[i] for i in left_t]
             u_det = [u_det[i] for i in left_d]
 
+        # 3. Low scores can sustain an active track after both high-score passes.
+        if self.use_byte and u_trk:
+            active = [i for i in u_trk if tracks[i].track_id and tracks[i].time_since_update == 1]
+            low = [d for d in detections if self.low_thresh <= d.confidence < self.det_thresh]
+            if active and low:
+                rest = [tracks[i] for i in active]
+                iou = compute_iou_matrix(np.array([t.motion.box for t in rest]), _boxes(low))
+                matches, _, _ = _assign(iou, self._gate(iou, rest, low) & (iou >= 0.5))
+                for ti, di in matches:
+                    self._match(rest[ti], low[di])
+
+        # 4. Tentative tracks <-> remaining high-score detections.
+        if tentative and u_det:
+            dets = [high[i] for i in u_det]
+            iou, cost = _hm_soft_iou(np.array([t.motion.box for t in tentative]), _boxes(dets))
+            matches, _, left_d = _assign(cost, self._gate(iou, tentative, dets))
+            for ti, di in matches:
+                self._match(tentative[ti], dets[di])
+            u_det = [u_det[i] for i in left_d]
+
         for i in u_trk:
-            tracks[i].motion.miss()
-        for i in u_det:
-            self._spawn(high[i], _OcSortMotion(high[i].bbox, self.delta_t))
+            if tracks[i].time_since_update:
+                tracks[i].motion.miss()
+        # A tentative track that misses a frame is dropped so it can't take later detections.
+        self._tracks = [t for t in self._tracks if t.track_id or not t.time_since_update]
+        # Spawn from confident leftovers that aren't mostly covered by a box matched this frame.
+        taken: dict[int, list[Box]] = {}
+        for t in self._tracks:
+            if not t.time_since_update:
+                taken.setdefault(t.class_id, []).append(t.box)
+        for i in sorted(u_det, key=lambda i: -high[i].confidence):
+            det = high[i]
+            if det.confidence < self.new_track_thresh:
+                continue
+            same = taken.get(det.class_id)
+            if same and float(compute_ioa_matrix(_boxes([det]), np.array(same)).max()) >= 0.8:
+                continue
+            self._spawn(det, _OcSortMotion(det.bbox, self.delta_t))
+            taken.setdefault(det.class_id, []).append(det.bbox)
         return self._finish_frame(events)

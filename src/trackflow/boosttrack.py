@@ -15,11 +15,15 @@ import numpy as np
 
 from trackflow.tracker import (
     SparseOpticalFlowCMC,
+    XywhKalmanFilter,
     _assign,
     _boxes,
     _expand_boxes,
     _SortStyleTracker,
     _SortTrack,
+    _xyxy_to_xywh,
+    compute_hmiou_matrix,
+    compute_ioa_matrix,
     compute_iou_matrix,
 )
 from trackflow.types import Detection, Track
@@ -28,55 +32,6 @@ Box = tuple[float, float, float, float]
 
 # 99% quantile of the chi-square distribution with 4 degrees of freedom.
 _MAHALANOBIS_LIMIT = 13.2767
-
-
-def _box_to_z(box: Box) -> np.ndarray:
-    """``[cx, cy, h, w/h]``."""
-    x1, y1, x2, y2 = box
-    w = max(x2 - x1, 1e-3)
-    h = max(y2 - y1, 1e-3)
-    return np.array([x1 + 0.5 * w, y1 + 0.5 * h, h, w / h], dtype=np.float64)
-
-
-def _z_to_box(z: np.ndarray) -> Box:
-    h = max(float(z[2]), 1e-3)
-    w = max(float(z[3]), 0.0) * h
-    cx, cy = float(z[0]), float(z[1])
-    return (cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h)
-
-
-class _BoostMotion:
-    """Constant-velocity Kalman filter on ``[cx, cy, h, w/h]`` with BoostTrack's fixed noise."""
-
-    _F = np.eye(8, dtype=np.float64) + np.eye(8, k=4, dtype=np.float64)
-    _H = np.eye(4, 8, dtype=np.float64)
-    _Q = np.diag([1.0, 1.0, 1.0, 1.0, 1e-2, 1e-2, 1e-2, 1e-2])
-    _R = np.diag([1.0, 1.0, 10.0, 1e-2])
-
-    def __init__(self, box: Box) -> None:
-        self.x = np.zeros(8, dtype=np.float64)
-        self.x[:4] = _box_to_z(box)
-        self.P = np.diag([10.0] * 4 + [1e4] * 4)
-
-    @property
-    def box(self) -> Box:
-        return _z_to_box(self.x)
-
-    def predict(self) -> None:
-        self.x = self._F @ self.x
-        self.P = self._F @ self.P @ self._F.T + self._Q
-
-    def update(self, box: Box) -> None:
-        s = self._H @ self.P @ self._H.T + self._R
-        gain = np.linalg.solve(s, self._H @ self.P).T
-        self.x = self.x + gain @ (_box_to_z(box) - self._H @ self.x)
-        self.P = self.P - gain @ s @ gain.T
-
-    def warp(self, affine: np.ndarray) -> None:
-        """Move the current box by a 2x3 camera-motion transform (velocities are kept)."""
-        x1, y1, x2, y2 = self.box
-        (ax1, ay1), (ax2, ay2) = (affine[:, :2] @ np.array([[x1, x2], [y1, y2]])).T + affine[:, 2]
-        self.x[:4] = _box_to_z((ax1, ay1, ax2, ay2))
 
 
 def _mahalanobis_similarity(dist: np.ndarray) -> np.ndarray:
@@ -103,7 +58,7 @@ def _shape_similarity(dets: np.ndarray, tracks: np.ndarray) -> np.ndarray:
 
 def _soft_buffered_iou(dets: np.ndarray, tracks: np.ndarray, track_conf: np.ndarray) -> np.ndarray:
     """IoU after growing both boxes in proportion to how uncertain the track is."""
-    grow = (1.0 - track_conf)[None, :, None]
+    grow = np.minimum(0.75, 1.0 - track_conf)[None, :, None]
     d = dets[:, None, :]
     t = tracks[None, :, :]
     d_size = np.concatenate([d[..., 2:] - d[..., :2]] * 2, axis=-1)
@@ -165,11 +120,17 @@ class BoostTracker(_SortStyleTracker):
         lambda_mhd: float = 0.25,
         lambda_shape: float = 0.25,
         dlo_boost: bool = True,
-        duo_boost: bool = True,
+        duo_boost: bool = False,
         use_cmc: bool = True,
         iou_buffer: float = 0.0,
+        new_track_thresh: float | None = None,
     ) -> None:
         self.det_thresh = float(det_thresh)
+        self.new_track_thresh = (
+            float(new_track_thresh)
+            if new_track_thresh is not None
+            else max(self.det_thresh, min(0.95, self.det_thresh + 0.05))
+        )
         self.iou_threshold = float(iou_threshold)
         self.lambda_iou = float(lambda_iou)
         self.lambda_mhd = float(lambda_mhd)
@@ -180,13 +141,19 @@ class BoostTracker(_SortStyleTracker):
         self.use_cmc = bool(use_cmc)
         # Buffered IoU for association (see iou_buffer_for_interval).
         self.iou_buffer = float(iou_buffer)
-        # Boosting can promote any detection, so every detection may need an embedding.
-        self.embedding_min_confidence = 0.0
+        # Keep embeddings available down to low-confidence detections.
+        self.embedding_min_confidence = min(0.20, self.det_thresh)
         super().__init__(max_age=max_age, min_hits=min_hits)
 
     def reset(self) -> None:
         super().reset()
         self._cmc = SparseOpticalFlowCMC() if self.use_cmc else None
+
+    def _predict(self) -> None:
+        for tr in self._tracks:
+            if tr.time_since_update > 0:
+                tr.motion.mean[6:] = 0.0  # a missed track keeps moving but stops resizing
+        super()._predict()
 
     @staticmethod
     def _track_confidence(tr: _SortTrack) -> float:
@@ -196,49 +163,47 @@ class BoostTracker(_SortStyleTracker):
 
     @staticmethod
     def _mahalanobis(dets: list[Detection], tracks: list[_SortTrack]) -> np.ndarray:
-        """Squared distance of each detection to each track, using the state variances."""
-        z = np.array([_box_to_z(d.bbox) for d in dets])
-        x = np.array([t.motion.x[:4] for t in tracks])
-        inv_var = np.array([1.0 / np.diag(t.motion.P)[:4] for t in tracks])
-        dist = (((z[:, None, :] - x[None, :, :]) ** 2) * inv_var[None, :, :]).sum(axis=2)
+        """Squared NSA innovation distance of each detection to each track."""
+        z = np.array([_xyxy_to_xywh(d.bbox) for d in dets], dtype=np.float64)
+        nsa = np.array(
+            [max(0.1, 1.0 - min(float(d.confidence), 0.95)) for d in dets], dtype=np.float64
+        )
+        x = np.array([t.motion.mean[:4] for t in tracks], dtype=np.float64)
+        p_diag = np.array([np.diag(t.motion.cov)[:4] for t in tracks], dtype=np.float64)
+        r_base = np.array([t.motion.measurement_var() for t in tracks], dtype=np.float64)
+        s_diag = np.maximum(p_diag[None, :, :] + nsa[:, None, None] * r_base[None, :, :], 1e-6)
+        dist = (((z[:, None, :] - x[None, :, :]) ** 2) / s_diag).sum(axis=2)
         same_class = np.equal.outer([d.class_id for d in dets], [t.class_id for t in tracks])
         return np.where(same_class, dist, np.inf)
 
-    def _boost(
-        self, dets: list[Detection], tracks: list[_SortTrack], track_conf: np.ndarray
+    def _duo_promote(
+        self,
+        dets: list[Detection],
+        tracks: list[_SortTrack],
+        scores: np.ndarray,
     ) -> np.ndarray:
-        scores = np.array([d.confidence for d in dets], dtype=np.float64)
+        """Promote isolated moderate-confidence detections that are far from existing tracks."""
+        promoted = np.zeros(len(dets), dtype=bool)
+        if not self.duo_boost or self._frame_id <= 1 or not dets or not tracks:
+            return promoted
+        duo_floor = max(0.35, self.det_thresh - 0.15)
         mahalanobis = self._mahalanobis(dets, tracks)
         d_boxes = _boxes(dets)
         t_boxes = np.array([t.motion.box for t in tracks], dtype=np.float64)
-
-        if self.dlo_boost:
-            sim = (
-                _mahalanobis_similarity(mahalanobis)
-                + _shape_similarity(d_boxes, t_boxes)
-                + _soft_buffered_iou(d_boxes, t_boxes, track_conf)
-            ) / 3.0
-            sim[np.isinf(mahalanobis)] = 0.0
-            scores = np.maximum(scores, 0.65 * scores + 0.35 * sim.max(axis=1) ** 1.5)
-            missed = np.array([t.time_since_update - 1 for t in tracks], dtype=np.float64)
-            needed = np.maximum(0.95 - missed * (0.15 / 20), 0.8)
-            likely = (sim > needed[None, :]).any(axis=1)
-            scores[likely] = np.maximum(scores[likely], self.det_thresh + 1e-5)
-
-        if self.duo_boost and self._frame_id > 1:
-            candidates = np.flatnonzero(
-                (mahalanobis.min(axis=1) > _MAHALANOBIS_LIMIT) & (scores < self.det_thresh)
-            )
-            if candidates.size:
-                overlap = compute_iou_matrix(d_boxes[candidates], d_boxes[candidates])
-                np.fill_diagonal(overlap, 0.0)
-                strongest = [
-                    i
-                    for k, i in enumerate(candidates)
-                    if scores[i] >= scores[candidates[overlap[k] > 0.3]].max(initial=-np.inf)
-                ]
-                scores[strongest] = self.det_thresh + 1e-4
-        return scores
+        max_track_iou = compute_iou_matrix(d_boxes, t_boxes).max(axis=1)
+        candidates = np.flatnonzero(
+            (mahalanobis.min(axis=1) > _MAHALANOBIS_LIMIT)
+            & (max_track_iou < 0.1)
+            & (scores >= duo_floor)
+            & (scores < self.det_thresh)
+        )
+        if candidates.size:
+            overlap = compute_iou_matrix(d_boxes[candidates], d_boxes[candidates])
+            np.fill_diagonal(overlap, 0.0)
+            for k, i in enumerate(candidates):
+                if scores[i] >= scores[candidates[overlap[k] > 0.3]].max(initial=-np.inf):
+                    promoted[i] = True
+        return promoted
 
     def _associate(
         self,
@@ -252,19 +217,22 @@ class BoostTracker(_SortStyleTracker):
             return [], list(range(len(dets))), list(range(len(tracks)))
         d_boxes = _boxes(dets)
         t_boxes = np.array([t.motion.box for t in tracks], dtype=np.float64)
-        iou = compute_iou_matrix(
-            _expand_boxes(d_boxes, self.iou_buffer), _expand_boxes(t_boxes, self.iou_buffer)
-        )
-        conf = scores[:, None] * track_conf[None, :]
-        conf[iou < self.iou_threshold] = 0.0
+        d_exp = _expand_boxes(d_boxes, self.iou_buffer)
+        t_exp = _expand_boxes(t_boxes, self.iou_buffer)
+        iou = compute_iou_matrix(d_exp, t_exp)
+        sb_iou = _soft_buffered_iou(d_exp, t_exp, track_conf)
         mahalanobis = self._mahalanobis(dets, tracks)
+        low_iou_gate = min(self.iou_threshold, 0.20)
+        valid = (sb_iou >= self.iou_threshold) | (
+            (sb_iou >= low_iou_gate) & (mahalanobis <= _MAHALANOBIS_LIMIT)
+        )
+        conf = np.where(valid, scores[:, None] * track_conf[None, :], 0.0)
         sim = (
-            iou
-            + self.lambda_iou * conf * iou
+            compute_hmiou_matrix(d_boxes, t_boxes, sb_iou)
+            + self.lambda_iou * conf * sb_iou
             + self.lambda_mhd * _mahalanobis_similarity(mahalanobis)
             + self.lambda_shape * conf * _shape_similarity(d_boxes, t_boxes)
         )
-        valid = iou >= self.iou_threshold
 
         known = [t.embedding for t in tracks if t.embedding is not None]
         if known and any(d.embedding is not None for d in dets):
@@ -277,6 +245,53 @@ class BoostTracker(_SortStyleTracker):
 
         return _assign(sim, valid & ~np.isinf(mahalanobis))
 
+    def _associate_low(
+        self,
+        tracks: list[_SortTrack],
+        dets: list[Detection],
+        scores: np.ndarray,
+    ) -> list[tuple[int, int]]:
+        """Second-stage tight-IoU association for active tracks with low-score detections."""
+        if not tracks or not dets:
+            return []
+        d_boxes = _boxes(dets)
+        t_boxes = np.array([t.motion.box for t in tracks], dtype=np.float64)
+        iou = compute_iou_matrix(d_boxes, t_boxes)
+        mahalanobis = self._mahalanobis(dets, tracks)
+        mhd_ok = mahalanobis <= _MAHALANOBIS_LIMIT
+        valid = ((iou >= 0.45) | ((iou >= 0.35) & mhd_ok & (scores[:, None] >= 0.25))) & ~np.isinf(
+            mahalanobis
+        )
+        sim = (
+            iou
+            + self.lambda_mhd * _mahalanobis_similarity(mahalanobis)
+            + self.lambda_shape * scores[:, None] * _shape_similarity(d_boxes, t_boxes)
+        )
+        matches, _, _ = _assign(sim, valid)
+        return matches
+
+    def _remove_duplicates(self) -> None:
+        tracked = [t for t in self._tracks if t.time_since_update == 0]
+        lost = [t for t in self._tracks if 0 < t.time_since_update <= self.track_buffer]
+        if not tracked or not lost:
+            return
+        t_boxes = np.array([t.box for t in tracked], dtype=np.float64)
+        l_boxes = np.array([t.motion.box for t in lost], dtype=np.float64)
+        iou = compute_iou_matrix(t_boxes, l_boxes)
+        drop: set[int] = set()
+        for p, q in zip(*np.where(iou > 0.85), strict=False):
+            a, b = tracked[int(p)], lost[int(q)]
+            if a.class_id != b.class_id:
+                continue
+            # Never delete an already-confirmed active track that matched this frame; only drop
+            # the overlapping lost track, or a newly-spawned tentative duplicate under a confirmed one.
+            if a.track_id or a.age >= b.age:
+                drop.add(b.uid)
+            else:
+                drop.add(a.uid)
+        if drop:
+            self._tracks = [t for t in self._tracks if t.uid not in drop]
+
     def update(
         self,
         detections: list[Detection],
@@ -287,30 +302,139 @@ class BoostTracker(_SortStyleTracker):
         events: list[dict[str, Any]] = []
         if self._cmc is not None and frame_bgr is not None:
             # Estimate on every frame (even with no tracks) so the reference frame never goes stale.
-            warp = self._cmc.estimate(frame_bgr)
+            warp = self._cmc.estimate(frame_bgr, _boxes(detections))
             if warp is not None:
                 for tr in self._tracks:
-                    tr.motion.warp(warp)
+                    tr.motion.apply_camera_warp(warp)
         self._predict()
-        tracks = list(self._tracks)
-        track_conf = np.array([self._track_confidence(t) for t in tracks], dtype=np.float64)
+        confirmed = [t for t in self._tracks if t.track_id > 0]
+        unconfirmed = [t for t in self._tracks if t.track_id == 0]
+        all_tracks = confirmed + unconfirmed
 
-        if tracks and detections:
-            boosted = self._boost(detections, tracks, track_conf)
-        else:
-            boosted = np.array([d.confidence for d in detections], dtype=np.float64)
-        keep = np.flatnonzero(boosted >= self.det_thresh)
-        dets = [detections[i] for i in keep]
-        scores = boosted[keep]
+        raw_scores = np.array([d.confidence for d in detections], dtype=np.float64)
+        duo_promoted = self._duo_promote(detections, all_tracks, raw_scores)
+        high_mask = (raw_scores >= self.det_thresh) | duo_promoted
+        high_indices = np.flatnonzero(high_mask)
+        low_indices = np.flatnonzero(~high_mask)
 
-        matches, u_det, _ = self._associate(tracks, dets, scores, track_conf)
-        for di, ti in matches:
-            tr, det = tracks[ti], dets[di]
-            tr.motion.update(det.bbox)
+        high_dets = [detections[i] for i in high_indices]
+        high_scores = np.where(
+            duo_promoted[high_indices], self.det_thresh + 1e-4, raw_scores[high_indices]
+        )
+        high_duo = duo_promoted[high_indices]
+
+        updated_boxes: dict[int, list[Box]] = {}
+        matched_uids: set[int] = set()
+
+        def _apply_match(tr: _SortTrack, det: Detection, score: float, *, blend_emb: bool) -> None:
+            tr.motion.update(det.bbox, confidence=det.confidence)
             self._observe(tr, det, tr.motion.box)
-            trust = (scores[di] - self.det_thresh) / max(1.0 - self.det_thresh, 1e-6)
-            tr.blend_embedding(det.embedding, alpha=0.95 + 0.05 * (1.0 - trust))
-        for di in u_det:
-            tr = self._spawn(dets[di], _BoostMotion(dets[di].bbox))
-            tr.blend_embedding(dets[di].embedding, alpha=0.0)
+            updated_boxes.setdefault(tr.class_id, []).append(tr.box)
+            matched_uids.add(tr.uid)
+            if blend_emb:
+                trust = (score - self.det_thresh) / max(1.0 - self.det_thresh, 1e-6)
+                tr.blend_embedding(det.embedding, alpha=0.95 + 0.05 * (1.0 - trust))
+
+        # Stage 1: match confirmed (active + lost) tracks with high-score detections.
+        conf_tconf = np.array([self._track_confidence(t) for t in confirmed], dtype=np.float64)
+        matches, u_det, u_conf = self._associate(confirmed, high_dets, high_scores, conf_tconf)
+        for di, ti in matches:
+            _apply_match(confirmed[ti], high_dets[di], float(high_scores[di]), blend_emb=True)
+
+        # Stage 2: DLO low-score recovery for remaining active and recently missed confirmed tracks.
+        used_low: set[int] = set()
+        if self.dlo_boost and low_indices.size:
+            active_conf = [confirmed[ti] for ti in u_conf if confirmed[ti].time_since_update == 1]
+            dlo_floor = min(0.15, self.det_thresh * 0.5)
+            low_keep = [i for i in low_indices.tolist() if raw_scores[i] >= dlo_floor]
+            if active_conf and low_keep:
+                low_dets = [detections[i] for i in low_keep]
+                low_scores = raw_scores[low_keep]
+                low_matches = self._associate_low(active_conf, low_dets, low_scores)
+                for di, ti in low_matches:
+                    _apply_match(
+                        active_conf[ti], low_dets[di], float(low_scores[di]), blend_emb=False
+                    )
+                    used_low.add(low_keep[di])
+            recent_lost = [
+                confirmed[ti]
+                for ti in u_conf
+                if confirmed[ti].uid not in matched_uids
+                and 2 <= confirmed[ti].time_since_update <= 3
+            ]
+            rec_keep = [
+                i for i in low_indices.tolist() if i not in used_low and raw_scores[i] >= 0.30
+            ]
+            if recent_lost and rec_keep:
+                rec_dets = [detections[i] for i in rec_keep]
+                rec_scores = raw_scores[rec_keep]
+                rec_boxes = _boxes(rec_dets)
+                lost_boxes = np.array([t.motion.box for t in recent_lost], dtype=np.float64)
+                rec_iou = compute_iou_matrix(rec_boxes, lost_boxes)
+                rec_mhd = self._mahalanobis(rec_dets, recent_lost)
+                rec_valid = (rec_iou >= 0.50) & (rec_mhd <= _MAHALANOBIS_LIMIT)
+                rec_sim = (
+                    rec_iou
+                    + self.lambda_mhd * _mahalanobis_similarity(rec_mhd)
+                    + self.lambda_shape
+                    * rec_scores[:, None]
+                    * _shape_similarity(rec_boxes, lost_boxes)
+                )
+                rec_matches, _, _ = _assign(rec_sim, rec_valid)
+                for di, ti in rec_matches:
+                    _apply_match(
+                        recent_lost[ti], rec_dets[di], float(rec_scores[di]), blend_emb=False
+                    )
+                    used_low.add(rec_keep[di])
+
+        # Stage 3: match unconfirmed tracks with leftover high-score detections.
+        rem_high_dets = [high_dets[di] for di in u_det]
+        rem_high_scores = high_scores[u_det] if u_det else np.empty(0, dtype=np.float64)
+        unconf_tconf = np.array([self._track_confidence(t) for t in unconfirmed], dtype=np.float64)
+        un_matches, u_rem_det, u_unconf = self._associate(
+            unconfirmed, rem_high_dets, rem_high_scores, unconf_tconf
+        )
+        for di, ti in un_matches:
+            _apply_match(
+                unconfirmed[ti], rem_high_dets[di], float(rem_high_scores[di]), blend_emb=True
+            )
+
+        # When DUO boost is enabled, let DUO-spawned unconfirmed tracks continue on low-score hits.
+        if self.duo_boost and self.dlo_boost and u_unconf and low_indices.size:
+            rem_unconf = [
+                unconfirmed[ti] for ti in u_unconf if unconfirmed[ti].time_since_update == 1
+            ]
+            dlo_floor = min(0.15, self.det_thresh * 0.5)
+            low_keep = [
+                i for i in low_indices.tolist() if i not in used_low and raw_scores[i] >= dlo_floor
+            ]
+            if rem_unconf and low_keep:
+                low_dets = [detections[i] for i in low_keep]
+                low_scores = raw_scores[low_keep]
+                for di, ti in self._associate_low(rem_unconf, low_dets, low_scores):
+                    _apply_match(
+                        rem_unconf[ti], low_dets[di], float(low_scores[di]), blend_emb=False
+                    )
+
+        # Prune unconfirmed tracks that missed so 1-frame ghosts never linger as zombies.
+        self._tracks = [t for t in self._tracks if t.track_id > 0 or t.uid in matched_uids]
+
+        # Spawn new tracks from leftover high-score detections above new_track_thresh (or DUO-promoted).
+        leftovers = sorted(
+            (u_det[i] for i in u_rem_det), key=lambda di: float(high_scores[di]), reverse=True
+        )
+        for di in leftovers:
+            det = high_dets[di]
+            if not high_duo[di] and det.confidence < self.new_track_thresh:
+                continue
+            same_class = updated_boxes.get(det.class_id)
+            if (
+                same_class
+                and float(compute_ioa_matrix(_boxes([det]), np.array(same_class)).max()) >= 0.8
+            ):
+                continue
+            tr = self._spawn(det, XywhKalmanFilter(det.bbox, height_scaled=True, min_nsa=0.03))
+            tr.blend_embedding(det.embedding, alpha=0.0)
+            updated_boxes.setdefault(det.class_id, []).append(det.bbox)
+        self._remove_duplicates()
         return self._finish_frame(events)

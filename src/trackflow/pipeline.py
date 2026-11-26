@@ -289,7 +289,7 @@ class TrackflowPipeline:
         self.reid_merge = bool(reid_merge)
         if self.query and self.vlm_backend == "none":
             raise ValueError(
-                "A text query needs a vision-language model. Choose clip, siglip or embeddinggemma."
+                "A text query needs a vision-language model. Choose clip, siglip, siglip2 or embeddinggemma."
             )
 
         detect_classes = self._allowed
@@ -310,7 +310,7 @@ class TrackflowPipeline:
         self.reid_embedder = reid_embedder or (
             ReidEmbedder(
                 backend=self.reid_backend,
-                device="cpu" if device == "mps" else device,
+                device=device,
                 cache_dir=cache_dir,
             )
             if self.reid_backend != "none"
