@@ -43,6 +43,11 @@ QUERY_THRESHOLDS: dict[str, float] = {
 
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+_IMAGENET_SCALE = (1.0 / (255.0 * _IMAGENET_STD)).astype(np.float32)
+_IMAGENET_BIAS = (-_IMAGENET_MEAN / _IMAGENET_STD).astype(np.float32)
+# Fixed padded batch size for OSNet on CoreML MLProgram so the graph compiles once per session
+# instead of stalling on every dynamic per-frame crop count.
+_COREML_OSNET_BATCH = 8
 
 
 def _l2_normalize(vec: np.ndarray) -> np.ndarray:
@@ -102,22 +107,28 @@ class ReidEmbedder:
         self._sess = None
         self._input_name = ""
         self._input_hw = (256, 128)
+        self._static_batch: int | None = None
         if backend == "osnet":
             spec = REID_REGISTRY["osnet"]
             self._input_hw = spec.input_hw
-            # ONNX Runtime has no MPS provider, and CoreML MLProgram recompiles on each dynamic
-            # per-frame crop batch size and stalls; CPU runs the 8.7 MB graph in a few ms.
-            eff_dev = "cpu" if device.lower().strip() in ("mps", "coreml") else device
-            self._sess, _ = create_onnx_session(
+            # ONNX Runtime has no MPS provider; map mps to CPU. CoreML runs with a fixed padded
+            # batch size in encode_images so MLProgram compiles the graph only once.
+            eff_dev = "cpu" if device.lower().strip() == "mps" else device
+            self._sess, active_provider = create_onnx_session(
                 resolve_reid_model("osnet", cache_dir=cache_dir), device=eff_dev
             )
             self._input_name = self._sess.get_inputs()[0].name
+            if active_provider == "CoreMLExecutionProvider":
+                self._static_batch = _COREML_OSNET_BATCH
 
     def _preprocess(self, crop_bgr: np.ndarray) -> np.ndarray:
         h, w = self._input_hw
-        rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-        x = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
-        return ((x - _IMAGENET_MEAN) / _IMAGENET_STD).transpose(2, 0, 1)
+        resized = cv2.resize(crop_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        x = rgb.astype(np.float32)
+        x *= _IMAGENET_SCALE
+        x += _IMAGENET_BIAS
+        return x.transpose(2, 0, 1)
 
     def encode_images(self, crops: list[np.ndarray | None]) -> list[np.ndarray | None]:
         """Embed a batch of BGR crops; ``None``/empty crops map to ``None``."""
@@ -130,10 +141,26 @@ class ReidEmbedder:
                 out[i] = _color_spatial_embedding(crops[i])  # type: ignore[arg-type]
             return out
         assert self._sess is not None
-        batch = np.stack([self._preprocess(crops[i]) for i in valid])  # type: ignore[arg-type]
-        embs = self._sess.run(None, {self._input_name: batch})[0]
-        for i, e in zip(valid, embs, strict=True):
-            out[i] = _l2_normalize(e)
+        if self._static_batch is None:
+            batch = np.stack([self._preprocess(crops[i]) for i in valid])  # type: ignore[arg-type]
+            embs = self._sess.run(None, {self._input_name: batch})[0]
+            for i, e in zip(valid, embs, strict=True):
+                out[i] = _l2_normalize(e)
+            return out
+
+        bs = self._static_batch
+        h, w = self._input_hw
+        buf = np.empty((bs, 3, h, w), dtype=np.float32)
+        for start in range(0, len(valid), bs):
+            chunk = valid[start : start + bs]
+            m = len(chunk)
+            for slot, idx in enumerate(chunk):
+                buf[slot] = self._preprocess(crops[idx])  # type: ignore[arg-type]
+            if m < bs:
+                buf[m:] = 0.0
+            embs = self._sess.run(None, {self._input_name: buf})[0]
+            for slot, idx in enumerate(chunk):
+                out[idx] = _l2_normalize(embs[slot])
         return out
 
     def encode_image(self, crop_bgr: np.ndarray | None) -> np.ndarray | None:

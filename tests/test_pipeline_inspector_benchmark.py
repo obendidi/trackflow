@@ -350,3 +350,48 @@ def test_agent_cli_json_and_llms_txt(tmp_path: Path, monkeypatch) -> None:
     llms_txt = repo_root / "web" / "llms.txt"
     assert llms_txt.is_file() and "trackflow-python" in llms_txt.read_text(encoding="utf-8")
     assert 'href="llms.txt"' in (repo_root / "web" / "index.html").read_text(encoding="utf-8")
+
+
+def test_async_pipeline_flushes_video_on_ctrl_c_and_propagates_worker_errors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    vid_path = generate_synthetic_crowd_video(tmp_path / "crowd.mp4", num_frames=16)
+
+    # 1. Single Ctrl-C with save_video=True flushes every processed frame into a valid MP4.
+    run_ctrlc = tmp_path / "run_ctrlc"
+    pipe_ctrlc = TrackflowPipeline(model="synthetic", detector=_InterruptingDetector(at_frame=5))
+    summary = pipe_ctrlc.run(
+        str(vid_path), output_dir=run_ctrlc, save_video=True, exports=("jsonl",)
+    )
+    assert summary.processed_frames == 6
+    cap = cv2.VideoCapture(str(run_ctrlc / "annotated.mp4"))
+    written = 0
+    while cap.read()[0]:
+        written += 1
+    cap.release()
+    assert written == 6
+
+    # 2. Exception raised inside the background writer thread propagates to the caller.
+    pipe_werr = TrackflowPipeline(model="synthetic", detector=_SyntheticMotionDetector())
+    seen_calls = 0
+
+    def failing_apply(frame, tracks, *, detections, coasting):
+        nonlocal seen_calls
+        seen_calls += 1
+        if seen_calls == 3:
+            raise RuntimeError("writer-boom")
+        return frame
+
+    monkeypatch.setattr(pipe_werr.anonymizer, "apply", failing_apply)
+    with pytest.raises(RuntimeError, match="writer-boom"):
+        pipe_werr.run(str(vid_path), output_dir=tmp_path / "run_werr", save_video=True, exports=())
+
+    # 3. Exception raised inside the background frame reader thread propagates cleanly.
+    img_dir = tmp_path / "bad_frames"
+    img_dir.mkdir()
+    cv2.imwrite(str(img_dir / "0.png"), np.zeros((64, 64, 3), dtype=np.uint8))
+    cv2.imwrite(str(img_dir / "1.png"), np.zeros((64, 64, 3), dtype=np.uint8))
+    cv2.imwrite(str(img_dir / "2.png"), np.zeros((80, 64, 3), dtype=np.uint8))  # wrong height
+    pipe_rerr = TrackflowPipeline(model="synthetic", detector=_SyntheticMotionDetector())
+    with pytest.raises(ValueError, match="Expected a readable 64x64 image"):
+        pipe_rerr.run(str(img_dir), output_dir=tmp_path / "run_rerr", save_video=False, exports=())

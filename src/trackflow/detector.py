@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import json
+import os
 import platform
 from collections.abc import Sequence
 from pathlib import Path
@@ -162,6 +165,34 @@ def select_providers(device: str = "auto") -> list[str]:
     return selected or ["CPUExecutionProvider"]
 
 
+def _apple_p_cores() -> int | None:
+    """Return Apple Silicon's performance-core count via sysctlbyname, or None elsewhere."""
+    if platform.system() != "Darwin":
+        return None
+    try:
+        libc = ctypes.CDLL(None)
+        val = ctypes.c_int(0)
+        size = ctypes.c_size_t(ctypes.sizeof(val))
+        rc = libc.sysctlbyname(
+            b"hw.perflevel0.physicalcpu", ctypes.byref(val), ctypes.byref(size), None, 0
+        )
+        return val.value if rc == 0 and val.value > 0 else None
+    except Exception:
+        return None
+
+
+def _default_onnx_threads() -> int:
+    """Pick ORT intra-op threads: honor OMP_NUM_THREADS, else pin Apple Silicon to P-cores."""
+    env = os.environ.get("OMP_NUM_THREADS", "").strip()
+    if env:
+        with contextlib.suppress(ValueError):
+            if (n := int(env)) > 0:
+                return n
+    # On Apple Silicon, ORT defaults to hw.physicalcpu (P + E cores), so slow E-cores stall
+    # thread barriers. Pinning to P-cores speeds up CPU DETR models by ~17-27%.
+    return _apple_p_cores() or 0
+
+
 def create_onnx_session(
     onnx_path: Path,
     device: str = "auto",
@@ -181,6 +212,8 @@ def create_onnx_session(
     ]
     sess_opts = ort.SessionOptions()
     sess_opts.graph_optimization_level = optimization
+    sess_opts.intra_op_num_threads = _default_onnx_threads()
+    sess_opts.inter_op_num_threads = 1
 
     try:
         session = ort.InferenceSession(
