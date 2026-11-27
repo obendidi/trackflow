@@ -314,7 +314,7 @@ def test_cuda_and_tensorrt_provider_options_and_actionable_errors(
 
     # 3. Silent TRT->CUDA fallback when device='tensorrt' fails loudly with actionable install hint.
     seen["force_active"] = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    with pytest.raises(RuntimeError, match="tensorrt-cu13-libs"):
+    with pytest.raises(RuntimeError, match="trackflow-python-tensorrt"):
         detector_module.create_onnx_session(model_path, device="tensorrt", cache_dir=tmp_path)
     seen.pop("force_active", None)
 
@@ -322,7 +322,7 @@ def test_cuda_and_tensorrt_provider_options_and_actionable_errors(
     monkeypatch.setattr(
         detector_module.ort, "get_available_providers", lambda: ["CPUExecutionProvider"]
     )
-    with pytest.raises(ValueError, match="onnxruntime-gpu"):
+    with pytest.raises(ValueError, match="trackflow-python-cuda"):
         detector_module.select_providers("cuda")
-    with pytest.raises(ValueError, match="tensorrt-cu13-libs"):
+    with pytest.raises(ValueError, match="trackflow-python-tensorrt"):
         detector_module.select_providers("tensorrt")

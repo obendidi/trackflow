@@ -19,12 +19,12 @@ Try it in the browser without installing anything: [obendidi.github.io/trackflow
 
 One command for your hardware — no system CUDA Toolkit, cuDNN, or TensorRT setup required:
 
-| Environment | Install & run | Notes |
-| :--- | :--- | :--- |
-| **CPU / macOS** *(default)* | `uvx trackflow-python run street.mp4` *(or `pip install trackflow-python`)* | Auto-pins Apple Silicon to P-cores (~14 FPS on M4 Pro CPU) |
-| **macOS GPU (CoreML)** | `uvx trackflow-python run street.mp4 --device coreml` | Runs detector + static-batch OSNet Re-ID on Apple GPU |
-| **NVIDIA CUDA** | `pip install trackflow-python && pip uninstall -y onnxruntime && pip install "onnxruntime-gpu[cuda,cudnn]>=1.22"` then `trackflow run street.mp4` | Bundles CUDA + cuDNN; auto-selects CUDA (~37–105 FPS on T4) |
-| **NVIDIA TensorRT** *(Py 3.11+)* | `pip install trackflow-python && pip uninstall -y onnxruntime && pip install "onnxruntime-gpu[cuda,cudnn]>=1.28" "tensorrt-cu13-libs>=10,<11"` then `trackflow run street.mp4 --device tensorrt` | Bundles CUDA 13 + TensorRT 10 FP16; cached engines (~94–136 FPS on T4) |
+| Environment | Zero-install (`uvx`) | Installed (`pip`) | Notes |
+| :--- | :--- | :--- | :--- |
+| **CPU / macOS** *(default)* | `uvx trackflow-python run street.mp4` | `pip install trackflow-python` | Auto-pins Apple Silicon to P-cores (~14 FPS on M4 Pro CPU) |
+| **macOS GPU (CoreML)** | `uvx trackflow-python run street.mp4 --device coreml` | `pip install trackflow-python` | Runs detector + static-batch OSNet Re-ID on Apple GPU |
+| **NVIDIA CUDA** | `uvx trackflow-python-cuda run street.mp4` | `pip install trackflow-python-cuda` | Bundles CUDA + cuDNN; auto-selects CUDA (~37–105 FPS on T4) |
+| **NVIDIA TensorRT** *(Py 3.11+)* | `uvx trackflow-python-tensorrt run street.mp4` | `pip install trackflow-python-tensorrt` | Bundles CUDA 13 + TensorRT 10 FP16; cached engines (~94–136 FPS on T4) |
 
 Or run via Docker with zero Python setup (`--target cpu`, `cuda`, or `tensorrt` in [Dockerfile](Dockerfile)):
 

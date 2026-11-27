@@ -14,14 +14,11 @@ Run without installing via `uvx`, or install once with `pip`/`uv` (never keep bo
 ```bash
 uvx trackflow-python run street.mp4                  # CPU / macOS (auto-pins Apple P-cores)
 uvx trackflow-python run street.mp4 --device coreml  # macOS Apple Silicon GPU
-
-# NVIDIA CUDA (bundles CUDA + cuDNN, zero system CUDA setup)
-pip install trackflow-python && pip uninstall -y onnxruntime && pip install "onnxruntime-gpu[cuda,cudnn]>=1.22"
+uvx trackflow-python-cuda run street.mp4             # NVIDIA CUDA (bundled CUDA + cuDNN)
+uvx trackflow-python-tensorrt run street.mp4         # NVIDIA TensorRT FP16 (Py 3.11+, cached engines)
+# or
+pip install trackflow-python                         # or trackflow-python-cuda / trackflow-python-tensorrt
 trackflow run street.mp4
-
-# NVIDIA TensorRT FP16 (Python 3.11+, bundles CUDA 13 + TensorRT 10, cached engines)
-pip install trackflow-python && pip uninstall -y onnxruntime && pip install "onnxruntime-gpu[cuda,cudnn]>=1.28" "tensorrt-cu13-libs>=10,<11"
-trackflow run street.mp4 --device tensorrt
 trackflow inspect                                    # opens local web UI on the latest run
 ```
 

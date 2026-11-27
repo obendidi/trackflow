@@ -139,14 +139,12 @@ def _allowed_classes(classes: Sequence[str] | None) -> set[str] | None:
 
 
 _CUDA_INSTALL_HINT = (
-    "Install NVIDIA CUDA support in one command: "
-    "`pip uninstall -y onnxruntime && pip install 'onnxruntime-gpu[cuda,cudnn]>=1.22'` "
-    "(never keep both `onnxruntime` and `onnxruntime-gpu` in the same environment)."
+    "Run with NVIDIA CUDA support: `uvx trackflow-python-cuda run <video>` "
+    "(or `pip install trackflow-python-cuda` in a clean environment without CPU `onnxruntime`)."
 )
 _TRT_INSTALL_HINT = (
-    "Install NVIDIA TensorRT support in one command (Python 3.11+): "
-    "`pip uninstall -y onnxruntime && pip install 'onnxruntime-gpu[cuda,cudnn]>=1.28' 'tensorrt-cu13-libs>=10,<11'` "
-    "(never keep both `onnxruntime` and `onnxruntime-gpu` in the same environment)."
+    "Run with NVIDIA TensorRT support (Python 3.11+): `uvx trackflow-python-tensorrt run <video>` "
+    "(or `pip install trackflow-python-tensorrt` in a clean environment without CPU `onnxruntime`)."
 )
 
 
