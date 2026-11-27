@@ -9,6 +9,11 @@ from trackflow.lines import CountingLine
 from trackflow.models import MODEL_REGISTRY, REID_REGISTRY, VLM_REGISTRY, ModelSpec
 from trackflow.ocsort import OcSortTracker
 from trackflow.pipeline import TrackflowPipeline
+from trackflow.postprocess import (
+    PostprocessResult,
+    postprocess_records,
+    postprocess_tracks_array,
+)
 from trackflow.privacy import PrivacyAnonymizer
 from trackflow.reid import ReidEmbedder, TrackCardIndex, VlmEmbedder
 from trackflow.tracker import (
@@ -45,6 +50,7 @@ __all__ = [
     "ModelSpec",
     "OcSortTracker",
     "OnnxDetrDetector",
+    "PostprocessResult",
     "PrivacyAnonymizer",
     "REID_REGISTRY",
     "ReidEmbedder",
@@ -59,4 +65,6 @@ __all__ = [
     "VlmEmbedder",
     "create_detector",
     "create_tracker",
+    "postprocess_records",
+    "postprocess_tracks_array",
 ]

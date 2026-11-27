@@ -148,6 +148,7 @@ class BoostTracker(_SortStyleTracker):
     def reset(self) -> None:
         super().reset()
         self._cmc = SparseOpticalFlowCMC() if self.use_cmc else None
+        self.last_cmc_warp: np.ndarray | None = None
 
     def _predict(self) -> None:
         for tr in self._tracks:
@@ -300,9 +301,11 @@ class BoostTracker(_SortStyleTracker):
         """Advance the tracker by one frame and return the tracks reported on it."""
         self._frame_id += 1
         events: list[dict[str, Any]] = []
+        self.last_cmc_warp = None
         if self._cmc is not None and frame_bgr is not None:
             # Estimate on every frame (even with no tracks) so the reference frame never goes stale.
             warp = self._cmc.estimate(frame_bgr, _boxes(detections))
+            self.last_cmc_warp = warp
             if warp is not None:
                 for tr in self._tracks:
                     tr.motion.apply_camera_warp(warp)

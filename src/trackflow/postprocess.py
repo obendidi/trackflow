@@ -9,7 +9,9 @@ image-space smoothing of box jitter.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
@@ -1404,7 +1406,124 @@ def _smooth_tracks(
     return res
 
 
-def postprocess_tracks_array(
+@dataclass(slots=True)
+class PostprocessResult:
+    """Output and diagnostics of :func:`postprocess_records`."""
+
+    records: list[dict[str, Any]]
+    source_row_indices: np.ndarray  # int64 (M,): index into input records, or -1 if interpolated
+    unique_tracks_before: int
+    unique_tracks_after: int
+    interpolated_rows: int
+    merges: int
+    splits: int
+    elapsed_ms: float
+
+
+def _cross_exit_reid_merge(
+    tracklets: list[_Tracklet],
+    frames: np.ndarray,
+    boxes: np.ndarray,
+    confs: np.ndarray,
+    max_ioa: np.ndarray,
+    max_iou: np.ndarray,
+    W: np.ndarray,
+    W_inv: np.ndarray,
+    use_cmc: bool,
+    embeddings: np.ndarray | None,
+    emb_valid: np.ndarray | None,
+    *,
+    min_exit_gap_frames: int = 8,
+    min_samples: int = 3,
+    threshold: float = 0.80,
+    margin: float = 0.05,
+) -> tuple[list[_Tracklet], int]:
+    """Opt-in global cross-exit appearance merge (unifies ``--reid-merge`` with ``--postprocess``).
+
+    Links non-overlapping same-class tracklets separated by at least ``min_exit_gap_frames``
+    when both have at least ``min_samples`` embeddings, cosine similarity clears ``threshold``,
+    and the best match beats every competing non-overlapping candidate on both ends by ``margin``.
+    """
+    if embeddings is None or emb_valid is None or len(tracklets) < 2:
+        return tracklets, 0
+
+    eligible = [
+        i for i, t in enumerate(tracklets) if t.emb_full is not None and t.n_emb >= min_samples
+    ]
+    if len(eligible) < 2:
+        return tracklets, 0
+
+    # Score all temporally valid (end_i + gap <= start_j) same-class pairs.
+    pair_sims: list[tuple[float, int, int]] = []
+    out_sims: dict[int, list[tuple[float, int]]] = {}
+    in_sims: dict[int, list[tuple[float, int]]] = {}
+    for a_pos, i in enumerate(eligible):
+        ti = tracklets[i]
+        assert ti.emb_full is not None
+        for j in eligible[a_pos + 1 :]:
+            tj = tracklets[j]
+            assert tj.emb_full is not None
+            if ti.class_id != tj.class_id:
+                continue
+            if ti.end_frame + min_exit_gap_frames <= tj.start_frame:
+                u, v = i, j
+            elif tj.end_frame + min_exit_gap_frames <= ti.start_frame:
+                u, v = j, i
+            else:
+                continue
+            sim = float(np.dot(ti.emb_full, tj.emb_full))
+            out_sims.setdefault(u, []).append((sim, v))
+            in_sims.setdefault(v, []).append((sim, u))
+            if sim >= threshold:
+                pair_sims.append((sim, u, v))
+
+    if not pair_sims:
+        return tracklets, 0
+
+    # Require strict margin over runner-up on both source and destination.
+    for lst in out_sims.values():
+        lst.sort(reverse=True)
+    for lst in in_sims.values():
+        lst.sort(reverse=True)
+
+    pair_sims.sort(reverse=True)
+    links: dict[int, int] = {}
+    used_dst: set[int] = set()
+    for sim, u, v in pair_sims:
+        if u in links or v in used_dst:
+            continue
+        o_list = out_sims[u]
+        i_list = in_sims[v]
+        o_runner = o_list[1][0] if len(o_list) > 1 else -1.0
+        i_runner = i_list[1][0] if len(i_list) > 1 else -1.0
+        if o_list[0][1] != v or i_list[0][1] != u:
+            continue
+        if sim - o_runner < margin or sim - i_runner < margin:
+            continue
+        links[u] = v
+        used_dst.add(v)
+
+    if not links:
+        return tracklets, 0
+
+    merged = _merge_chains(
+        tracklets,
+        links,
+        frames,
+        boxes,
+        confs,
+        max_ioa,
+        max_iou,
+        W,
+        W_inv,
+        use_cmc,
+        embeddings,
+        emb_valid,
+    )
+    return merged, len(links)
+
+
+def _postprocess_tracks_core(
     rows: np.ndarray,
     *,
     fps: float = 30.0,
@@ -1416,15 +1535,23 @@ def postprocess_tracks_array(
     cmc_valid: np.ndarray | None = None,
     class_ids: np.ndarray | None = None,
     frame_stride: int = 1,
-) -> np.ndarray:
-    """Offline post-processing: suspect-transition splitting + global CMC/Re-ID re-stitching.
-
-    `rows` has shape (N, 7) float64: [frame_idx (0-based), track_id, x1, y1, x2, y2, conf].
-    Returns float64 array of shape (M, 7) with valid boxes and unique (frame_idx, track_id).
-    """
+    allow_long_reid_merge: bool = False,
+    min_exit_gap_frames: int = 8,
+) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
+    """Core post-processing engine returning ``(out_rows, source_row_indices, stats)``."""
     arr = np.asarray(rows, dtype=np.float64).reshape(-1, 7)
     if len(arr) == 0:
-        return arr.copy()
+        return (
+            arr.copy(),
+            np.zeros((0,), dtype=np.int64),
+            {
+                "unique_tracks_before": 0,
+                "unique_tracks_after": 0,
+                "interpolated_rows": 0,
+                "merges": 0,
+                "splits": 0,
+            },
+        )
 
     frames = np.rint(arr[:, 0]).astype(np.int64)
     tids = np.rint(arr[:, 1]).astype(np.int64)
@@ -1448,6 +1575,7 @@ def postprocess_tracks_array(
         int(tid): order[s : s + c]
         for tid, s, c in zip(u_tids, t_starts, t_counts, strict=True)
     }
+    unique_before = len(raw_tracks)
 
     reid_trust, mu_same, _p50_diff, p70_diff = _calibrate_reid(
         raw_tracks, frames, confs, max_ioa, embeddings, emb_valid
@@ -1490,6 +1618,7 @@ def postprocess_tracks_array(
         embeddings,
         emb_valid,
     )
+    n_splits = sum(len(v) for v in split_points.values())
 
     # A cut may have coalesced with another split. Rewire only intact
     # crossing pairs, resolving simultaneous proposals by their cost margin.
@@ -1544,6 +1673,7 @@ def postprocess_tracks_array(
     p2_max_cost = 0.54 + 0.28 * reid_trust
     # With trusted Re-ID, commit medium-range links before the long-range pass.
     horizons = [2.5, long_gap_s] if reid_trust >= 0.50 else [long_gap_s]
+    n_long_merges = 0
     for horizon_s in horizons:
         long_gap = max(75, int(round(horizon_s * fps)))
         links_p2 = _stitch_pass(
@@ -1563,6 +1693,7 @@ def postprocess_tracks_array(
         )
         if not links_p2:
             break
+        n_long_merges += len(links_p2)
         tracklets = _merge_chains(
             tracklets,
             links_p2,
@@ -1578,6 +1709,24 @@ def postprocess_tracks_array(
             emb_valid,
         )
 
+    # Optional cross-exit Re-ID merge pass (when user passes both --postprocess and --reid-merge)
+    if allow_long_reid_merge:
+        tracklets, n_reentry = _cross_exit_reid_merge(
+            tracklets,
+            frames,
+            boxes,
+            confs,
+            max_ioa,
+            max_iou,
+            W,
+            W_inv,
+            use_cmc,
+            embeddings,
+            emb_valid,
+            min_exit_gap_frames=min_exit_gap_frames,
+        )
+        n_long_merges += n_reentry
+
     # Reconstruct output rows with clean contiguous 1-based track IDs
     tracklets.sort(key=lambda t: (t.start_frame, t.raw_id, t.part_id))
     out = arr.copy()
@@ -1585,6 +1734,7 @@ def postprocess_tracks_array(
     for assigned_id, t in enumerate(tracklets, start=1):
         new_tid[t.row_indices] = assigned_id
     out[:, 1] = new_tid.astype(np.float64)
+    src_idx = np.arange(len(arr), dtype=np.int64)
 
     # Stage 3: Strictly gated short-gap CMC interpolation
     interp_rows = _gated_cmc_interpolate(
@@ -1602,16 +1752,201 @@ def postprocess_tracks_array(
         mu_same=mu_same,
         p70_diff=p70_diff,
     )
+    n_interp = len(interp_rows)
     is_interp = np.zeros(len(out), dtype=bool)
-    if len(interp_rows) > 0:
+    if n_interp > 0:
         out = np.vstack((out, interp_rows))
-        is_interp = np.concatenate((is_interp, np.ones(len(interp_rows), dtype=bool)))
+        is_interp = np.concatenate((is_interp, np.ones(n_interp, dtype=bool)))
+        src_idx = np.concatenate((src_idx, np.full(n_interp, -1, dtype=np.int64)))
 
     # Stage 4: Motion- and curvature-adaptive image-space smoothing
     out = _smooth_tracks(out, fps, frame_stride, is_interp=is_interp)
 
     out_order = np.lexsort((out[:, 1], out[:, 0]))
-    return out[out_order]
+    # Count raw-ID merges realized in the final tracklets (distinct raw IDs folded into one track)
+    raw_merges = sum(
+        max(0, len({int(tids[i]) for i in t.row_indices.tolist()}) - 1) for t in tracklets
+    )
+    stats = {
+        "unique_tracks_before": unique_before,
+        "unique_tracks_after": len(tracklets),
+        "interpolated_rows": n_interp,
+        "merges": max(raw_merges, n_long_merges),
+        "splits": n_splits,
+    }
+    return out[out_order], src_idx[out_order], stats
 
 
-__all__ = ["postprocess_tracks_array"]
+def postprocess_tracks_array(
+    rows: np.ndarray,
+    *,
+    fps: float = 30.0,
+    frame_width: int | None = None,
+    frame_height: int | None = None,
+    embeddings: np.ndarray | None = None,
+    emb_valid: np.ndarray | None = None,
+    cmc_warps: np.ndarray | None = None,
+    cmc_valid: np.ndarray | None = None,
+    class_ids: np.ndarray | None = None,
+    frame_stride: int = 1,
+) -> np.ndarray:
+    """Offline post-processing: suspect-transition splitting + global CMC/Re-ID re-stitching.
+
+    `rows` has shape (N, 7) float64: [frame_idx (0-based), track_id, x1, y1, x2, y2, conf].
+    Returns float64 array of shape (M, 7) with valid boxes and unique (frame_idx, track_id).
+    """
+    out, _, _ = _postprocess_tracks_core(
+        rows,
+        fps=fps,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        embeddings=embeddings,
+        emb_valid=emb_valid,
+        cmc_warps=cmc_warps,
+        cmc_valid=cmc_valid,
+        class_ids=class_ids,
+        frame_stride=frame_stride,
+    )
+    return out
+
+
+def postprocess_records(
+    records: list[dict[str, Any]],
+    *,
+    fps: float = 30.0,
+    frame_width: int | None = None,
+    frame_height: int | None = None,
+    embeddings: np.ndarray | None = None,
+    emb_valid: np.ndarray | None = None,
+    cmc_warps: np.ndarray | None = None,
+    cmc_valid: np.ndarray | None = None,
+    frame_stride: int = 1,
+    allow_long_reid_merge: bool = False,
+    min_exit_gap_frames: int = 8,
+) -> PostprocessResult:
+    """Post-process a list of Trackflow observation records (matching ``PARQUET_SCHEMA``).
+
+    Preserves multi-class isolation, ``frame_stride``, and exact source-row provenance while
+    recomputing bounding box dimensions, track ages/hits, and timestamps for interpolated rows.
+    """
+    t0 = time.perf_counter()
+    if not records:
+        return PostprocessResult(
+            records=[],
+            source_row_indices=np.zeros((0,), dtype=np.int64),
+            unique_tracks_before=0,
+            unique_tracks_after=0,
+            interpolated_rows=0,
+            merges=0,
+            splits=0,
+            elapsed_ms=0.0,
+        )
+
+    n = len(records)
+    rows = np.empty((n, 7), dtype=np.float64)
+    class_ids = np.empty(n, dtype=np.int64)
+    class_name_by_id: dict[int, str] = {}
+    for i, r in enumerate(records):
+        rows[i, 0] = float(r["frame_idx"])
+        rows[i, 1] = float(r["track_id"])
+        rows[i, 2] = float(r["x1"])
+        rows[i, 3] = float(r["y1"])
+        rows[i, 4] = float(r["x2"])
+        rows[i, 5] = float(r["y2"])
+        rows[i, 6] = float(r["confidence"])
+        cid = int(r["class_id"])
+        class_ids[i] = cid
+        class_name_by_id.setdefault(cid, str(r["class_name"]))
+
+    out_rows, src_idx, stats = _postprocess_tracks_core(
+        rows,
+        fps=fps,
+        frame_width=frame_width,
+        frame_height=frame_height,
+        embeddings=embeddings,
+        emb_valid=emb_valid,
+        cmc_warps=cmc_warps,
+        cmc_valid=cmc_valid,
+        class_ids=class_ids,
+        frame_stride=frame_stride,
+        allow_long_reid_merge=allow_long_reid_merge,
+        min_exit_gap_frames=min_exit_gap_frames,
+    )
+
+    # Determine each finalized track's class from its observed source rows
+    tid_class: dict[int, tuple[int, str]] = {}
+    for r_row, si in zip(out_rows, src_idx.tolist(), strict=True):
+        if si >= 0:
+            tid = int(round(r_row[1]))
+            if tid not in tid_class:
+                orig = records[si]
+                tid_class[tid] = (int(orig["class_id"]), str(orig["class_name"]))
+
+    fps_safe = max(float(fps), 1e-6)
+    stride = max(1, int(frame_stride))
+    first_frame_by_tid: dict[int, int] = {}
+    hits_by_tid: dict[int, int] = {}
+    out_records: list[dict[str, Any]] = []
+
+    for r_row, si in zip(out_rows, src_idx.tolist(), strict=True):
+        f_idx = int(round(r_row[0]))
+        tid = int(round(r_row[1]))
+        x1, y1, x2, y2 = float(r_row[2]), float(r_row[3]), float(r_row[4]), float(r_row[5])
+        conf = float(r_row[6])
+        first_f = first_frame_by_tid.setdefault(tid, f_idx)
+        age = max(1, (f_idx - first_f) // stride + 1)
+        if si >= 0:
+            hits_by_tid[tid] = hits_by_tid.get(tid, 0) + 1
+            orig = records[si]
+            cid, cname = int(orig["class_id"]), str(orig["class_name"])
+            ts = float(orig["timestamp_s"])
+            recovered = bool(orig.get("recovered", False))
+            q_score = orig.get("query_score")
+            q_match = bool(orig.get("query_match", True))
+        else:
+            hits_by_tid.setdefault(tid, 1)
+            cid, cname = tid_class.get(tid, (0, class_name_by_id.get(0, "object")))
+            ts = round(f_idx / fps_safe, 4)
+            recovered = False
+            q_score = None
+            q_match = True
+
+        out_records.append(
+            {
+                "frame_idx": f_idx,
+                "timestamp_s": round(ts, 4),
+                "track_id": tid,
+                "class_id": cid,
+                "class_name": cname,
+                "confidence": round(conf, 4),
+                "x1": round(x1, 2),
+                "y1": round(y1, 2),
+                "x2": round(x2, 2),
+                "y2": round(y2, 2),
+                "width": round(max(0.0, x2 - x1), 2),
+                "height": round(max(0.0, y2 - y1), 2),
+                "age": int(age),
+                "hits": int(hits_by_tid[tid]),
+                "recovered": recovered,
+                "query_score": q_score,
+                "query_match": q_match,
+                "world_x": None,
+                "world_y": None,
+                "zone": None,
+            }
+        )
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    return PostprocessResult(
+        records=out_records,
+        source_row_indices=src_idx,
+        unique_tracks_before=stats["unique_tracks_before"],
+        unique_tracks_after=stats["unique_tracks_after"],
+        interpolated_rows=stats["interpolated_rows"],
+        merges=stats["merges"],
+        splits=stats["splits"],
+        elapsed_ms=elapsed_ms,
+    )
+
+
+__all__ = ["PostprocessResult", "postprocess_records", "postprocess_tracks_array"]

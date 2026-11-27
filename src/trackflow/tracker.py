@@ -846,12 +846,14 @@ class BotSortTracker(ByteTracker):
         self.proximity_thresh = float(proximity_thresh)
         self.appearance_thresh = float(appearance_thresh)
         self._cmc = SparseOpticalFlowCMC(drop_foreground_flow=False) if use_cmc else None
+        self.last_cmc_warp: np.ndarray | None = None
         self._frame_boxes = np.zeros((0, 4), dtype=np.float64)
         # Appearance is fused into the first association, which only sees high-score detections.
         self.embedding_min_confidence = self.track_high_thresh
 
     def reset(self) -> None:
         super().reset()
+        self.last_cmc_warp = None
         if self.use_cmc:
             self._cmc = SparseOpticalFlowCMC(drop_foreground_flow=False)
 
@@ -892,10 +894,12 @@ class BotSortTracker(ByteTracker):
         tr.update_embedding(det.embedding)
 
     def _apply_cmc(self, frame_bgr: np.ndarray | None) -> None:
+        self.last_cmc_warp = None
         if self._cmc is None or frame_bgr is None:
             return
         # Estimate on every frame (even with no tracks) so the reference frame never goes stale.
         warp = self._cmc.estimate(frame_bgr, self._frame_boxes)
+        self.last_cmc_warp = warp
         if warp is None:
             return
         for tr in self._tracks:
