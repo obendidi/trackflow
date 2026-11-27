@@ -264,7 +264,7 @@ To use your own model, pass any object with a `detect(frame_bgr) -> list[Detecti
 
 ## Agent skills
 
-Use Trackflow — and its ONNX computer-vision deployment checklist — from Claude Code, Codex, Antigravity, Cursor, or OpenCode by installing the bundled skills:
+Use Trackflow — and its ONNX computer-vision deployment checklist — from Claude Code, Codex, Antigravity, Cursor, or OpenCode by installing the bundled skills (or point doc-fetchers at [`llms.txt`](https://obendidi.github.io/trackflow/llms.txt)):
 
 - [`trackflow`](skills/trackflow/SKILL.md): run local tracking, line counting, text search, floorplan projection, anonymization, and exports.
 - [`onnx-vision-deploy`](skills/onnx-vision-deploy/SKILL.md): empirical checklist for ONNX vision deployment across CPU, CUDA, Apple Silicon CoreML, and browser WebGPU/WASM parity.

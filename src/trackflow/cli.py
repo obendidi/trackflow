@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import onnxruntime as ort
 import typer
@@ -276,12 +276,22 @@ def search(
             help="Seconds of context to pad before/after each hit window in --export-prompts.",
         ),
     ] = 0.0,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print search results as JSON.")
+    ] = False,
 ) -> None:
     """Search saved Track Cards in a completed run using natural language."""
     with _user_errors():
         hits = search_track_cards(run_dir, query, top_k=top_k, min_score=min_score)
+        out_path: Path | None = None
         if export_prompts is not None:
             out_path = export_search_prompts(run_dir, query, hits, export_prompts, pad_s=pad_s)
+    if as_json:
+        payload: dict[str, Any] = {"query": query, "results": hits}
+        if out_path is not None:
+            payload["exported_prompts"] = str(out_path)
+        typer.echo(json.dumps(payload, indent=2))
+        return
     table = Table(title=f'Track Card Search: "{query}"')
     table.add_column("Track ID", style="bold cyan")
     table.add_column("Score", justify="right", style="bold green")
@@ -543,14 +553,33 @@ def models(
 
 
 @app.command()
-def info() -> None:
+def info(
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print environment details as JSON.")
+    ] = False,
+) -> None:
     """Display system environment, Python version, and ONNX Runtime acceleration providers."""
+    providers = ort.get_available_providers()
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "version": __version__,
+                    "python": platform.python_version(),
+                    "platform": f"{platform.system()} {platform.machine()}",
+                    "onnxruntime": ort.__version__,
+                    "available_providers": providers,
+                },
+                indent=2,
+            )
+        )
+        return
     table = Table(title="Trackflow Environment Info", show_header=False)
     table.add_row("Trackflow Version", f"[bold cyan]{__version__}[/]")
     table.add_row("Python", platform.python_version())
     table.add_row("Platform", f"{platform.system()} {platform.machine()}")
     table.add_row("ONNX Runtime", ort.__version__)
-    table.add_row("Available EPs", ", ".join(ort.get_available_providers()))
+    table.add_row("Available EPs", ", ".join(providers))
     console.print(table)
 
 

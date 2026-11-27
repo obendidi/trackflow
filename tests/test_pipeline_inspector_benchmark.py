@@ -318,3 +318,35 @@ def test_inspector_serves_source_frames_and_respects_anonymization(tmp_path: Pat
         server.shutdown()
         server.server_close()
         handler.frame_store.close()
+
+
+def test_agent_cli_json_and_llms_txt(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+
+    info_res = runner.invoke(app, ["info", "--json"])
+    assert info_res.exit_code == 0, info_res.output
+    info_data = json.loads(info_res.output)
+    assert {"version", "python", "platform", "onnxruntime", "available_providers"} <= set(info_data)
+    assert isinstance(info_data["available_providers"], list)
+
+    fake_hits = [
+        {
+            "track_id": 1,
+            "class_name": "person",
+            "first_frame": 0,
+            "last_frame": 20,
+            "duration_s": 0.8,
+            "search_score": 0.312,
+            "thumbnail": "crops/track_1.jpg",
+        }
+    ]
+    monkeypatch.setattr("trackflow.cli.search_track_cards", lambda *_a, **_kw: fake_hits)
+    search_res = runner.invoke(app, ["search", str(tmp_path), "person in white shirt", "--json"])
+    assert search_res.exit_code == 0, search_res.output
+    search_data = json.loads(search_res.output)
+    assert search_data == {"query": "person in white shirt", "results": fake_hits}
+
+    repo_root = Path(__file__).resolve().parent.parent
+    llms_txt = repo_root / "web" / "llms.txt"
+    assert llms_txt.is_file() and "trackflow-python" in llms_txt.read_text(encoding="utf-8")
+    assert 'href="llms.txt"' in (repo_root / "web" / "index.html").read_text(encoding="utf-8")

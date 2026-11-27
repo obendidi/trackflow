@@ -27,6 +27,13 @@ keywords = [
   "d-fine",
   "onnxruntime",
   "computer-vision",
+  "video-tracking",
+  "re-identification",
+  "homography",
+  "parquet",
+  "webgpu",
+  "clip",
+  "siglip",
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
