@@ -438,6 +438,7 @@ def _detect_split_points(
     reid_trust: float,
     mu_same: float,
     p70_diff: float,
+    crossing_swaps: list[tuple[float, int, int]],
     frame_stride: int,
     fps: float,
 ) -> dict[int, list[tuple[int, float, bool]]]:
@@ -581,10 +582,49 @@ def _detect_split_points(
                 and sb0 < ts - 2
                 and sb1 > te + 2
             ):
+                # Compare the two possible continuations using motion on either
+                # side of the overlap. Both fits use the peak's camera coordinates.
+                sides = []
+                for ids, fs in ((ia, fa), (ib, fb)):
+                    pre = ids[np.searchsorted(fs, ts - 12 * stride):np.searchsorted(fs, ts)]
+                    post = ids[np.searchsorted(fs, te + 1):np.searchsorted(fs, te + 1 + 12 * stride)]
+                    sides.append((pre[max_iou[pre] < 0.2], post[max_iou[post] < 0.2]))
+                if min(len(ids) for pair in sides for ids in pair) < 4:
+                    continue
+                states = []
+                for pair in sides:
+                    track_states = []
+                    for end, ids in zip((True, False), pair, strict=True):
+                        pos, vel, h, _ = _fit_edge_state(
+                            frames[ids], boxes[ids], max_ioa[ids], W, W_inv, use_cmc,
+                            peak_fr, from_end=end,
+                        )
+                        edge = frames[ids[-1 if end else 0]]
+                        emb, _ = _clean_prototype(ids, confs[ids], max_ioa[ids], embeddings, emb_valid)
+                        track_states.append((pos, vel, h, edge, emb))
+                    states.append(track_states)
+
+                costs = np.empty((2, 2))
+                for a in range(2):
+                    p0, v0, h0, f0, e0 = states[a][0]
+                    for b in range(2):
+                        p1, v1, h1, f1, e1 = states[b][1]
+                        gap = f1 - f0
+                        delta = p1 - p0
+                        h = 0.5 * (h0 + h1)
+                        costs[a, b] = (
+                            np.linalg.norm(delta - gap * v0) + np.linalg.norm(delta - gap * v1)
+                        ) / (2 * h)
+                        if e0 is not None and e1 is not None:
+                            costs[a, b] += reid_trust * (1 - e0 @ e1) / sep_tail
+                gain = min(costs[0, 0] - costs[0, 1], costs[1, 1] - costs[1, 0])
+                if gain <= 0.08 or max(costs[0, 1], costs[1, 0]) > 1.2:
+                    continue
                 ka = int(np.searchsorted(fa, peak_fr, side="right"))
                 kb = int(np.searchsorted(fb, peak_fr, side="right"))
                 _add_split(ta, ka, b_cross, True, la, min_side=4)
                 _add_split(tb, kb, b_cross, True, lb, min_side=4)
+                crossing_swaps.append((gain, int(ia[ka - 1]), int(ib[kb - 1])))
 
     # --- Trigger D: Strong calibrated appearance shift across an overlap region ---
     if reid_trust >= 0.50 and embeddings is not None and emb_valid is not None:
@@ -1249,6 +1289,7 @@ def postprocess_tracks_array(
     )
 
     # Stage 1: Suspect-transition track splitting
+    crossing_swaps: list[tuple[float, int, int]] = []
     split_points = _detect_split_points(
         raw_tracks,
         frames,
@@ -1265,6 +1306,7 @@ def postprocess_tracks_array(
         reid_trust,
         mu_same,
         p70_diff,
+        crossing_swaps,
         frame_stride=frame_stride,
         fps=fps,
     )
@@ -1283,6 +1325,21 @@ def postprocess_tracks_array(
         embeddings,
         emb_valid,
     )
+
+    # A cut may have coalesced with another split. Rewire only intact
+    # crossing pairs, resolving simultaneous proposals by their cost margin.
+    tails = {int(t.row_indices[-1]): t for t in tracklets}
+    paired = set()
+    for _, ra, rb in sorted(crossing_swaps, reverse=True):
+        if ra not in tails or rb not in tails or ra in paired or rb in paired:
+            continue
+        a, b = tails[ra], tails[rb]
+        if a.class_id != b.class_id or min(a.next_sibling_idx, b.next_sibling_idx) < 0:
+            continue
+        a.next_sibling_idx, b.next_sibling_idx = b.next_sibling_idx, a.next_sibling_idx
+        a.next_sibling_bonus = b.next_sibling_bonus = 1.0
+        a.next_sibling_soft = b.next_sibling_soft = True
+        paired.update((ra, rb))
 
     # Stage 2, Pass 1 (Local Repair): resolve crossing swaps, Y/T-junction hijacks & restore soft splits
     p1_gap = max(20, int(round(0.9 * fps)))
