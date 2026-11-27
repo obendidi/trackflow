@@ -628,7 +628,9 @@ def _detect_split_points(
                     if app_dist >= 0.85 and cos_g < mu_same - 0.08:
                         app_drop = True
 
-            extreme_teleport = (d_bidir >= 0.85) and (d_ep >= 0.85)
+            # Clear kinematic breaks across a gap are switches; short gaps need a larger break.
+            d_break = min(d_bidir, d_ep)
+            extreme_teleport = d_break >= 0.85 or (d_break >= 0.5 and df >= 0.25 * fps)
             if app_drop or extreme_teleport:
                 _add_split(tid, k_val, 0.0, False, L, min_side=2)
             elif (d_bidir >= 0.30) or (d_ep >= 0.35 + 0.03 * df):
