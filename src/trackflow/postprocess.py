@@ -27,6 +27,16 @@ _INTERP_MAX_BIDIR = 1.0  # forward/backward extrapolation disagreement at midpoi
 _INTERP_MAX_HEIGHT_RATIO = 1.6
 _INTERP_MIN_COS = 0.5
 _INTERP_CONF_DECAY = 0.9
+# Stage 1 within-track appearance bisection: min clean observations per side, local window,
+# recursion depth, and required calibrated appearance distance (global and local contrast).
+_BIS_MIN = 15
+_BIS_WIN = 15
+_BIS_DEPTH = 2
+_BIS_GLOBAL = 0.85
+_BIS_LOCAL = 0.85
+# Stage 2 temporal prototypes: clean head/tail window length and blend weight in stitching.
+_HT_WIN = 30
+_HT_BLEND = 0.5
 # Stage 4 image-space smoothing: Gaussian sigma in seconds, max accepted shift in box heights.
 _SMOOTH_SIGMA_S = 1.0 / 30.0
 _SMOOTH_GATE = 0.15
@@ -59,6 +69,8 @@ class _Tracklet:
     n_end: int
     emb_full: np.ndarray | None = None
     n_emb: int = 0
+    emb_head: np.ndarray | None = None  # clean prototype of the first observations
+    emb_tail: np.ndarray | None = None  # clean prototype of the last observations
     # Continuity prior with the immediately following split sibling (if any)
     next_sibling_idx: int = -1
     next_sibling_bonus: float = 0.0
@@ -221,6 +233,28 @@ def _clean_prototype(
         w = np.clip(sel_conf, 0.2, 1.0) * np.square(1.0 - np.clip(sel_ioa, 0.0, 0.90))
     mean_v = np.sum(embs * w[:, None].astype(np.float32), axis=0)
     return _l2_norm_vec(mean_v), n_valid
+
+
+def _head_tail_prototypes(
+    row_indices: np.ndarray,
+    ioa: np.ndarray,
+    embeddings: np.ndarray | None,
+    emb_valid: np.ndarray | None,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Mean of the first and last `_HT_WIN` clean (unoccluded) embeddings of a tracklet."""
+    if embeddings is None or emb_valid is None or len(row_indices) == 0:
+        return None, None
+    v = emb_valid[row_indices]
+    clean = v & (ioa < 0.20)
+    sel = row_indices[clean] if int(clean.sum()) >= 3 else row_indices[v]
+    if len(sel) < 3:
+        return None, None
+    protos = []
+    for part in (sel[:_HT_WIN], sel[-_HT_WIN:]):
+        E = embeddings[part].astype(np.float32)
+        E /= np.maximum(np.linalg.norm(E, axis=1, keepdims=True), 1e-12)
+        protos.append(_l2_norm_vec(E.mean(axis=0)))
+    return protos[0], protos[1]
 
 
 def _calibrate_reid(
@@ -396,6 +430,7 @@ def _make_tracklet(
         seg_f, seg_b, seg_ioa, W, W_inv, use_cmc, f_end, from_end=True, win=12
     )
     emb, n_emb = _clean_prototype(seg_idxs, seg_c, seg_ioa, embeddings, emb_valid)
+    e_head, e_tail = _head_tail_prototypes(seg_idxs, seg_ioa, embeddings, emb_valid)
     return _Tracklet(
         idx=idx,
         raw_id=raw_id,
@@ -419,7 +454,69 @@ def _make_tracklet(
         n_end=n_e,
         emb_full=emb,
         n_emb=n_emb,
+        emb_head=e_head,
+        emb_tail=e_tail,
     )
+
+
+def _appearance_bisect(
+    idxs: np.ndarray,
+    max_ioa: np.ndarray,
+    max_iou: np.ndarray,
+    embeddings: np.ndarray,
+    emb_valid: np.ndarray,
+    mu_same: float,
+    sep_tail: float,
+) -> list[int]:
+    """Split points (observation positions in `idxs`) where clean appearance changes abruptly.
+
+    The clean (unoccluded) embeddings of a track are cut at the point that minimises the cosine
+    between the pre- and post-cut mean embeddings. A cut is kept when that global contrast and a
+    local window contrast around it are both far below the sequence's same-identity similarity;
+    each accepted side is bisected again up to `_BIS_DEPTH` levels.
+    """
+    clean = np.nonzero(emb_valid[idxs] & (max_ioa[idxs] < 0.20))[0]
+    m = _BIS_MIN
+    if len(clean) < 2 * m:
+        return []
+    E = embeddings[idxs[clean]].astype(np.float32)
+    E /= np.maximum(np.linalg.norm(E, axis=1, keepdims=True), 1e-12)
+    cuts: list[int] = []
+
+    def _rec(lo: int, hi: int, depth: int) -> None:
+        n = hi - lo
+        if depth >= _BIS_DEPTH or n < 2 * m:
+            return
+        c = np.arange(m - 1, n - m)
+        pre = np.cumsum(E[lo:hi], axis=0)[c].astype(np.float64)
+        total = E[lo:hi].sum(axis=0, dtype=np.float64)
+        pre_sq = np.einsum("ij,ij->i", pre, pre)
+        pre_tot = pre @ total
+        post_sq = np.maximum(float(total @ total) - 2.0 * pre_tot + pre_sq, 1e-12)
+        cos = (pre_tot - pre_sq) / np.sqrt(np.maximum(pre_sq, 1e-12) * post_sq)
+        b = int(np.argmin(cos))
+        if (mu_same - float(cos[b])) / sep_tail < _BIS_GLOBAL:
+            return
+        cut = lo + int(c[b]) + 1  # first clean position of the post side
+        w = _BIS_WIN
+        e_pre = E[max(lo, cut - w) : cut].mean(axis=0)
+        e_post = E[cut : min(hi, cut + w)].mean(axis=0)
+        cos_loc = float(e_pre @ e_post) / max(
+            float(np.linalg.norm(e_pre) * np.linalg.norm(e_post)), 1e-12
+        )
+        if (mu_same - cos_loc) / sep_tail < _BIS_LOCAL:
+            return
+        # Place the cut at the most overlapped observation between the two clean samples.
+        a = int(clean[cut - 1])
+        k = int(clean[cut])
+        if k > a + 1:
+            k = a + 2 + int(np.argmax(max_iou[idxs[a + 1 : k]]))
+        cuts.append(k)
+        _rec(lo, cut, depth + 1)
+        _rec(cut, hi, depth + 1)
+
+    _rec(0, len(clean), 0)
+    return cuts
 
 
 def _detect_split_points(
@@ -668,6 +765,14 @@ def _detect_split_points(
                         peak_k = r_s + int(np.argmax(ious[r_s : r_e + 1])) + 1
                         _add_split(tid, peak_k, 0.0, False, L, min_side=4)
 
+    # --- Trigger E: Within-track appearance bisection (undetected mid-track switches) ---
+    if reid_trust >= 0.50 and embeddings is not None and emb_valid is not None:
+        for tid, idxs in raw_tracks.items():
+            for k in _appearance_bisect(
+                idxs, max_ioa, max_iou, embeddings, emb_valid, mu_same, sep_tail
+            ):
+                _add_split(tid, k, 0.0, False, len(idxs), min_side=4)
+
     # Coalesce split points closer than 4 observations on the same track
     out: dict[int, list[tuple[int, float, bool]]] = {}
     for tid, kmap in splits.items():
@@ -864,6 +969,13 @@ def _stitch_pass(
             if t.emb_full is not None:
                 emb_mat[i] = t.emb_full
 
+        head_mat = np.zeros((n, emb_dim), dtype=np.float32)
+        tail_mat = np.zeros((n, emb_dim), dtype=np.float32)
+        for i, t in enumerate(tracklets):
+            if t.emb_head is not None:
+                head_mat[i] = t.emb_head
+                tail_mat[i] = t.emb_tail
+
     order_by_start = np.argsort(start_f, kind="mergesort")
     sorted_starts = start_f[order_by_start]
 
@@ -972,6 +1084,9 @@ def _stitch_pass(
             both_emb = has_emb[cand_j]
             if np.any(both_emb):
                 cos = (emb_mat[cand_j[both_emb]] @ emb_mat[i]).astype(np.float64)
+                # Credit a clean tail-of-i to head-of-j match that the full-track mean blurs.
+                cos_th = (head_mat[cand_j[both_emb]] @ tail_mat[i]).astype(np.float64)
+                cos += _HT_BLEND * np.maximum(cos_th - cos, 0.0)
                 app_dist = (mu_same - cos) / sep_tail
                 w_kin = 1.0 - 0.52 * reid_trust
                 w_app = 0.55 * reid_trust
@@ -1376,9 +1491,11 @@ def postprocess_tracks_array(
 
     # Stage 2, Pass 2 & 3 (Global Long-Range Stitching): operate on repaired full-length tracklets
     long_gap_s = 6.0 if reid_trust >= 0.50 else 3.2
-    long_gap = max(75, int(round(long_gap_s * fps)))
     p2_max_cost = 0.54 + 0.28 * reid_trust
-    for _ in range(2):
+    # With trusted Re-ID, commit medium-range links before the long-range pass.
+    horizons = [2.5, long_gap_s] if reid_trust >= 0.50 else [long_gap_s, long_gap_s]
+    for horizon_s in horizons:
+        long_gap = max(75, int(round(horizon_s * fps)))
         links_p2 = _stitch_pass(
             tracklets,
             W,
