@@ -77,6 +77,10 @@ dev = [
   "pytest>=8.0",
   "ruff>=0.6",
 ]
+docs = [
+  "mkdocs-material>=9.6",
+  "mkdocstrings[python]>=0.29",
+]
 
 [project.scripts]
 trackflow = "trackflow.cli:app"
@@ -84,6 +88,7 @@ trackflow-python = "trackflow.cli:app"
 
 [project.urls]
 Homepage = "https://obendidi.github.io/trackflow/"
+Documentation = "https://obendidi.github.io/trackflow/docs/"
 Repository = "https://github.com/obendidi/trackflow"
 Issues = "https://github.com/obendidi/trackflow/issues"
 

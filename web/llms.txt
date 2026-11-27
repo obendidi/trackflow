@@ -3,6 +3,7 @@
 > Apache-2.0 local people and object tracking toolkit (`trackflow-python`) for Python and the browser (WebGPU/WASM). Runs ONNX Runtime detectors (RT-DETRv2, RF-DETR, D-FINE, optional YOLO26/DEIMv2/`hf:` Transformers) with ByteTrack, BoT-SORT, OC-SORT, or BoostTrack++, exports DuckDB-ready Parquet/JSONL/CSV/MOTChallenge/HTML, supports natural-language Track Card search (CLIP, SigLIP, EmbeddingGemma 2), directional line counting, anonymization, and a local visual run inspector with 4-point floorplan homography.
 
 - GitHub: https://github.com/obendidi/trackflow
+- Documentation: https://obendidi.github.io/trackflow/docs/
 - PyPI: https://pypi.org/project/trackflow-python/
 - Browser Playground (WebGPU/WASM, local only): https://obendidi.github.io/trackflow/
 - Coding-agent skills (`npx skills add obendidi/trackflow`): https://skills.sh/obendidi/trackflow
