@@ -16,14 +16,16 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import linear_sum_assignment
 
 # Stage 3 gap interpolation gates.
-_INTERP_MAX_GAP_S = 20.0 / 30.0  # longest filled gap, seconds
+_INTERP_MAX_GAP_S = 20.0 / 30.0  # longest filled gap without strong Re-ID verification, seconds
+_INTERP_REID_MAX_GAP_S = 36.0 / 30.0  # extended gap when sequence-calibrated Re-ID confirms identity
 _INTERP_ENDPOINT_CONF = 0.25
 _INTERP_SUPPORT_CONF = 0.40  # mean confidence of the support observations on each side
 _INTERP_SUPPORT_WINDOW = 5
 _INTERP_MIN_SUPPORT = 3
 _INTERP_TRAVEL_BASE = 0.5  # camera-compensated centre travel, box heights
 _INTERP_TRAVEL_PER_FRAME = 0.08
-_INTERP_MAX_BIDIR = 1.0  # forward/backward extrapolation disagreement at midpoint, box heights
+_INTERP_MAX_BIDIR = 0.80  # forward/backward extrapolation disagreement at midpoint, box heights
+_INTERP_REID_EXT_BIDIR = 0.65  # tighter kinematic consistency required for extended Re-ID gaps
 _INTERP_MAX_HEIGHT_RATIO = 1.6
 _INTERP_MIN_COS = 0.5
 _INTERP_CONF_DECAY = 0.9
@@ -39,8 +41,12 @@ _HT_WIN = 30
 _HT_BLEND = 0.5
 # A trusted-Re-ID link must be within this cosine of the best candidate of its source and target.
 _MUTUAL_COS_TOL = 0.04
-# Stage 4 image-space smoothing: Gaussian sigma in seconds, max accepted shift in box heights.
-_SMOOTH_SIGMA_S = 1.0 / 30.0
+# Stage 4 image-space smoothing: adaptive two-scale Gaussian (seconds), max accepted shift (box heights).
+_SMOOTH_SIGMA_LO_S = 1.0 / 30.0
+_SMOOTH_SIGMA_HI_S = 4.2 / 30.0
+_SMOOTH_MIN_FPS = 6.0
+_SMOOTH_V_SCALE = 0.65  # max box-edge speed (box-heights/s) for strong smoothing
+_SMOOTH_D_SCALE = 0.0150  # 4-edge multi-scale discrepancy (box heights) for strong smoothing
 _SMOOTH_GATE = 0.15
 
 
@@ -1202,20 +1208,6 @@ def _side_velocity(frames: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return (t[:, None] * (pts - pts.mean(axis=0))).sum(axis=0) / denom
 
 
-def _mean_embedding(
-    embeddings: np.ndarray | None, emb_valid: np.ndarray | None, idx: np.ndarray
-) -> np.ndarray | None:
-    if embeddings is None:
-        return None
-    if emb_valid is not None:
-        idx = idx[emb_valid[idx]]
-    if len(idx) == 0:
-        return None
-    e = embeddings[idx].astype(np.float64)
-    e /= np.maximum(np.linalg.norm(e, axis=1, keepdims=True), 1e-12)
-    return _l2_norm_vec(e.mean(axis=0))
-
-
 def _gated_cmc_interpolate(
     tracklets: list[_Tracklet],
     W: np.ndarray,
@@ -1227,17 +1219,30 @@ def _gated_cmc_interpolate(
     frame_height: int | None,
     embeddings: np.ndarray | None,
     emb_valid: np.ndarray | None,
+    reid_trust: float = 0.0,
+    mu_same: float = 0.88,
+    p70_diff: float = 0.88,
 ) -> np.ndarray:
     """Fill short gaps whose both sides are well supported and kinematically consistent.
 
     A gap is filled when each side has at least `_INTERP_MIN_SUPPORT` nearby observations with
     mean confidence `>= _INTERP_SUPPORT_CONF`, both endpoints have confidence
     `>= _INTERP_ENDPOINT_CONF`, the camera-compensated travel and bidirectional velocity
-    extrapolations agree, and (when embeddings exist) both sides look alike. Centres are
+    extrapolations agree, and (when embeddings exist) both sides look alike. When calibrated
+    Re-ID is trustworthy and strongly confirms identity across both sides of a gap, gaps up to
+    `_INTERP_REID_MAX_GAP_S` are eligible under tighter kinematic checks. Centres are
     interpolated in the coordinates of the gap's last frame and mapped back to each filled frame.
     """
     stride = max(1, int(frame_stride))
-    max_gap = max(2 * stride, int(round(_INTERP_MAX_GAP_S * fps)))
+    max_gap_base = max(2 * stride, int(round(_INTERP_MAX_GAP_S * fps)))
+    can_extend = reid_trust >= 0.45 and embeddings is not None
+    max_gap = (
+        max(max_gap_base, int(round(_INTERP_REID_MAX_GAP_S * fps)))
+        if can_extend
+        else max_gap_base
+    )
+    reid_confirm_cos = max(p70_diff + 0.08, mu_same - 0.10)
+    reid_veto_cos = max(_INTERP_MIN_COS, p70_diff - 0.04) if reid_trust >= 0.50 else _INTERP_MIN_COS
     win = _INTERP_SUPPORT_WINDOW
     out: list[np.ndarray] = []
 
@@ -1252,9 +1257,10 @@ def _gated_cmc_interpolate(
             f0 = int(fr[g])
             f1 = int(fr[g + 1])
             span = f1 - f0
+            is_extended = (span - 1) > max_gap_base
             c0 = float(t.confs[g])
             c1 = float(t.confs[g + 1])
-            if min(c0, c1) < _INTERP_ENDPOINT_CONF:
+            if min(c0, c1) < (_INTERP_ENDPOINT_CONF + 0.05 if is_extended else _INTERP_ENDPOINT_CONF):
                 continue
             before = np.arange(max(0, g + 1 - win), g + 1)
             after = np.arange(g + 1, min(L, g + 1 + win))
@@ -1262,9 +1268,10 @@ def _gated_cmc_interpolate(
             after = after[fr[after] <= f1 + 2 * stride * win]
             if len(before) < _INTERP_MIN_SUPPORT or len(after) < _INTERP_MIN_SUPPORT:
                 continue
+            min_sup_conf = _INTERP_SUPPORT_CONF + 0.05 if is_extended else _INTERP_SUPPORT_CONF
             if (
-                float(t.confs[before].mean()) < _INTERP_SUPPORT_CONF
-                or float(t.confs[after].mean()) < _INTERP_SUPPORT_CONF
+                float(t.confs[before].mean()) < min_sup_conf
+                or float(t.confs[after].mean()) < min_sup_conf
             ):
                 continue
             b0 = t.boxes[g]
@@ -1291,17 +1298,30 @@ def _gated_cmc_interpolate(
             p0 = pb[-1]
             p1 = pa[0]
             travel = float(np.hypot(*(p1 - p0))) / hm
-            if travel > _INTERP_TRAVEL_BASE + _INTERP_TRAVEL_PER_FRAME * span:
+            travel_rate = 0.065 if is_extended else _INTERP_TRAVEL_PER_FRAME
+            if travel > _INTERP_TRAVEL_BASE + travel_rate * span:
                 continue
             v0 = _side_velocity(fr[before].astype(np.float64), pb)
             v1 = _side_velocity(fr[after].astype(np.float64), pa)
             half = 0.5 * span
             bidir = float(np.hypot(*((p0 + v0 * half) - (p1 - v1 * half)))) / hm
-            if bidir > _INTERP_MAX_BIDIR:
+            max_bidir = _INTERP_REID_EXT_BIDIR if is_extended else _INTERP_MAX_BIDIR
+            if bidir > max_bidir:
                 continue
-            e0 = _mean_embedding(embeddings, emb_valid, t.row_indices[before])
-            e1 = _mean_embedding(embeddings, emb_valid, t.row_indices[after])
-            if e0 is not None and e1 is not None and float(e0 @ e1) < _INTERP_MIN_COS:
+
+            # Use a slightly wider occlusion-filtered window for Re-ID verification across gaps
+            emb_b = np.arange(max(0, g + 1 - 10), g + 1)
+            emb_a = np.arange(g + 1, min(L, g + 1 + 10))
+            e0, _ = _clean_prototype(
+                t.row_indices[emb_b], t.confs[emb_b], t.ioa[emb_b], embeddings, emb_valid
+            )
+            e1, _ = _clean_prototype(
+                t.row_indices[emb_a], t.confs[emb_a], t.ioa[emb_a], embeddings, emb_valid
+            )
+            if is_extended:
+                if e0 is None or e1 is None or float(e0 @ e1) < reid_confirm_cos:
+                    continue
+            elif e0 is not None and e1 is not None and float(e0 @ e1) < reid_veto_cos:
                 continue
 
             fill = np.arange(f0 + stride, f1, stride, dtype=np.int64)
@@ -1336,38 +1356,83 @@ def _gated_cmc_interpolate(
     return np.concatenate(out, axis=0)
 
 
-def _smooth_tracks(out: np.ndarray, fps: float, frame_stride: int) -> np.ndarray:
-    """Gaussian-smooth box centre and size along each contiguous run, in image coordinates.
+def _smooth_tracks(
+    out: np.ndarray,
+    fps: float,
+    frame_stride: int,
+    is_interp: np.ndarray | None = None,
+) -> np.ndarray:
+    """Motion- and curvature-adaptive two-scale Gaussian smoothing in image coordinates.
 
-    A smoothed value replaces the observed one only when it stays within `_SMOOTH_GATE` box
-    heights of it, so detector jitter is removed while sharp real manoeuvres are kept.
+    Every contiguous run starts from light Gaussian smoothing (`_SMOOTH_SIGMA_LO_S`, with a
+    low-fps frame-space floor) and smoothly blends toward stronger smoothing
+    (`_SMOOTH_SIGMA_HI_S`) on low-speed, low-curvature frames measured across all four box
+    edges (`x1, y1, x2, y2`), so steady targets lose jitter while fast articulated motion stays
+    sharp. A smoothed value is only accepted if it stays within `_SMOOTH_GATE` box heights.
     """
     stride = max(1, int(frame_stride))
-    sigma = _SMOOTH_SIGMA_S * fps / stride
-    if sigma < 0.5 or len(out) == 0:
+    fps_eff = float(fps) / stride
+    if fps_eff < _SMOOTH_MIN_FPS or len(out) == 0:
         return out
+    sigma_lo = max(0.55, _SMOOTH_SIGMA_LO_S * fps_eff)
+    sigma_hi = max(1.80, _SMOOTH_SIGMA_HI_S * fps_eff)
+
     order = np.lexsort((out[:, 0], out[:, 1]))
     srt = out[order]
+    interp_srt = is_interp[order] if is_interp is not None else np.zeros(len(srt), dtype=bool)
     tid = srt[:, 1]
     fr = np.rint(srt[:, 0]).astype(np.int64)
     brk = np.nonzero((np.diff(tid) != 0) | (np.diff(fr) != stride))[0] + 1
     starts = np.concatenate(([0], brk))
     ends = np.concatenate((brk, [len(srt)]))
+
     b = srt[:, 2:6]
-    st = np.column_stack(
+    sm = b.copy()
+
+    for s, e in zip(starts.tolist(), ends.tolist(), strict=True):
+        L = e - s
+        if L < 5:
+            continue
+        seg = b[s:e]
+        s_lo = gaussian_filter1d(seg, sigma_lo, axis=0, mode="nearest")
+        s_hi = gaussian_filter1d(seg, sigma_hi, axis=0, mode="nearest")
+
+        h_ref = np.maximum(s_lo[:, 3] - s_lo[:, 1], 1.0)
+        edge_v = (np.abs(np.gradient(s_lo, axis=0)).max(axis=1) / h_ref) * fps_eff
+        d_hl = np.abs(s_hi - s_lo).max(axis=1) / h_ref
+        # Local neighborhood smoothing prevents turning on strong smoothing at inflection points
+        edge_v_loc = gaussian_filter1d(edge_v, sigma_lo, mode="nearest")
+        d_hl_loc = gaussian_filter1d(d_hl, sigma_lo, mode="nearest")
+
+        w_v = 1.0 / (1.0 + np.power(edge_v_loc / _SMOOTH_V_SCALE, 4))
+        w_d = 1.0 / (1.0 + np.power(d_hl_loc / _SMOOTH_D_SCALE, 4))
+        w_hi = w_v * w_d
+
+        seg_interp = interp_srt[s:e]
+        if seg_interp.any():
+            seam = seg_interp.copy()
+            seam[:-1] |= seg_interp[1:]
+            seam[1:] |= seg_interp[:-1]
+            w_seam = (
+                0.50
+                / (1.0 + np.power(edge_v_loc / (1.3 * _SMOOTH_V_SCALE), 4))
+                / (1.0 + np.power(d_hl_loc / (1.5 * _SMOOTH_D_SCALE), 4))
+            )
+            w_hi = np.where(seam, np.maximum(w_hi, w_seam), w_hi)
+
+        sm[s:e] = (1.0 - w_hi[:, None]) * s_lo + w_hi[:, None] * s_hi
+
+    h = np.maximum(b[:, 3] - b[:, 1], 1.0)
+    # Match baseline gate on [cx, cy, w, h]
+    st_raw = np.column_stack(
         (0.5 * (b[:, 0] + b[:, 2]), 0.5 * (b[:, 1] + b[:, 3]), b[:, 2] - b[:, 0], b[:, 3] - b[:, 1])
     )
-    sm = st.copy()
-    for s, e in zip(starts.tolist(), ends.tolist(), strict=True):
-        if e - s >= 5:
-            sm[s:e] = gaussian_filter1d(st[s:e], sigma, axis=0, mode="nearest")
-    h = np.maximum(st[:, 3], 1.0)
-    dev = np.abs(sm - st).max(axis=1) / h
-    use = dev <= _SMOOTH_GATE
-    st[use] = sm[use]
-    nb = np.column_stack(
-        (st[:, 0] - 0.5 * st[:, 2], st[:, 1] - 0.5 * st[:, 3], st[:, 0] + 0.5 * st[:, 2], st[:, 1] + 0.5 * st[:, 3])
+    st_sm = np.column_stack(
+        (0.5 * (sm[:, 0] + sm[:, 2]), 0.5 * (sm[:, 1] + sm[:, 3]), sm[:, 2] - sm[:, 0], sm[:, 3] - sm[:, 1])
     )
+    dev = np.abs(st_sm - st_raw).max(axis=1) / h
+    use = dev <= _SMOOTH_GATE
+    nb = np.where(use[:, None], sm, b)
     ok = np.isfinite(nb).all(axis=1) & (nb[:, 2] - nb[:, 0] >= 1.0) & (nb[:, 3] - nb[:, 1] >= 1.0)
     srt[ok, 2:6] = nb[ok]
     res = out.copy()
@@ -1569,12 +1634,17 @@ def postprocess_tracks_array(
         frame_height,
         embeddings,
         emb_valid,
+        reid_trust=reid_trust,
+        mu_same=mu_same,
+        p70_diff=p70_diff,
     )
+    is_interp = np.zeros(len(out), dtype=bool)
     if len(interp_rows) > 0:
         out = np.vstack((out, interp_rows))
+        is_interp = np.concatenate((is_interp, np.ones(len(interp_rows), dtype=bool)))
 
-    # Stage 4: Gated image-space smoothing of box jitter
-    out = _smooth_tracks(out, fps, frame_stride)
+    # Stage 4: Motion- and curvature-adaptive image-space smoothing
+    out = _smooth_tracks(out, fps, frame_stride, is_interp=is_interp)
 
     out_order = np.lexsort((out[:, 1], out[:, 0]))
     return out[out_order]
