@@ -587,8 +587,7 @@ def info(
     recommended_command: str | None = None
     if nvidia_gpu and "CUDAExecutionProvider" not in providers:
         recommended_command = (
-            "pip uninstall -y onnxruntime && pip install 'onnxruntime-gpu[cuda,cudnn]>=1.28' "
-            "'tensorrt-cu13-libs>=10,<11'"
+            "uvx trackflow-python-cuda run <video>  # or uvx trackflow-python-tensorrt run <video>"
         )
     if as_json:
         typer.echo(

@@ -345,7 +345,7 @@ def test_agent_cli_json_and_llms_txt(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("trackflow.cli.ort.get_available_providers", lambda: ["CPUExecutionProvider"])
     gpu_info = json.loads(runner.invoke(app, ["info", "--json"]).output)
     assert gpu_info["nvidia_gpu"] == "Tesla T4, 580.82"
-    assert "onnxruntime-gpu" in gpu_info["recommended_command"]
+    assert "trackflow-python-cuda" in gpu_info["recommended_command"]
 
     # TRACKFLOW_DEFAULT_DEVICE flows into `trackflow run` when --device is omitted.
     seen_device: list[str] = []
