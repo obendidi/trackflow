@@ -218,12 +218,13 @@ def _crop(frame_bgr: np.ndarray, bbox: tuple[float, float, float, float]) -> np.
     return frame_bgr[y1:y2, x1:x2]
 
 
-def _is_replayable_source(source: str | Path | int) -> bool:
-    """Return True when ``source`` is a local video file or image directory that can be re-read."""
+def _is_live_source(source: str | Path | int) -> bool:
+    """Return True for non-replayable live streams or camera indices."""
     if isinstance(source, int) or _is_stream_url(source):
-        return False
-    p = Path(source)
-    return p.is_file() or p.is_dir()
+        return True
+    if isinstance(source, str) and (source.isdigit() or source.lower() == "camera"):
+        return not Path(source).exists()
+    return False
 
 
 def _match_track_embeddings(
@@ -671,7 +672,8 @@ class TrackflowPipeline:
 
         line_counts_by_frame: dict[int, dict[str, dict[str, int]]] = {}
         if counter is not None:
-            last_obs: dict[int, tuple[int, int]] = {}  # final_tid -> (last_frame, last_raw_id)
+            last_seen_frame: dict[int, int] = {}
+            last_raw_id: dict[int, int] = {}
             for f_i in pp_frame_indices:
                 f_recs = by_frame.get(f_i, ())
                 f_srcs = by_frame_src.get(f_i, ())
@@ -680,17 +682,21 @@ class TrackflowPipeline:
                     ts = float(f_recs[0]["timestamp_s"])
                     for rec, si in zip(f_recs, f_srcs, strict=True):
                         tid = int(rec["track_id"])
+                        prev_frame = last_seen_frame.get(tid)
                         if si >= 0:
                             cur_raw = raw_tids[si]
-                            prev = last_obs.get(tid)
-                            # Reset line state only across stitched exits between different raw IDs.
+                            prev_raw = last_raw_id.get(tid)
+                            # Reset line state only across an un-interpolated stitched exit gap
+                            # between different raw IDs (never mid-trajectory after interpolation).
                             if (
-                                prev is not None
-                                and cur_raw != prev[1]
-                                and f_i - prev[0] >= min_exit_gap
+                                prev_raw is not None
+                                and prev_frame is not None
+                                and cur_raw != prev_raw
+                                and f_i - prev_frame >= min_exit_gap
                             ):
                                 counter.forget_track(tid)
-                            last_obs[tid] = (f_i, cur_raw)
+                            last_raw_id[tid] = cur_raw
+                        last_seen_frame[tid] = f_i
                         f_tracks.append(
                             Track(
                                 track_id=tid,
@@ -742,7 +748,6 @@ class TrackflowPipeline:
         width: int,
         height: int,
         gap_reset_frames: int,
-        stop: threading.Event,
     ) -> None:
         """Render ``annotated.mp4`` from finalized post-processed tracks while preserving masks."""
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
@@ -754,57 +759,62 @@ class TrackflowPipeline:
         pp_trails: dict[int, list[tuple[int, int]]] = defaultdict(list)
         last_trail_frame: dict[int, int] = {}
         replay_iter, _, _, _, _ = _iter_frames(source, max_frames=seen_frames, fps=src_fps)
+        written_frames = 0
         try:
-            for f_i, _ts, f_bgr in replay_iter:
-                if stop.is_set():
-                    break
-                if skip > 0 and (f_i % (skip + 1) != 0):
-                    continue
-                f_recs = by_frame.get(f_i, ())
-                f_tracks = [
-                    Track(
-                        track_id=int(r["track_id"]),
-                        bbox=(r["x1"], r["y1"], r["x2"], r["y2"]),
-                        confidence=float(r["confidence"]),
-                        class_id=int(r["class_id"]),
-                        class_name=str(r["class_name"]),
-                        query_score=r["query_score"],
-                        query_match=bool(r["query_match"]),
-                        zone=r["zone"],
+            with _stop_on_interrupt() as replay_stop:
+                for f_i, _ts, f_bgr in replay_iter:
+                    if replay_stop.is_set():
+                        break
+                    if skip > 0 and (f_i % (skip + 1) != 0):
+                        continue
+                    f_recs = by_frame.get(f_i, ())
+                    f_tracks = [
+                        Track(
+                            track_id=int(r["track_id"]),
+                            bbox=(r["x1"], r["y1"], r["x2"], r["y2"]),
+                            confidence=float(r["confidence"]),
+                            class_id=int(r["class_id"]),
+                            class_name=str(r["class_name"]),
+                            query_score=r["query_score"],
+                            query_match=bool(r["query_match"]),
+                            zone=r["zone"],
+                        )
+                        for r in f_recs
+                    ]
+                    for tr in f_tracks:
+                        prev_f = last_trail_frame.get(tr.track_id)
+                        if prev_f is not None and f_i - prev_f >= gap_reset_frames:
+                            pp_trails[tr.track_id].clear()
+                        last_trail_frame[tr.track_id] = f_i
+                        fx, fy = tr.foot_point
+                        trl = pp_trails[tr.track_id]
+                        trl.append((int(round(fx)), int(round(fy))))
+                        del trl[:-48]
+                    saved_dets, saved_coasting = pp_privacy_masks.get(f_i, ([], []))
+                    # In skeleton mode, draw only finalized tracks (avoid double-drawing stale coasting).
+                    mask_coasting = () if self.anonymize_mode == "skeleton" else saved_coasting
+                    anon_frame = self.anonymizer.apply(
+                        f_bgr,
+                        f_tracks,
+                        detections=saved_dets,
+                        coasting=mask_coasting,
                     )
-                    for r in f_recs
-                ]
-                for tr in f_tracks:
-                    prev_f = last_trail_frame.get(tr.track_id)
-                    if prev_f is not None and f_i - prev_f > gap_reset_frames:
-                        pp_trails[tr.track_id].clear()
-                    last_trail_frame[tr.track_id] = f_i
-                    fx, fy = tr.foot_point
-                    trl = pp_trails[tr.track_id]
-                    trl.append((int(round(fx)), int(round(fy))))
-                    del trl[:-48]
-                saved_dets, saved_coasting = pp_privacy_masks.get(f_i, ([], []))
-                # In skeleton mode, draw only finalized tracks (avoid double-drawing stale coasting).
-                mask_coasting = () if self.anonymize_mode == "skeleton" else saved_coasting
-                anon_frame = self.anonymizer.apply(
-                    f_bgr,
-                    f_tracks,
-                    detections=saved_dets,
-                    coasting=mask_coasting,
-                )
-                rendered = draw_tracks(
-                    anon_frame,
-                    f_tracks,
-                    trails=pp_trails,
-                    query=self.query,
-                    anonymize_mode=self.anonymize_mode,
-                    lines=self.lines,
-                    line_counts=line_counts_by_frame.get(f_i) if self.lines else None,
-                )
-                v_writer.write(rendered)
+                    rendered = draw_tracks(
+                        anon_frame,
+                        f_tracks,
+                        trails=pp_trails,
+                        query=self.query,
+                        anonymize_mode=self.anonymize_mode,
+                        lines=self.lines,
+                        line_counts=line_counts_by_frame.get(f_i) if self.lines else None,
+                    )
+                    v_writer.write(rendered)
+                    written_frames += 1
         finally:
             replay_iter.close()
             v_writer.release()
+            if written_frames == 0:
+                video_path.unlink(missing_ok=True)
 
     def run(
         self,
@@ -826,7 +836,7 @@ class TrackflowPipeline:
         """
         if skip < 0 or (max_frames is not None and max_frames < 1):
             raise ValueError("skip must be nonnegative and max_frames must be positive.")
-        if self.postprocess and not _is_replayable_source(source):
+        if self.postprocess and _is_live_source(source):
             raise ValueError("--postprocess requires a recorded video file or image directory.")
         if isinstance(exports, str):
             exports = exports.split(",")
@@ -904,154 +914,156 @@ class TrackflowPipeline:
             processed = 0
             seen_frames = 0
 
-            stop = stack.enter_context(_stop_on_interrupt())
-            try:
-                for frame_idx, timestamp_s, frame_bgr in frame_iter:
-                    if stop.is_set():
-                        break
-                    seen_frames += 1
-                    if skip > 0 and (frame_idx % (skip + 1) != 0):
-                        continue
+            interrupted_pass1 = False
+            with _stop_on_interrupt() as stop:
+                try:
+                    for frame_idx, timestamp_s, frame_bgr in frame_iter:
+                        if stop.is_set():
+                            break
+                        seen_frames += 1
+                        if skip > 0 and (frame_idx % (skip + 1) != 0):
+                            continue
 
-                    fr, dets = self._process_frame(
-                        frame_bgr,
-                        frame_idx,
-                        timestamp_s,
-                        frame_dt_s,
-                        tracker,
-                        card_index,
-                        floorplan if not self.postprocess else None,
-                        counter if not self.postprocess else None,
-                        record_floorplan=not self.postprocess,
-                    )
-                    tracks = fr.tracks
-                    observations += len(tracks)
-                    total_dets += fr.num_detections
-                    total_inf_ms += fr.inference_ms
-                    total_trk_ms += fr.tracking_ms
-                    for ev in fr.events:
-                        all_events.append(
-                            {"frame_idx": frame_idx, "timestamp_s": round(timestamp_s, 3), **ev}
-                        )
-
-                    if self.postprocess:
-                        pp_frame_indices.append(frame_idx)
-                        warp = getattr(tracker, "last_cmc_warp", None)
-                        if warp is not None:
-                            pp_cmc_by_frame[frame_idx] = np.asarray(warp, dtype=np.float32)
-                        obs_embs = _match_track_embeddings(
-                            tracks,
-                            dets,
+                        fr, dets = self._process_frame(
                             frame_bgr,
-                            self.reid_embedder,
-                            seen_counts=pp_seen_counts,
-                            sample_every=card_index.reid_sample_every,
+                            frame_idx,
+                            timestamp_s,
+                            frame_dt_s,
+                            tracker,
+                            card_index,
+                            floorplan if not self.postprocess else None,
+                            counter if not self.postprocess else None,
+                            record_floorplan=not self.postprocess,
                         )
-                        for tr, emb in zip(tracks, obs_embs, strict=True):
-                            if tr.recovered:
-                                recovered_count += 1
-                            rec = tr.to_record(frame_idx, timestamp_s)
-                            # Keep full-precision coordinates for offline post-processing.
-                            rec["x1"], rec["y1"], rec["x2"], rec["y2"] = tr.bbox
-                            pp_records.append(rec)
-                            pp_embs.append(emb)
+                        tracks = fr.tracks
+                        observations += len(tracks)
+                        total_dets += fr.num_detections
+                        total_inf_ms += fr.inference_ms
+                        total_trk_ms += fr.tracking_ms
+                        for ev in fr.events:
+                            all_events.append(
+                                {"frame_idx": frame_idx, "timestamp_s": round(timestamp_s, 3), **ev}
+                            )
+
+                        if self.postprocess:
+                            pp_frame_indices.append(frame_idx)
+                            warp = getattr(tracker, "last_cmc_warp", None)
+                            if warp is not None:
+                                pp_cmc_by_frame[frame_idx] = np.asarray(warp, dtype=np.float32)
+                            obs_embs = _match_track_embeddings(
+                                tracks,
+                                dets,
+                                frame_bgr,
+                                self.reid_embedder,
+                                seen_counts=pp_seen_counts,
+                                sample_every=card_index.reid_sample_every,
+                            )
+                            for tr, emb in zip(tracks, obs_embs, strict=True):
+                                if tr.recovered:
+                                    recovered_count += 1
+                                rec = tr.to_record(frame_idx, timestamp_s)
+                                # Keep full-precision coordinates for offline post-processing.
+                                rec["x1"], rec["y1"], rec["x2"], rec["y2"] = tr.bbox
+                                pp_records.append(rec)
+                                pp_embs.append(emb)
+                                if display:
+                                    fx, fy = tr.foot_point
+                                    trail = trails[tr.track_id]
+                                    trail.append((int(round(fx)), int(round(fy))))
+                                    del trail[:-48]
+                        else:
+                            for tr in tracks:
+                                if tr.recovered:
+                                    recovered_count += 1
+                                if paths:
+                                    record = tr.to_record(frame_idx, timestamp_s)
+                                    if spool is None:
+                                        sink.append(record)
+                                    else:
+                                        spool.write(json.dumps(record) + "\n")
+                                if save_video or display:
+                                    fx, fy = tr.foot_point
+                                    trail = trails[tr.track_id]
+                                    trail.append((int(round(fx)), int(round(fy))))
+                                    del trail[:-48]
+                            if "html" in export_set:
+                                counts.append(len(tracks))
+                        processed += 1
+
+                        elapsed_now = max(time.perf_counter() - t_start, 1e-6)
+                        live_fps = processed / elapsed_now
+
+                        if defer_video and self.anonymize_mode != "none":
+                            coasting = (
+                                tracker.coasting_tracks(3)
+                                if hasattr(tracker, "coasting_tracks")
+                                else []
+                            )
+                            # Preserve all raw detections, Pass-1 track boxes & coasting boxes so
+                            # Pass-2 privacy masking covers every box even after smoothing shifts.
+                            raw_track_masks = [
+                                Track(tr.track_id, tr.bbox, tr.confidence, tr.class_id, tr.class_name)
+                                for tr in tracks
+                            ]
+                            pp_privacy_masks[frame_idx] = (
+                                [
+                                    Detection(
+                                        bbox=d.bbox,
+                                        confidence=d.confidence,
+                                        class_id=d.class_id,
+                                        class_name=d.class_name,
+                                    )
+                                    for d in dets
+                                ],
+                                [*coasting, *raw_track_masks],
+                            )
+
+                        if (save_video and not defer_video) or display:
+                            # Anonymize every box that may hold a person, not just confirmed tracks.
+                            coasting = (
+                                tracker.coasting_tracks(3)
+                                if hasattr(tracker, "coasting_tracks")
+                                else []
+                            )
+                            anon_frame = self.anonymizer.apply(
+                                frame_bgr, tracks, detections=dets, coasting=coasting
+                            )
+                            for c in coasting:
+                                c.track_id = card_index.canonical_id(c.track_id)
+                            rendered = draw_tracks(
+                                anon_frame,
+                                tracks,
+                                coasting=coasting,
+                                trails=trails,
+                                fps=live_fps,
+                                query=self.query,
+                                anonymize_mode=self.anonymize_mode,
+                                lines=self.lines,
+                                line_counts=counter.counts if counter else None,
+                            )
+                            if video_writer is not None:
+                                video_writer.write(rendered)
                             if display:
-                                fx, fy = tr.foot_point
-                                trail = trails[tr.track_id]
-                                trail.append((int(round(fx)), int(round(fy))))
-                                del trail[:-48]
-                    else:
-                        for tr in tracks:
-                            if tr.recovered:
-                                recovered_count += 1
-                            if paths:
-                                record = tr.to_record(frame_idx, timestamp_s)
-                                if spool is None:
-                                    sink.append(record)
-                                else:
-                                    spool.write(json.dumps(record) + "\n")
-                            if save_video or display:
-                                fx, fy = tr.foot_point
-                                trail = trails[tr.track_id]
-                                trail.append((int(round(fx)), int(round(fy))))
-                                del trail[:-48]
-                        if "html" in export_set:
-                            counts.append(len(tracks))
-                    processed += 1
+                                try:
+                                    cv2.imshow("Trackflow", rendered)
+                                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                                        break
+                                except cv2.error:
+                                    display = False
 
-                    elapsed_now = max(time.perf_counter() - t_start, 1e-6)
-                    live_fps = processed / elapsed_now
-
-                    if defer_video and self.anonymize_mode != "none":
-                        coasting = (
-                            tracker.coasting_tracks(3)
-                            if hasattr(tracker, "coasting_tracks")
-                            else []
-                        )
-                        # Preserve all raw detections, Pass-1 track boxes & coasting boxes so
-                        # Pass-2 privacy masking covers every box even after smoothing shifts.
-                        raw_track_masks = [
-                            Track(tr.track_id, tr.bbox, tr.confidence, tr.class_id, tr.class_name)
-                            for tr in tracks
-                        ]
-                        pp_privacy_masks[frame_idx] = (
-                            [
-                                Detection(
-                                    bbox=d.bbox,
-                                    confidence=d.confidence,
-                                    class_id=d.class_id,
-                                    class_name=d.class_name,
-                                )
-                                for d in dets
-                            ],
-                            [*coasting, *raw_track_masks],
-                        )
-
-                    if (save_video and not defer_video) or display:
-                        # Anonymize every box that may hold a person, not just confirmed tracks.
-                        coasting = (
-                            tracker.coasting_tracks(3)
-                            if hasattr(tracker, "coasting_tracks")
-                            else []
-                        )
-                        anon_frame = self.anonymizer.apply(
-                            frame_bgr, tracks, detections=dets, coasting=coasting
-                        )
-                        for c in coasting:
-                            c.track_id = card_index.canonical_id(c.track_id)
-                        rendered = draw_tracks(
-                            anon_frame,
-                            tracks,
-                            coasting=coasting,
-                            trails=trails,
-                            fps=live_fps,
-                            query=self.query,
-                            anonymize_mode=self.anonymize_mode,
-                            lines=self.lines,
-                            line_counts=counter.counts if counter else None,
-                        )
-                        if video_writer is not None:
-                            video_writer.write(rendered)
-                        if display:
-                            try:
-                                cv2.imshow("Trackflow", rendered)
-                                if cv2.waitKey(1) & 0xFF == ord("q"):
-                                    break
-                            except cv2.error:
-                                display = False
-
-                    if progress_callback is not None:
-                        progress_callback(processed, (total_frames + skip) // stride, live_fps)
-            finally:
-                capture_stack.close()
-                if display:
-                    with contextlib.suppress(cv2.error):
-                        cv2.destroyAllWindows()
+                        if progress_callback is not None:
+                            progress_callback(processed, (total_frames + skip) // stride, live_fps)
+                finally:
+                    interrupted_pass1 = stop.is_set()
+                    capture_stack.close()
+                    if display:
+                        with contextlib.suppress(cv2.error):
+                            cv2.destroyAllWindows()
 
             # Merges are decided a few frames into a returning person's new track; relabel the
             # observations recorded before that so exports use one ID per person.
             if processed == 0:
-                if stop.is_set():
+                if interrupted_pass1:
                     raise KeyboardInterrupt
                 raise RuntimeError(f"No readable frames in {source}")
 
@@ -1097,7 +1109,6 @@ class TrackflowPipeline:
                         width=width,
                         height=height,
                         gap_reset_frames=gap_reset_frames,
-                        stop=stop,
                     )
             elif spool is not None:
                 spool.seek(0)

@@ -1493,13 +1493,27 @@ def _cross_exit_reid_merge(
     if not pair_sims:
         return tracklets, []
 
-    # Sort earliest valid chronological transition first on ties, preferring highest similarity.
+    # Merge clusters via union-find (highest similarity first) so a stronger (A, C) link
+    # cannot orphan an intermediate re-entry B in A -> B -> C chains.
+    parent = list(range(len(tracklets)))
+    members: list[list[int]] = [[i] for i in range(len(tracklets))]
+
+    def _find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _separated(a: _Tracklet, b: _Tracklet) -> bool:
+        return (
+            a.end_frame + min_exit_gap_frames <= b.start_frame
+            or b.end_frame + min_exit_gap_frames <= a.start_frame
+        )
+
     pair_sims.sort(key=lambda x: (-x[0], tracklets[x[2]].start_frame - tracklets[x[1]].end_frame))
-    links: dict[int, int] = {}
-    used_dst: set[int] = set()
-    link_meta: list[tuple[int, int, int, float]] = []
     for sim, u, v in pair_sims:
-        if u in links or v in used_dst:
+        ru, rv = _find(u), _find(v)
+        if ru == rv:
             continue
         tu, tv = tracklets[u], tracklets[v]
         # Only candidates that overlap in time with v (or u) are mutually exclusive look-alikes;
@@ -1510,10 +1524,34 @@ def _cross_exit_reid_merge(
         i_runner = max(i_comp, default=-1.0)
         if sim - o_runner < margin or sim - i_runner < margin:
             continue
-        links[u] = v
-        used_dst.add(v)
-        # Record (reentry_frame, src_row_of_u, src_row_of_v, similarity)
-        link_meta.append((tv.start_frame, int(tu.row_indices[0]), int(tv.row_indices[0]), sim))
+        if not all(
+            _separated(tracklets[a], tracklets[b]) for a in members[ru] for b in members[rv]
+        ):
+            continue
+        if len(members[ru]) < len(members[rv]):
+            ru, rv = rv, ru
+        parent[rv] = ru
+        members[ru].extend(members[rv])
+        members[rv].clear()
+
+    links: dict[int, int] = {}
+    link_meta: list[tuple[int, int, int, float]] = []
+    for grp in members:
+        if len(grp) < 2:
+            continue
+        grp.sort(key=lambda idx: (tracklets[idx].start_frame, tracklets[idx].end_frame))
+        for u, v in zip(grp, grp[1:], strict=False):
+            tu, tv = tracklets[u], tracklets[v]
+            assert tu.emb_full is not None and tv.emb_full is not None
+            links[u] = v
+            link_meta.append(
+                (
+                    tv.start_frame,
+                    int(tu.row_indices[0]),
+                    int(tv.row_indices[0]),
+                    float(np.dot(tu.emb_full, tv.emb_full)),
+                )
+            )
 
     if not links:
         return tracklets, []
@@ -1577,9 +1615,23 @@ def _postprocess_tracks_core(
             )
         if emb_valid is None:
             emb_valid = np.ones((len(arr),), dtype=bool)
-        elif len(emb_valid) != len(arr):
+        else:
+            emb_valid = np.asarray(emb_valid, dtype=bool)
+            if emb_valid.shape != (len(arr),):
+                raise ValueError(
+                    f"emb_valid length ({len(emb_valid)}) must match rows length ({len(arr)})."
+                )
+    if class_ids is not None:
+        class_ids = np.asarray(class_ids, dtype=np.int64)
+        if class_ids.shape != (len(arr),):
             raise ValueError(
-                f"emb_valid length ({len(emb_valid)}) must match rows length ({len(arr)})."
+                f"class_ids length ({len(class_ids)}) must match rows length ({len(arr)})."
+            )
+    if cmc_warps is not None and cmc_valid is not None:
+        cmc_valid = np.asarray(cmc_valid, dtype=bool)
+        if len(cmc_valid) != len(cmc_warps):
+            raise ValueError(
+                f"cmc_valid length ({len(cmc_valid)}) must match cmc_warps length ({len(cmc_warps)})."
             )
 
     tids = np.rint(arr[:, 1]).astype(np.int64)

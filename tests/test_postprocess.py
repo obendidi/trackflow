@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 import pytest
 from typer.testing import CliRunner
 
+import trackflow.pipeline as pipeline_mod
 from trackflow import (
     CountingLine,
     Detection,
@@ -48,27 +49,45 @@ def _linear_track_rows(
     return out
 
 
+def _write_image_seq(path: Path, count: int, width: int = 320, height: int = 240) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    for i in range(count):
+        frame = np.full((height, width, 3), 30, dtype=np.uint8)
+        cv2.rectangle(frame, (20, 40), (90, 190), (10, 10, 230), -1)
+        cv2.rectangle(frame, (200, 40), (260, 190), (10, 10, 230), -1)
+        cv2.imwrite(str(path / f"{i:03d}.png"), frame)
+    return path
+
+
+def _count_video_frames(path: Path) -> int:
+    cap = cv2.VideoCapture(str(path))
+    try:
+        n = 0
+        while True:
+            ok, _ = cap.read()
+            if not ok:
+                break
+            n += 1
+        return n
+    finally:
+        cap.release()
+
+
 def test_postprocess_fills_short_gap_and_respects_frame_stride() -> None:
-    # Single person walking smoothly with missing observations at frames 10 and 12 (stride=2)
     frames = [f for f in range(0, 22, 2) if f not in (10, 12)]
     rows = np.array(_linear_track_rows(1, frames, x0=50.0, y0=150.0, vx=4.0, vy=0.0), dtype=np.float64)
 
     out = postprocess_tracks_array(
         rows, fps=20.0, frame_width=640, frame_height=480, frame_stride=2
     )
-    out_frames = sorted(int(round(f)) for f in out[:, 0])
-    assert out_frames == list(range(0, 22, 2))
+    assert sorted(int(round(f)) for f in out[:, 0]) == list(range(0, 22, 2))
     assert set(int(round(t)) for t in out[:, 1]) == {1}
 
-    # Filled midpoint at frame 10 sits near x=90 (cx=50+4*10=90 -> x1=70, x2=110)
     f10 = out[np.isclose(out[:, 0], 10.0)][0]
-    cx10 = 0.5 * (f10[2] + f10[4])
-    assert abs(cx10 - 90.0) < 2.0
+    assert abs(0.5 * (f10[2] + f10[4]) - 90.0) < 2.0
 
 
 def test_postprocess_stitches_fragmented_tracklet_and_isolates_classes() -> None:
-    # Fragment 1 (frames 0..14) and Fragment 2 (frames 25..39) of the same walking person (class 0),
-    # plus a different class (class 24) along a similar path that must NEVER merge with class 0.
     r1 = _linear_track_rows(1, list(range(0, 15)), x0=40.0, y0=180.0, vx=5.0, vy=0.0)
     r2 = _linear_track_rows(2, list(range(25, 40)), x0=40.0, y0=180.0, vx=5.0, vy=0.0)
     r_other = _linear_track_rows(3, list(range(25, 40)), x0=42.0, y0=180.0, vx=5.0, vy=0.0)
@@ -78,17 +97,13 @@ def test_postprocess_stitches_fragmented_tracklet_and_isolates_classes() -> None
     out = postprocess_tracks_array(
         rows, fps=30.0, frame_width=640, frame_height=480, class_ids=class_ids
     )
-    unique_tids = sorted(set(int(round(t)) for t in out[:, 1]))
-    assert len(unique_tids) == 2
-
+    assert len(set(int(round(t)) for t in out[:, 1])) == 2
     pairs = set(zip(np.rint(out[:, 0]).astype(int), np.rint(out[:, 1]).astype(int), strict=True))
     assert len(pairs) == len(out)
     assert np.all(out[:, 4] > out[:, 2]) and np.all(out[:, 5] > out[:, 3])
 
 
 def test_postprocess_repairs_two_track_crossing_swap() -> None:
-    # Person A walks left->right (x: 40 -> 340); Person B walks right->left (x: 340 -> 40).
-    # They cross around frame 25, and the raw online tracker swaps IDs 1 <-> 2 at frame 25.
     rows = []
     for f in range(51):
         xa = 40.0 + 6.0 * f
@@ -104,11 +119,10 @@ def test_postprocess_repairs_two_track_crossing_swap() -> None:
     f50 = out[np.isclose(out[:, 0], 50.0)]
     left_tid = int(round(f0[np.argmin(f0[:, 2]), 1]))
     end_row = f50[np.isclose(f50[:, 1], left_tid)][0]
-    end_cx = 0.5 * (end_row[2] + end_row[4])
-    assert end_cx > 300.0
+    assert 0.5 * (end_row[2] + end_row[4]) > 300.0
 
 
-def test_postprocess_edge_cases_and_validation() -> None:
+def test_postprocess_empty_and_input_validation() -> None:
     empty_res = postprocess_records([])
     assert isinstance(empty_res, PostprocessResult)
     assert empty_res.records == []
@@ -116,16 +130,12 @@ def test_postprocess_edge_cases_and_validation() -> None:
     assert empty_res.unique_tracks_after == 0
     assert empty_res.reid_merges == 0
     assert empty_res.reid_merge_events == []
+    assert postprocess_tracks_array(np.zeros((0, 7), dtype=np.float64)).shape == (0, 7)
 
-    empty_arr = postprocess_tracks_array(np.zeros((0, 7), dtype=np.float64))
-    assert empty_arr.shape == (0, 7)
-
-    # Negative frame_idx raises ValueError instead of wrapping CMC arrays
     neg_rows = np.array([[-1.0, 1.0, 10.0, 20.0, 50.0, 120.0, 0.9]], dtype=np.float64)
     with pytest.raises(ValueError, match="nonnegative"):
         postprocess_tracks_array(neg_rows)
 
-    # Mismatched embeddings / emb_valid lengths raise ValueError
     valid_rows = np.array(_linear_track_rows(1, [0, 1, 2], 50.0, 150.0, 2.0, 0.0), dtype=np.float64)
     with pytest.raises(ValueError, match="embeddings length"):
         postprocess_tracks_array(valid_rows, embeddings=np.ones((2, 4), dtype=np.float32))
@@ -135,8 +145,17 @@ def test_postprocess_edge_cases_and_validation() -> None:
             embeddings=np.ones((3, 4), dtype=np.float32),
             emb_valid=np.ones((2,), dtype=bool),
         )
+    with pytest.raises(ValueError, match="class_ids length"):
+        postprocess_tracks_array(valid_rows, class_ids=np.array([0, 0], dtype=np.int64))
+    with pytest.raises(ValueError, match="cmc_valid length"):
+        postprocess_tracks_array(
+            valid_rows,
+            cmc_warps=np.zeros((3, 2, 3), dtype=np.float32),
+            cmc_valid=np.ones((2,), dtype=bool),
+        )
 
-    # Passing embeddings with emb_valid=None defaults to all-True (actually uses embeddings)
+
+def test_postprocess_embeddings_default_emb_valid_and_list_coercion() -> None:
     e_red = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
     e_blue = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
     recs: list[dict] = []
@@ -149,7 +168,8 @@ def test_postprocess_edge_cases_and_validation() -> None:
     for f in range(70, 80):
         recs.append(Track(3, (300, 40, 360, 180), 0.9, 0, "person").to_record(f, f / 10.0))
         embs.append(e_red)
-    res_implicit = postprocess_records(
+
+    res_none = postprocess_records(
         recs,
         fps=10.0,
         frame_width=640,
@@ -159,27 +179,36 @@ def test_postprocess_edge_cases_and_validation() -> None:
         allow_long_reid_merge=True,
         min_exit_gap_frames=8,
     )
-    assert res_implicit.unique_tracks_after == 2
-    assert res_implicit.reid_merges == 1
+    assert res_none.unique_tracks_after == 2 and res_none.reid_merges == 1
+
+    # Passing a Python list of ints for emb_valid must coerce cleanly to bool
+    res_list = postprocess_records(
+        recs,
+        fps=10.0,
+        frame_width=640,
+        frame_height=480,
+        embeddings=np.stack(embs),
+        emb_valid=[1] * len(embs),  # type: ignore[arg-type]
+        allow_long_reid_merge=True,
+        min_exit_gap_frames=8,
+    )
+    assert res_list.unique_tracks_after == 2 and res_list.reid_merges == 1
 
 
 def test_postprocess_long_horizon_continues_when_medium_pass_empty() -> None:
-    # High-trust Re-ID scene with ZERO gaps <= 2.5s and one 4.0s gap (120 frames @ 30fps).
-    # Stage 2 must continue from the 2.5s pass to the 6.0s pass instead of breaking early.
     e_a = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
     e_b = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
     e_c = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32)
     rows: list[list[float]] = []
     embs: list[np.ndarray] = []
 
-    # Two continuous bystander tracks establish high sequence-level reid_trust (>= 0.50).
     for f in range(200):
         rows.append([float(f), 1.0, 40.0, 60.0, 80.0, 160.0, 0.92])
         embs.append(e_a)
         rows.append([float(f), 2.0, 460.0, 60.0, 500.0, 160.0, 0.92])
         embs.append(e_b)
 
-    # Person C disappears at frame 30 and reappears 4.0s (120 frames) later at frame 150.
+    # Person C disappears at frame 30 and reappears 4.0s (120 frames) later with no <=2.5s gaps.
     for f in range(0, 31):
         rows.append([float(f), 3.0, 220.0, 200.0, 260.0, 300.0, 0.92])
         embs.append(e_c)
@@ -197,20 +226,32 @@ def test_postprocess_long_horizon_continues_when_medium_pass_empty() -> None:
     assert len(set(int(round(t)) for t in out[:, 1])) == 3
 
 
-def test_postprocess_cross_exit_reid_multi_reentry_and_lookalike_guard() -> None:
-    e_red = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
-    e_blue = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+def test_postprocess_cross_exit_reid_chains_noisy_three_segment_reentry() -> None:
+    # Noisy embeddings where sim(A, C) ~= 0.99 > sim(B, C) ~= 0.97 > sim(A, B) ~= 0.92:
+    # union-find must still chain A -> B -> C instead of orphaning middle segment B.
+    def _unit(v: list[float]) -> np.ndarray:
+        a = np.array(v, dtype=np.float32)
+        return a / float(np.linalg.norm(a))
 
-    # 1. Three non-overlapping appearances A -> B -> C of the same person must chain into 1 track
+    e_a = _unit([1.0, 0.0, 0.0, 0.0])
+    e_c = _unit([0.99, 0.141, 0.0, 0.0])
+    e_b = _unit([0.92, 0.392, 0.0, 0.0])
+    e_other = _unit([0.0, 0.0, 1.0, 0.0])
+    assert float(e_a @ e_c) > float(e_b @ e_c) > float(e_a @ e_b) > 0.90
+
     recs: list[dict] = []
     embs: list[np.ndarray] = []
-    for seg_tid, start_f, x0 in ((10, 0, 20), (20, 45, 220), (30, 90, 420)):
+    for seg_tid, start_f, x0, vec in (
+        (10, 0, 20, e_a),
+        (20, 45, 220, e_b),
+        (30, 90, 420, e_c),
+    ):
         for f in range(start_f, start_f + 10):
             recs.append(Track(seg_tid, (x0, 40, x0 + 60, 180), 0.9, 0, "person").to_record(f, f / 10.0))
-            embs.append(e_red)
+            embs.append(vec)
     for f in range(0, 10):
         recs.append(Track(11, (520, 40, 580, 180), 0.9, 0, "person").to_record(f, f / 10.0))
-        embs.append(e_blue)
+        embs.append(e_other)
 
     res = postprocess_records(
         recs,
@@ -226,51 +267,54 @@ def test_postprocess_cross_exit_reid_multi_reentry_and_lookalike_guard() -> None
     assert res.reid_merges == 2
     assert len(res.reid_merge_events) == 2
 
-    # 2. Two overlapping look-alikes within margin (< 0.05) must NOT merge ambiguously
+
+def test_postprocess_cross_exit_reid_rejects_overlapping_lookalikes() -> None:
+    e_red = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
     e_la1 = np.array([0.995, 0.09987, 0.0, 0.0], dtype=np.float32)
     e_la1 /= np.linalg.norm(e_la1)
     e_la2 = np.array([0.990, 0.14107, 0.0, 0.0], dtype=np.float32)
     e_la2 /= np.linalg.norm(e_la2)
-    recs_la: list[dict] = []
-    embs_la: list[np.ndarray] = []
+
+    recs: list[dict] = []
+    embs: list[np.ndarray] = []
     for f in range(10):
-        recs_la.append(Track(1, (20, 40, 80, 180), 0.9, 0, "person").to_record(f, f / 10.0))
-        embs_la.append(e_red)
+        recs.append(Track(1, (20, 40, 80, 180), 0.9, 0, "person").to_record(f, f / 10.0))
+        embs.append(e_red)
     for f in range(50, 60):
-        recs_la.append(Track(2, (200, 40, 260, 180), 0.9, 0, "person").to_record(f, f / 10.0))
-        embs_la.append(e_la1)
-        recs_la.append(Track(3, (400, 40, 460, 180), 0.9, 0, "person").to_record(f, f / 10.0))
-        embs_la.append(e_la2)
-    res_la = postprocess_records(
-        recs_la,
+        recs.append(Track(2, (200, 40, 260, 180), 0.9, 0, "person").to_record(f, f / 10.0))
+        embs.append(e_la1)
+        recs.append(Track(3, (400, 40, 460, 180), 0.9, 0, "person").to_record(f, f / 10.0))
+        embs.append(e_la2)
+
+    res = postprocess_records(
+        recs,
         fps=10.0,
         frame_width=640,
         frame_height=480,
-        embeddings=np.stack(embs_la),
+        embeddings=np.stack(embs),
         allow_long_reid_merge=True,
         min_exit_gap_frames=8,
     )
-    assert res_la.unique_tracks_after == 3
-    assert res_la.reid_merges == 0
+    assert res.unique_tracks_after == 3
+    assert res.reid_merges == 0
 
 
-def test_postprocess_low_fps_horizon_stride_and_cross_class_isolation() -> None:
-    # 1. At 5 fps without Re-ID, max horizon is 3.2s (~16 frames): a 12s (60-frame) gap must NOT merge.
+def test_postprocess_low_fps_horizon_scales_in_seconds() -> None:
     r1 = _linear_track_rows(1, list(range(0, 10)), x0=100.0, y0=150.0, vx=0.0, vy=0.0)
-    r2 = _linear_track_rows(2, list(range(70, 80)), x0=102.0, y0=150.0, vx=0.0, vy=0.0)
+    r_far = _linear_track_rows(2, list(range(70, 80)), x0=102.0, y0=150.0, vx=0.0, vy=0.0)
     out_far = postprocess_tracks_array(
-        np.array(r1 + r2, dtype=np.float64), fps=5.0, frame_width=640, frame_height=480
+        np.array(r1 + r_far, dtype=np.float64), fps=5.0, frame_width=640, frame_height=480
     )
     assert len(set(int(round(t)) for t in out_far[:, 1])) == 2
 
-    # 2. Same 5 fps with a 2s (10-frame) gap DOES merge.
-    r3 = _linear_track_rows(2, list(range(19, 29)), x0=102.0, y0=150.0, vx=0.0, vy=0.0)
+    r_near = _linear_track_rows(2, list(range(19, 29)), x0=102.0, y0=150.0, vx=0.0, vy=0.0)
     out_near = postprocess_tracks_array(
-        np.array(r1 + r3, dtype=np.float64), fps=5.0, frame_width=640, frame_height=480
+        np.array(r1 + r_near, dtype=np.float64), fps=5.0, frame_width=640, frame_height=480
     )
     assert len(set(int(round(t)) for t in out_near[:, 1])) == 1
 
-    # 3. Cross-class crossing (person=0 vs car=2): never split or rewire across classes.
+
+def test_postprocess_cross_class_overlap_and_stride8_crossing() -> None:
     rows_cc: list[list[float]] = []
     cids_cc: list[int] = []
     for f in range(51):
@@ -289,7 +333,6 @@ def test_postprocess_low_fps_horizon_stride_and_cross_class_isolation() -> None:
     )
     assert len(set(int(round(t)) for t in out_cc[:, 1])) == 2
 
-    # 4. Stride=8 crossing swap: episode grouping and Trigger C scale cleanly with frame_stride.
     rows_st: list[list[float]] = []
     for step in range(41):
         f = step * 8
@@ -312,17 +355,7 @@ def test_postprocess_low_fps_horizon_stride_and_cross_class_isolation() -> None:
     assert 0.5 * (end_row[2] + end_row[4]) > 280.0
 
 
-def _write_image_seq(path: Path, count: int, width: int = 320, height: int = 240) -> Path:
-    path.mkdir(parents=True, exist_ok=True)
-    for i in range(count):
-        frame = np.full((height, width, 3), 30, dtype=np.uint8)
-        cv2.rectangle(frame, (20, 40), (90, 190), (10, 10, 230), -1)
-        cv2.rectangle(frame, (200, 40), (260, 190), (10, 10, 230), -1)
-        cv2.imwrite(str(path / f"{i:03d}.png"), frame)
-    return path
-
-
-def test_pipeline_postprocess_end_to_end_privacy_lines_and_stream_untouched(
+def test_pipeline_postprocess_e2e_exports_privacy_events_and_progressive_overlay(
     tmp_path: Path, monkeypatch
 ) -> None:
     src = _write_image_seq(tmp_path / "seq", 30)
@@ -337,7 +370,6 @@ def test_pipeline_postprocess_end_to_end_privacy_lines_and_stream_untouched(
             _ = frame_bgr
             f = self.step
             self.step += 1
-            # Walk across the counting line x=140 from left to right; drop frames 10..12
             if 10 <= f <= 12:
                 return []
             x = 20.0 + f * 6.0
@@ -358,7 +390,6 @@ def test_pipeline_postprocess_end_to_end_privacy_lines_and_stream_untouched(
             self.last_events = []
             if not detections:
                 return []
-            # Fragment into two raw IDs (7 -> 9) so postprocess must stitch, renumber, and remap events
             tid = 7 if idx < 10 else 9
             if idx == 0:
                 self.last_events = [{"type": "track_started", "track_id": 7}]
@@ -379,7 +410,7 @@ def test_pipeline_postprocess_end_to_end_privacy_lines_and_stream_untouched(
     )
     line = CountingLine("gate", (140.0, 0.0), (140.0, 240.0))
 
-    # 1. Live stream() remains strictly frame-by-frame online even when postprocess=True
+    # Live stream() remains strictly online even when postprocess=True
     pipe_stream = TrackflowPipeline(
         model="mock",
         detector=_GapDetector(),
@@ -392,7 +423,6 @@ def test_pipeline_postprocess_end_to_end_privacy_lines_and_stream_untouched(
     ]
     assert [7] in stream_ids and [9] in stream_ids and [] in stream_ids
 
-    # 2. Offline run() with postprocess=True + anonymize + save_video + floorplan + line + all exports
     out_dir = tmp_path / "pp_run"
     anon_calls: list[tuple[int, int]] = []
     rendered_counts: list[dict[str, dict[str, int]] | None] = []
@@ -406,14 +436,11 @@ def test_pipeline_postprocess_end_to_end_privacy_lines_and_stream_untouched(
         lines=[line],
     )
     orig_apply = pipe.anonymizer.apply
+    orig_draw = pipeline_mod.draw_tracks
 
     def _spy_apply(frame, tracks, *, detections=(), coasting=()):
         anon_calls.append((len(tracks), len(detections)))
         return orig_apply(frame, tracks, detections=detections, coasting=coasting)
-
-    import trackflow.pipeline as pipeline_mod
-
-    orig_draw = pipeline_mod.draw_tracks
 
     def _spy_draw(*args, **kwargs):
         lc = kwargs.get("line_counts")
@@ -432,31 +459,25 @@ def test_pipeline_postprocess_end_to_end_privacy_lines_and_stream_untouched(
     )
     assert summary.postprocessed is True
     assert summary.unique_tracks == 1
-    assert summary.reid_merges == 0  # Kinematic stitches must NOT inflate reid_merges
+    assert summary.reid_merges == 0
     assert summary.total_track_observations == 30
-    assert (out_dir / "annotated.mp4").is_file()
+    assert _count_video_frames(out_dir / "annotated.mp4") == 30
     assert (out_dir / "floorplan.png").is_file()
     assert (out_dir / "report.html").is_file()
-    # Privacy: zero crops on anonymized run, and Pass 2 anonymizer ran on all 30 frames with raw dets
     assert not (out_dir / "crops").exists()
-    assert len(anon_calls) == 30
-    assert sum(d for _, d in anon_calls) == 27
-    # Pass 2 video overlay must show progressive line counts (0 on frame 0, 1 at the end)
+    assert len(anon_calls) == 30 and sum(d for _, d in anon_calls) == 27
     assert len(rendered_counts) == 30
     assert rendered_counts[0] == {"gate": {"in": 0, "out": 0}}
     assert sum(rendered_counts[-1]["gate"].values()) == 1
 
     cards = json.loads((out_dir / "track_cards.json").read_text(encoding="utf-8"))["cards"]
-    assert len(cards) == 1 and cards[0]["thumbnail"] is None
-    assert cards[0]["merged_track_ids"] == []
+    assert len(cards) == 1 and cards[0]["thumbnail"] is None and cards[0]["merged_track_ids"] == []
     assert "crops/" not in (out_dir / "report.html").read_text(encoding="utf-8")
 
-    # All export formats agree on single stitched ID = 1 and 30 observations
     pq_tbl = pq.read_table(out_dir / "tracks.parquet")
     assert pq_tbl.num_rows == 30 and set(pq_tbl["track_id"].to_pylist()) == {1}
     assert len(list(csv.reader((out_dir / "tracks.txt").read_text().splitlines()))) == 30
 
-    # Events are chronologically sorted, raw IDs remapped to final ID=1, resolved self-switch dropped
     events = json.loads((out_dir / "events.json").read_text(encoding="utf-8"))
     frame_seq = [int(e.get("frame_idx", 0)) for e in events]
     assert frame_seq == sorted(frame_seq)
@@ -468,7 +489,20 @@ def test_pipeline_postprocess_end_to_end_privacy_lines_and_stream_untouched(
     assert summary.line_counts["gate"]["out"] + summary.line_counts["gate"]["in"] == 1
     assert load_run_payload(out_dir)["diagnostics"]["total_observations"] == 30
 
-    # 3. Unification with --reid-merge and no false line crossing across long exit/re-entry
+
+def test_pipeline_postprocess_reid_merge_unification_suppresses_fake_line_crossing(
+    tmp_path: Path,
+) -> None:
+    src = _write_image_seq(tmp_path / "seq", 30)
+    line = CountingLine("gate", (140.0, 0.0), (140.0, 240.0))
+
+    class _Det:
+        active_provider = "MockCPU"
+
+        def detect(self, frame_bgr: np.ndarray) -> list[Detection]:
+            _ = frame_bgr
+            return []
+
     class _ExitReentryTracker:
         track_buffer = 3
 
@@ -479,17 +513,16 @@ def test_pipeline_postprocess_end_to_end_privacy_lines_and_stream_untouched(
             _ = detections, frame_bgr
             idx = self.f
             self.f += 1
-            # 9 frames each -> 3 sampled embeddings at reid_sample_every=3, gap = 12 >= 8
             if idx < 9:
-                return [Track(10, (20, 40, 80, 190), 0.9, 0, "person")]  # left of x=140
+                return [Track(10, (20, 40, 80, 190), 0.9, 0, "person")]
             if idx >= 21:
-                return [Track(20, (200, 40, 260, 190), 0.9, 0, "person")]  # right of x=140 after exit
+                return [Track(20, (200, 40, 260, 190), 0.9, 0, "person")]
             return []
 
     out_reid = tmp_path / "pp_reid_merge"
     pipe_rm = TrackflowPipeline(
         model="mock",
-        detector=_GapDetector(),
+        detector=_Det(),
         tracker_factory=_ExitReentryTracker,
         reid="color",
         reid_merge=True,
@@ -504,10 +537,28 @@ def test_pipeline_postprocess_end_to_end_privacy_lines_and_stream_untouched(
     assert sum_rm.line_counts["gate"] == {"in": 0, "out": 0}
 
 
-def test_pipeline_postprocess_same_raw_id_occlusion_line_and_non_replayable_rejected(
+def test_pipeline_postprocess_source_validation(tmp_path: Path) -> None:
+    class _Det:
+        active_provider = "MockCPU"
+
+        def detect(self, frame_bgr: np.ndarray) -> list[Detection]:
+            _ = frame_bgr
+            return []
+
+    pipe = TrackflowPipeline(model="mock", detector=_Det(), postprocess=True)
+    with pytest.raises(ValueError, match="recorded video"):
+        pipe.run("rtsp://example.com/live", output_dir=tmp_path / "rtsp_out", save_video=False)
+    with pytest.raises(ValueError, match="recorded video"):
+        pipe.run(0, output_dir=tmp_path / "cam_out", save_video=False)
+    with pytest.raises(FileNotFoundError):
+        pipe.run(tmp_path / "missing.mp4", output_dir=tmp_path / "miss_out", save_video=False)
+
+
+def test_pipeline_postprocess_line_keeps_same_raw_id_occlusion_and_interpolated_stitch(
     tmp_path: Path,
 ) -> None:
-    src = _write_image_seq(tmp_path / "occ_seq", 30)
+    src = _write_image_seq(tmp_path / "occ_seq", 35)
+    line = CountingLine("gate", (140.0, 0.0), (140.0, 240.0))
 
     class _Det:
         active_provider = "MockCPU"
@@ -516,15 +567,7 @@ def test_pipeline_postprocess_same_raw_id_occlusion_line_and_non_replayable_reje
             _ = frame_bgr
             return []
 
-    # Live stream URL and camera index must fail fast under postprocess=True
-    pipe_live = TrackflowPipeline(model="mock", detector=_Det(), postprocess=True)
-    with pytest.raises(ValueError, match="recorded video"):
-        pipe_live.run("rtsp://example.com/live", output_dir=tmp_path / "rtsp_out", save_video=False)
-    with pytest.raises(ValueError, match="recorded video"):
-        pipe_live.run(0, output_dir=tmp_path / "cam_out", save_video=False)
-
-    # Same raw ID occluded for 0.7s (14 frames @ 20fps) while stepping across line x=140
-    # must NOT reset LineCounter (would undercount occluded crossings).
+    # 1. Same raw ID occluded for 0.7s (14 frames @ 20fps) across line still counts
     class _OccludedSameIdTracker:
         track_buffer = 30
 
@@ -536,27 +579,141 @@ def test_pipeline_postprocess_same_raw_id_occlusion_line_and_non_replayable_reje
             idx = self.f
             self.f += 1
             if idx < 8:
-                return [Track(1, (80.0, 40.0, 120.0, 190.0), 0.9, 0, "person")]  # left of x=140
+                return [Track(1, (80.0, 40.0, 120.0, 190.0), 0.9, 0, "person")]
             if idx >= 22:
-                return [Track(1, (160.0, 40.0, 200.0, 190.0), 0.9, 0, "person")]  # right of x=140
+                return [Track(1, (160.0, 40.0, 200.0, 190.0), 0.9, 0, "person")]
             return []
 
-    line = CountingLine("gate", (140.0, 0.0), (140.0, 240.0))
-    pipe = TrackflowPipeline(
+    pipe1 = TrackflowPipeline(
         model="mock",
         detector=_Det(),
         tracker_factory=_OccludedSameIdTracker,
         postprocess=True,
         lines=[line],
     )
-    summary = pipe.run(src, output_dir=tmp_path / "occ_out", fps=20.0, save_video=False, exports=("jsonl",))
-    assert summary.line_counts["gate"]["in"] + summary.line_counts["gate"]["out"] == 1
+    s1 = pipe1.run(src, output_dir=tmp_path / "same_raw", fps=20.0, save_video=False, exports=("jsonl",))
+    assert s1.line_counts["gate"]["in"] + s1.line_counts["gate"]["out"] == 1
+
+    # 2. Different raw IDs bridged by continuous Stage-3 interpolation across >= min_exit_gap
+    # (track_buffer=5 -> min_exit_gap=8, 9-frame interpolated crossing) still counts
+    class _InterpStitchedCrossTracker:
+        track_buffer = 5
+
+        def __init__(self) -> None:
+            self.f = 0
+
+        def update(self, detections: list[Detection], frame_bgr=None) -> list[Track]:
+            _ = detections, frame_bgr
+            idx = self.f
+            self.f += 1
+            if 10 <= idx <= 18:
+                return []
+            x = 70.0 + idx * 5.0
+            tid = 1 if idx < 10 else 2
+            return [Track(tid, (x, 40.0, x + 40.0, 190.0), 0.92, 0, "person")]
+
+    pipe2 = TrackflowPipeline(
+        model="mock",
+        detector=_Det(),
+        tracker_factory=_InterpStitchedCrossTracker,
+        postprocess=True,
+        lines=[line],
+    )
+    s2 = pipe2.run(src, output_dir=tmp_path / "interp_stitch", fps=20.0, save_video=False, exports=("jsonl",))
+    assert s2.unique_tracks == 1
+    assert s2.total_track_observations == 35
+    assert s2.line_counts["gate"]["in"] + s2.line_counts["gate"]["out"] == 1
 
 
-def test_pipeline_postprocess_ctrl_c_in_replay_and_skeleton_no_coasting(
+def test_pipeline_postprocess_ctrl_c_in_pass1_renders_processed_frames(tmp_path: Path) -> None:
+    src = _write_image_seq(tmp_path / "p1_ctrlc", 20)
+
+    class _InterruptPass1Detector:
+        active_provider = "MockCPU"
+
+        def __init__(self) -> None:
+            self.step = 0
+
+        def detect(self, frame_bgr: np.ndarray) -> list[Detection]:
+            _ = frame_bgr
+            self.step += 1
+            if self.step == 6:
+                os.kill(os.getpid(), signal.SIGINT)
+            return [Detection((40.0, 40.0, 90.0, 190.0), 0.92, 0, "person")]
+
+    out_dir = tmp_path / "p1_out"
+    pipe = TrackflowPipeline(model="mock", detector=_InterruptPass1Detector(), postprocess=True)
+    summary = pipe.run(src, output_dir=out_dir, fps=20.0, save_video=True, exports=("jsonl",))
+    assert summary.processed_frames == 6
+    assert "video" in summary.output_files
+    assert _count_video_frames(out_dir / "annotated.mp4") == 6
+    assert (out_dir / "summary.json").is_file()
+    assert (out_dir / "track_cards.json").is_file()
+    assert (out_dir / "events.json").is_file()
+
+
+def test_pipeline_postprocess_ctrl_c_in_pass2_preserves_artifacts_and_unlinks_empty_video(
     tmp_path: Path, monkeypatch
 ) -> None:
-    src = _write_image_seq(tmp_path / "ctrlc_seq", 20)
+    src = _write_image_seq(tmp_path / "p2_ctrlc", 20)
+
+    class _Det:
+        active_provider = "MockCPU"
+
+        def detect(self, frame_bgr: np.ndarray) -> list[Detection]:
+            _ = frame_bgr
+            return [Detection((40.0, 40.0, 90.0, 190.0), 0.92, 0, "person")]
+
+    orig_draw = pipeline_mod.draw_tracks
+
+    # 1. SIGINT on Pass-2 frame 5 writes a valid 5-frame MP4 plus all JSON artifacts
+    out_mid = tmp_path / "p2_mid"
+    replay_frames = 0
+
+    def _interrupt_mid(*args, **kwargs):
+        nonlocal replay_frames
+        replay_frames += 1
+        if replay_frames == 5:
+            os.kill(os.getpid(), signal.SIGINT)
+        return orig_draw(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline_mod, "draw_tracks", _interrupt_mid)
+    pipe_mid = TrackflowPipeline(model="mock", detector=_Det(), postprocess=True)
+    s_mid = pipe_mid.run(src, output_dir=out_mid, fps=20.0, save_video=True, exports=("jsonl",))
+    assert replay_frames == 5
+    assert _count_video_frames(out_mid / "annotated.mp4") == 5
+    assert (out_mid / "summary.json").is_file()
+    assert (out_mid / "track_cards.json").is_file()
+    assert (out_mid / "events.json").is_file()
+    assert s_mid.total_track_observations == 20
+
+    # 2. SIGINT before frame 0 is written unlinks the empty MP4 and omits "video" from summary
+    monkeypatch.setattr(pipeline_mod, "draw_tracks", orig_draw)
+    out_zero = tmp_path / "p2_zero"
+    orig_iter = pipeline_mod._iter_frames
+    iter_calls = 0
+
+    def _interrupt_before_first_replay(*args, **kwargs):
+        nonlocal iter_calls
+        iter_calls += 1
+        gen, rate, w, h, total = orig_iter(*args, **kwargs)
+        if iter_calls == 2:
+            def _wrapped():
+                os.kill(os.getpid(), signal.SIGINT)
+                yield from gen
+            return _wrapped(), rate, w, h, total
+        return gen, rate, w, h, total
+
+    monkeypatch.setattr(pipeline_mod, "_iter_frames", _interrupt_before_first_replay)
+    pipe_zero = TrackflowPipeline(model="mock", detector=_Det(), postprocess=True)
+    s_zero = pipe_zero.run(src, output_dir=out_zero, fps=20.0, save_video=True, exports=("jsonl",))
+    assert not (out_zero / "annotated.mp4").exists()
+    assert "video" not in s_zero.output_files
+    assert (out_zero / "summary.json").is_file()
+
+
+def test_pipeline_postprocess_skeleton_omits_stale_coasting(tmp_path: Path, monkeypatch) -> None:
+    src = _write_image_seq(tmp_path / "skel_seq", 10)
 
     class _Det:
         active_provider = "MockCPU"
@@ -577,42 +734,7 @@ def test_pipeline_postprocess_ctrl_c_in_replay_and_skeleton_no_coasting(
             _ = max_age
             return [Track(99, (180.0, 40.0, 220.0, 190.0), 0.5, 0, "person")]
 
-    # 1. SIGINT during Pass 2 video replay must break cleanly and still write all run artifacts.
-    out_ctrlc = tmp_path / "ctrlc_out"
-    pipe_cc = TrackflowPipeline(
-        model="mock",
-        detector=_Det(),
-        tracker_factory=_CoastTracker,
-        postprocess=True,
-    )
-    import trackflow.pipeline as pipeline_mod
-
-    orig_draw = pipeline_mod.draw_tracks
-    replay_frames = 0
-
-    def _interrupt_mid_replay(*args, **kwargs):
-        nonlocal replay_frames
-        replay_frames += 1
-        if replay_frames == 5:
-            os.kill(os.getpid(), signal.SIGINT)
-        return orig_draw(*args, **kwargs)
-
-    monkeypatch.setattr(pipeline_mod, "draw_tracks", _interrupt_mid_replay)
-    summary = pipe_cc.run(
-        src, output_dir=out_ctrlc, fps=20.0, save_video=True, exports=("jsonl",)
-    )
-    assert replay_frames < 20
-    assert (out_ctrlc / "summary.json").is_file()
-    assert (out_ctrlc / "track_cards.json").is_file()
-    assert (out_ctrlc / "events.json").is_file()
-    assert (out_ctrlc / "tracks.jsonl").is_file()
-    assert (out_ctrlc / "annotated.mp4").is_file()
-    assert summary.total_track_observations == 20
-
-    # 2. In skeleton mode, Pass 2 passes coasting=() to anonymizer.apply (no stale coasting double-draw).
-    monkeypatch.setattr(pipeline_mod, "draw_tracks", orig_draw)
-    out_skel = tmp_path / "skel_out"
-    pipe_sk = TrackflowPipeline(
+    pipe = TrackflowPipeline(
         model="mock",
         detector=_Det(),
         tracker_factory=_CoastTracker,
@@ -620,16 +742,15 @@ def test_pipeline_postprocess_ctrl_c_in_replay_and_skeleton_no_coasting(
         anonymize="skeleton",
     )
     coasting_lens: list[int] = []
-    orig_apply = pipe_sk.anonymizer.apply
+    orig_apply = pipe.anonymizer.apply
 
-    def _spy_skel(frame, tracks, *, detections=(), coasting=()):
+    def _spy(frame, tracks, *, detections=(), coasting=()):
         coasting_lens.append(len(coasting))
         return orig_apply(frame, tracks, detections=detections, coasting=coasting)
 
-    monkeypatch.setattr(pipe_sk.anonymizer, "apply", _spy_skel)
-    pipe_sk.run(src, output_dir=out_skel, fps=20.0, save_video=True, exports=("jsonl",))
-    assert len(coasting_lens) == 20
-    assert all(n == 0 for n in coasting_lens)
+    monkeypatch.setattr(pipe.anonymizer, "apply", _spy)
+    pipe.run(src, output_dir=tmp_path / "skel_out", fps=20.0, save_video=True, exports=("jsonl",))
+    assert len(coasting_lens) == 10 and all(n == 0 for n in coasting_lens)
 
 
 def test_cli_postprocess_flag(tmp_path: Path, monkeypatch) -> None:
