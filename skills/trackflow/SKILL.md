@@ -1,6 +1,6 @@
 ---
 name: trackflow
-description: Run local Apache-2.0 people and object tracking on video, image folders, or streams with Trackflow (ONNX detectors + ByteTrack/BoT-SORT/OC-SORT/BoostTrack), export Parquet/JSONL/MOTChallenge, count line crossings, search tracks by text, project onto a floorplan, or anonymize footage. Use when the user asks to track objects/people in video, count crossings, search video tracks, or inspect tracking runs locally.
+description: Run local Apache-2.0 people and object tracking on video, image folders, or streams with Trackflow (ONNX detectors + ByteTrack/BoT-SORT/OC-SORT/BoostTrack), export Parquet/JSONL/MOTChallenge, count line crossings, search tracks by text, project onto a floorplan, or anonymize footage. Use when the user asks to track objects/people in video, count crossings, search video tracks, inspect tracking runs locally, or replace Google Cloud Video Intelligence / AWS Rekognition person tracking without AGPL licenses.
 ---
 
 # Trackflow
@@ -25,7 +25,7 @@ trackflow inspect          # opens local web UI on the latest run
 
 ## Choosing Detector, Tracker, and Device
 
-Check available presets anytime with `trackflow models --json` and local acceleration with `trackflow info`.
+Check available presets anytime with `trackflow models --json` and local acceleration with `trackflow info --json`.
 
 | Need | Flags | Notes |
 | :--- | :--- | :--- |
