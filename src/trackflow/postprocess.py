@@ -36,9 +36,6 @@ _BIS_WIN = 15
 _BIS_DEPTH = 2
 _BIS_GLOBAL = 0.85
 _BIS_LOCAL = 0.85
-# Stage 2 temporal prototypes: clean head/tail window length and blend weight in stitching.
-_HT_WIN = 30
-_HT_BLEND = 0.5
 # A trusted-Re-ID link must be within this cosine of the best candidate of its source and target.
 _MUTUAL_COS_TOL = 0.04
 # Stage 4 image-space smoothing: adaptive two-scale Gaussian (seconds), max accepted shift (box heights).
@@ -77,8 +74,6 @@ class _Tracklet:
     n_end: int
     emb_full: np.ndarray | None = None
     n_emb: int = 0
-    emb_head: np.ndarray | None = None  # clean prototype of the first observations
-    emb_tail: np.ndarray | None = None  # clean prototype of the last observations
     # Continuity prior with the immediately following split sibling (if any)
     next_sibling_idx: int = -1
     next_sibling_bonus: float = 0.0
@@ -241,28 +236,6 @@ def _clean_prototype(
         w = np.clip(sel_conf, 0.2, 1.0) * np.square(1.0 - np.clip(sel_ioa, 0.0, 0.90))
     mean_v = np.sum(embs * w[:, None].astype(np.float32), axis=0)
     return _l2_norm_vec(mean_v), n_valid
-
-
-def _head_tail_prototypes(
-    row_indices: np.ndarray,
-    ioa: np.ndarray,
-    embeddings: np.ndarray | None,
-    emb_valid: np.ndarray | None,
-) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """Mean of the first and last `_HT_WIN` clean (unoccluded) embeddings of a tracklet."""
-    if embeddings is None or emb_valid is None or len(row_indices) == 0:
-        return None, None
-    v = emb_valid[row_indices]
-    clean = v & (ioa < 0.20)
-    sel = row_indices[clean] if int(clean.sum()) >= 3 else row_indices[v]
-    if len(sel) < 3:
-        return None, None
-    protos = []
-    for part in (sel[:_HT_WIN], sel[-_HT_WIN:]):
-        E = embeddings[part].astype(np.float32)
-        E /= np.maximum(np.linalg.norm(E, axis=1, keepdims=True), 1e-12)
-        protos.append(_l2_norm_vec(E.mean(axis=0)))
-    return protos[0], protos[1]
 
 
 def _calibrate_reid(
@@ -438,7 +411,6 @@ def _make_tracklet(
         seg_f, seg_b, seg_ioa, W, W_inv, use_cmc, f_end, from_end=True, win=12
     )
     emb, n_emb = _clean_prototype(seg_idxs, seg_c, seg_ioa, embeddings, emb_valid)
-    e_head, e_tail = _head_tail_prototypes(seg_idxs, seg_ioa, embeddings, emb_valid)
     return _Tracklet(
         idx=idx,
         raw_id=raw_id,
@@ -462,8 +434,6 @@ def _make_tracklet(
         n_end=n_e,
         emb_full=emb,
         n_emb=n_emb,
-        emb_head=e_head,
-        emb_tail=e_tail,
     )
 
 
@@ -667,18 +637,20 @@ def _detect_split_points(
             ep_len = te - ts + 1
 
             # Trigger B: Track died or started right at this overlap -> soft junction split
-            if ts - 3 <= sb1 <= te + 4 and sa0 < sb1 < sa1:
-                ka = int(np.searchsorted(fa, sb1, side="right"))
-                _add_split(ta, ka, b_junc, True, la, min_side=3)
-            if ts - 4 <= sb0 <= te + 3 and sa0 < sb0 < sa1:
-                ka = int(np.searchsorted(fa, sb0, side="left"))
-                _add_split(ta, ka, b_junc, True, la, min_side=3)
-            if ts - 3 <= sa1 <= te + 4 and sb0 < sa1 < sb1:
-                kb = int(np.searchsorted(fb, sa1, side="right"))
-                _add_split(tb, kb, b_junc, True, lb, min_side=3)
-            if ts - 4 <= sa0 <= te + 3 and sb0 < sa0 < sb1:
-                kb = int(np.searchsorted(fb, sa0, side="left"))
-                _add_split(tb, kb, b_junc, True, lb, min_side=3)
+            # Only split T/Y junctions when calibrated Re-ID can reliably disambiguate branches.
+            if reid_trust >= 0.45:
+                if ts - 3 <= sb1 <= te + 4 and sa0 < sb1 < sa1:
+                    ka = int(np.searchsorted(fa, sb1, side="right"))
+                    _add_split(ta, ka, b_junc, True, la, min_side=3)
+                if ts - 4 <= sb0 <= te + 3 and sa0 < sb0 < sa1:
+                    ka = int(np.searchsorted(fa, sb0, side="left"))
+                    _add_split(ta, ka, b_junc, True, la, min_side=3)
+                if ts - 3 <= sa1 <= te + 4 and sb0 < sa1 < sb1:
+                    kb = int(np.searchsorted(fb, sa1, side="right"))
+                    _add_split(tb, kb, b_junc, True, lb, min_side=3)
+                if ts - 4 <= sa0 <= te + 3 and sb0 < sa0 < sb1:
+                    kb = int(np.searchsorted(fb, sa0, side="left"))
+                    _add_split(tb, kb, b_junc, True, lb, min_side=3)
 
             # Trigger C: Surviving 2-track crossing -> soft split on both at peak IoU
             if (
@@ -979,13 +951,6 @@ def _stitch_pass(
             if t.emb_full is not None:
                 emb_mat[i] = t.emb_full
 
-        head_mat = np.zeros((n, emb_dim), dtype=np.float32)
-        tail_mat = np.zeros((n, emb_dim), dtype=np.float32)
-        for i, t in enumerate(tracklets):
-            if t.emb_head is not None:
-                head_mat[i] = t.emb_head
-                tail_mat[i] = t.emb_tail
-
     order_by_start = np.argsort(start_f, kind="mergesort")
     sorted_starts = start_f[order_by_start]
 
@@ -1098,9 +1063,6 @@ def _stitch_pass(
             both_emb = has_emb[cand_j]
             if np.any(both_emb):
                 cos = (emb_mat[cand_j[both_emb]] @ emb_mat[i]).astype(np.float64)
-                # Credit a clean tail-of-i to head-of-j match that the full-track mean blurs.
-                cos_th = (head_mat[cand_j[both_emb]] @ tail_mat[i]).astype(np.float64)
-                cos += _HT_BLEND * np.maximum(cos_th - cos, 0.0)
                 app_dist = (mu_same - cos) / sep_tail
                 w_kin = 1.0 - 0.52 * reid_trust
                 w_app = 0.55 * reid_trust
@@ -1581,7 +1543,7 @@ def postprocess_tracks_array(
     long_gap_s = 6.0 if reid_trust >= 0.50 else 3.2
     p2_max_cost = 0.54 + 0.28 * reid_trust
     # With trusted Re-ID, commit medium-range links before the long-range pass.
-    horizons = [2.5, long_gap_s] if reid_trust >= 0.50 else [long_gap_s, long_gap_s]
+    horizons = [2.5, long_gap_s] if reid_trust >= 0.50 else [long_gap_s]
     for horizon_s in horizons:
         long_gap = max(75, int(round(horizon_s * fps)))
         links_p2 = _stitch_pass(
