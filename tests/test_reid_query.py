@@ -302,3 +302,67 @@ def test_new_apache2_presets_are_pinned_and_rfdetr_normalizes() -> None:
     sig2 = VLM_REGISTRY["siglip2"]
     assert sig2.license == "Apache-2.0"
     assert sig2.revision and len(sig2.revision) == 40
+
+
+def test_osnet_coreml_uses_static_padded_batches_and_mps_falls_back_to_cpu(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[str, tuple[int, ...], bool]] = []
+
+    class _FakeInput:
+        name = "input"
+
+    class _FakeSess:
+        def __init__(self, tag: str) -> None:
+            self.tag = tag
+
+        def get_inputs(self) -> list[_FakeInput]:
+            return [_FakeInput()]
+
+        def run(self, _outputs, feeds):
+            batch = feeds["input"]
+            # Check padded tail rows are zeroed on partial static chunks.
+            has_zero_tail = bool(np.all(batch[-1] == 0.0))
+            calls.append((self.tag, tuple(batch.shape), has_zero_tail))
+            return [batch.mean(axis=(2, 3), dtype=np.float64).astype(np.float32)]
+
+    seen_devices: list[str] = []
+
+    def fake_session(_path: Path, device: str = "auto", **_kw):
+        seen_devices.append(device)
+        if device == "coreml":
+            return _FakeSess("coreml"), "CoreMLExecutionProvider"
+        return _FakeSess("cpu"), "CPUExecutionProvider"
+
+    monkeypatch.setattr(reid, "resolve_reid_model", lambda *_a, **_kw: tmp_path / "osnet.onnx")
+    monkeypatch.setattr(reid, "create_onnx_session", fake_session)
+
+    cpu_emb = ReidEmbedder(backend="osnet", device="mps")
+    cm_emb = ReidEmbedder(backend="osnet", device="coreml")
+    assert seen_devices == ["cpu", "coreml"]
+    assert cpu_emb._static_batch is None
+    assert cm_emb._static_batch == reid._COREML_OSNET_BATCH
+
+    rng = np.random.default_rng(7)
+    for n in (0, 1, 7, 8, 9, 17):
+        crops: list[np.ndarray | None] = [
+            rng.integers(0, 255, (64, 32, 3), dtype=np.uint8) for _ in range(n)
+        ]
+        if n > 0:
+            crops.insert(min(2, n), None)
+        calls.clear()
+        ref = cpu_emb.encode_images(crops)
+        got = cm_emb.encode_images(crops)
+        assert len(got) == len(ref)
+        for a, b in zip(ref, got, strict=True):
+            if a is None:
+                assert b is None
+            else:
+                assert b is not None and np.allclose(a, b, atol=1e-6)
+        cm_calls = [c for c in calls if c[0] == "coreml"]
+        bs = reid._COREML_OSNET_BATCH
+        expected_chunks = (n + bs - 1) // bs if n > 0 else 0
+        assert len(cm_calls) == expected_chunks
+        assert all(shape == (bs, 3, 256, 128) for _, shape, _ in cm_calls)
+        if n % bs != 0:
+            assert cm_calls[-1][2] is True

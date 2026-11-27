@@ -204,3 +204,42 @@ def test_postprocess_deduplicates_overlapping_queries() -> None:
         nms_iou=0.65,
     )
     assert len(dets) == 1
+
+
+def test_onnx_session_pins_apple_p_cores_and_honors_omp_env(monkeypatch, tmp_path) -> None:
+    from trackflow import detector as detector_module
+
+    seen = {}
+
+    class Session:
+        def __init__(self, path, sess_options=None, providers=None, provider_options=None):
+            seen["opts"] = sess_options
+            self._providers = providers
+
+        def get_providers(self):
+            return self._providers
+
+    monkeypatch.setattr(
+        detector_module.ort, "get_available_providers", lambda: ["CPUExecutionProvider"]
+    )
+    monkeypatch.setattr(detector_module.ort, "InferenceSession", Session)
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+
+    monkeypatch.setattr(detector_module, "_apple_p_cores", lambda: 8)
+    detector_module.create_onnx_session(tmp_path / "m.onnx", device="cpu")
+    assert seen["opts"].intra_op_num_threads == 8
+    assert seen["opts"].inter_op_num_threads == 1
+
+    # Non-Apple platforms leave intra_op_num_threads at ORT's physical-core default (0).
+    monkeypatch.setattr(detector_module, "_apple_p_cores", lambda: None)
+    detector_module.create_onnx_session(tmp_path / "m.onnx", device="cpu")
+    assert seen["opts"].intra_op_num_threads == 0
+    assert seen["opts"].inter_op_num_threads == 1
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "6")
+    detector_module.create_onnx_session(tmp_path / "m.onnx", device="cpu")
+    assert seen["opts"].intra_op_num_threads == 6
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "not-a-number")
+    detector_module.create_onnx_session(tmp_path / "m.onnx", device="cpu")
+    assert seen["opts"].intra_op_num_threads == 0
