@@ -1,0 +1,31 @@
+/* Match the Trackflow browser playground palette (emerald + sky on deep navy slate). */
+[data-md-color-scheme="slate"] {
+  --md-default-bg-color: #080c18;
+  --md-default-bg-color--light: #11182c;
+  --md-default-fg-color: #e6eefc;
+  --md-default-fg-color--light: #9fb1d4;
+  --md-primary-fg-color: #0d1629;
+  --md-primary-fg-color--light: #15223d;
+  --md-primary-fg-color--dark: #060a14;
+  --md-accent-fg-color: #34d399;
+  --md-typeset-a-color: #38bdf8;
+  --md-code-bg-color: #0e1629;
+  --md-code-fg-color: #dbeafe;
+}
+
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: #059669;
+  --md-primary-fg-color--light: #10b981;
+  --md-primary-fg-color--dark: #047857;
+  --md-accent-fg-color: #0284c7;
+  --md-typeset-a-color: #0369a1;
+}
+
+.md-header__button.md-logo img,
+.md-header__button.md-logo svg {
+  border-radius: 6px;
+}
+
+.md-typeset img {
+  border-radius: 8px;
+}
