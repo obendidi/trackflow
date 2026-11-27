@@ -353,8 +353,9 @@ def run_trackflow_tracker(
     postprocess: bool = False,
 ) -> float:
     """Run a Trackflow tracker across sequences and return tracker-only FPS."""
-    from trackflow.postprocess import postprocess_tracks_array
-    from trackflow.tracker import compute_iou_matrix, create_tracker
+    from trackflow.pipeline import _match_track_embeddings, _pack_postprocess_embeddings
+    from trackflow.postprocess import postprocess_records
+    from trackflow.tracker import create_tracker
 
     tracker_name, _, reid_name = tracker_spec.partition("+")
     pred_dir.mkdir(parents=True, exist_ok=True)
@@ -381,6 +382,7 @@ def run_trackflow_tracker(
         seq_embs = embs_by_seq[seq.name] if (embs_by_seq and reid_name) else None
 
         mot_rows: list[tuple[int, int, float, float, float, float, float]] = []
+        pp_records: list[dict] = []
         obs_embs: list[np.ndarray | None] = []
         cmc_warps = np.broadcast_to(
             np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
@@ -391,22 +393,35 @@ def run_trackflow_tracker(
             frame_bgr = cv2.imread(str(img_p)) if need_frames else None
             # Fresh Detection objects with optional cached embeddings attached
             frame_dets: list[Detection] = []
+            emb_dets: list[Detection] = []
             f_embs = seq_embs[f_idx - 1] if seq_embs is not None else None
             for d_i, d in enumerate(raw_dets):
-                emb = None
-                if f_embs is not None and min_conf is not None and d.confidence >= min_conf:
-                    e = f_embs[d_i]
-                    if e is not None:
-                        emb = e.astype(np.float32)
-                frame_dets.append(
-                    Detection(
-                        bbox=d.bbox,
-                        confidence=d.confidence,
-                        class_id=d.class_id,
-                        class_name=d.class_name,
-                        embedding=emb,
-                    )
+                raw_e = f_embs[d_i] if f_embs is not None else None
+                emb = (
+                    raw_e.astype(np.float32)
+                    if (raw_e is not None and min_conf is not None and d.confidence >= min_conf)
+                    else None
                 )
+                det_obj = Detection(
+                    bbox=d.bbox,
+                    confidence=d.confidence,
+                    class_id=d.class_id,
+                    class_name=d.class_name,
+                    embedding=emb,
+                )
+                frame_dets.append(det_obj)
+                if postprocess and raw_e is not None:
+                    emb_dets.append(
+                        det_obj
+                        if emb is not None
+                        else Detection(
+                            bbox=d.bbox,
+                            confidence=d.confidence,
+                            class_id=d.class_id,
+                            class_name=d.class_name,
+                            embedding=raw_e.astype(np.float32),
+                        )
+                    )
             t0 = time.perf_counter()
             tracks = tracker.update(frame_dets, frame_bgr=frame_bgr)
             total_trk_s += time.perf_counter() - t0
@@ -415,39 +430,24 @@ def run_trackflow_tracker(
             if warp is not None:
                 cmc_warps[f_idx - 1] = np.asarray(warp, dtype=np.float32)
                 cmc_valid[f_idx - 1] = True
-            matched_embs: list[np.ndarray | None] = [None] * len(tracks)
-            if postprocess and f_embs is not None and tracks:
-                valid_d = [i for i, e in enumerate(f_embs) if e is not None]
-                if valid_d:
-                    iou = compute_iou_matrix(
-                        np.array([tr.bbox for tr in tracks], dtype=np.float64),
-                        np.array([raw_dets[i].bbox for i in valid_d], dtype=np.float64),
-                    )
-                    for r_i in range(len(tracks)):
-                        j_i = int(np.argmax(iou[r_i]))
-                        if float(iou[r_i, j_i]) >= 0.5:
-                            matched_embs[r_i] = f_embs[valid_d[j_i]]
+            matched_embs = (
+                _match_track_embeddings(tracks, emb_dets, None, None)
+                if postprocess
+                else [None] * len(tracks)
+            )
             for tr, m_emb in zip(tracks, matched_embs, strict=True):
                 x1, y1, x2, y2 = tr.bbox
                 mot_rows.append((f_idx, tr.track_id, x1, y1, x2, y2, tr.confidence))
                 if postprocess:
+                    rec = tr.to_record(f_idx - 1, (f_idx - 1) / fps)
+                    rec["x1"], rec["y1"], rec["x2"], rec["y2"] = tr.bbox
+                    pp_records.append(rec)
                     obs_embs.append(m_emb)
-        if postprocess and mot_rows:
-            rows_0b = np.array(mot_rows, dtype=np.float64).reshape(-1, 7)
-            rows_0b[:, 0] -= 1.0
-            emb_dense = None
-            emb_valid = None
-            if any(e is not None for e in obs_embs):
-                dim = next(e.shape[0] for e in obs_embs if e is not None)
-                emb_dense = np.zeros((len(obs_embs), dim), dtype=np.float32)
-                emb_valid = np.zeros((len(obs_embs),), dtype=bool)
-                for i_e, e in enumerate(obs_embs):
-                    if e is not None:
-                        emb_dense[i_e] = e.astype(np.float32)
-                        emb_valid[i_e] = True
+        if postprocess and pp_records:
+            emb_dense, emb_valid = _pack_postprocess_embeddings(obs_embs)
             t0 = time.perf_counter()
-            out_0b = postprocess_tracks_array(
-                rows_0b,
+            pp_res = postprocess_records(
+                pp_records,
                 fps=fps,
                 frame_width=seq_w,
                 frame_height=seq_h,
@@ -460,15 +460,15 @@ def run_trackflow_tracker(
             total_trk_s += time.perf_counter() - t0
             mot_rows = [
                 (
-                    int(round(r[0])) + 1,
-                    int(round(r[1])),
-                    float(r[2]),
-                    float(r[3]),
-                    float(r[4]),
-                    float(r[5]),
-                    float(r[6]),
+                    int(r["frame_idx"]) + 1,
+                    int(r["track_id"]),
+                    float(r["x1"]),
+                    float(r["y1"]),
+                    float(r["x2"]),
+                    float(r["y2"]),
+                    float(r["confidence"]),
                 )
-                for r in out_0b
+                for r in pp_res.records
             ]
         write_mot_txt(pred_dir / f"{seq.name}.txt", mot_rows)
 

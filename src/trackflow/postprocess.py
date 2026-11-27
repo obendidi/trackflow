@@ -97,10 +97,12 @@ def _compute_cumulative_cmc(
     frame_height: int | None,
 ) -> tuple[np.ndarray, np.ndarray, bool]:
     """Build cumulative 3x3 homogeneous transforms W[f] mapping frame 0 -> frame f."""
+    if cmc_warps is None or len(cmc_warps) == 0:
+        empty = np.zeros((0, 3, 3), dtype=np.float64)
+        return empty, empty, False
+
     T = max(num_frames, 1)
     W = np.broadcast_to(np.eye(3, dtype=np.float64), (T, 3, 3)).copy()
-    if cmc_warps is None or len(cmc_warps) == 0:
-        return W, W.copy(), False
 
     max_shift = float(max(frame_width or 1920, frame_height or 1080)) * 0.45
     n_w = min(T, len(cmc_warps))
@@ -121,7 +123,8 @@ def _compute_cumulative_cmc(
         W[f] = W[f - 1]
 
     if not any_applied:
-        return W, W.copy(), False
+        empty = np.zeros((0, 3, 3), dtype=np.float64)
+        return empty, empty, False
 
     W_inv = np.broadcast_to(np.eye(3, dtype=np.float64), (T, 3, 3)).copy()
     a = W[:, 0, 0]
@@ -516,6 +519,8 @@ def _detect_split_points(
     mu_same: float,
     p70_diff: float,
     crossing_swaps: list[tuple[float, int, int]],
+    *,
+    class_ids: np.ndarray | None = None,
     frame_stride: int,
     fps: float,
 ) -> dict[int, list[tuple[int, float, bool]]]:
@@ -614,6 +619,10 @@ def _detect_split_points(
     for (ta, tb), evs in pair_overlaps.items():
         if ta not in raw_tracks or tb not in raw_tracks:
             continue
+        ia = raw_tracks[ta]
+        ib = raw_tracks[tb]
+        if class_ids is not None and int(class_ids[ia[0]]) != int(class_ids[ib[0]]):
+            continue
         sa0, sa1, la = spans[ta]
         sb0, sb1, lb = spans[tb]
         if la < 4 or lb < 4:
@@ -622,13 +631,11 @@ def _detect_split_points(
         evs.sort(key=lambda x: x[0])
         episodes: list[list[tuple[int, float]]] = [[evs[0]]]
         for item in evs[1:]:
-            if item[0] - episodes[-1][-1][0] <= 6:
+            if item[0] - episodes[-1][-1][0] <= 6 * stride:
                 episodes[-1].append(item)
             else:
                 episodes.append([item])
 
-        ia = raw_tracks[ta]
-        ib = raw_tracks[tb]
         fa = frames[ia]
         fb = frames[ib]
 
@@ -636,21 +643,21 @@ def _detect_split_points(
             ts = ep[0][0]
             te = ep[-1][0]
             peak_fr, peak_iou = max(ep, key=lambda x: x[1])
-            ep_len = te - ts + 1
+            ep_len = (te - ts) // stride + 1
 
             # Trigger B: Track died or started right at this overlap -> soft junction split
             # Only split T/Y junctions when calibrated Re-ID can reliably disambiguate branches.
             if reid_trust >= 0.45:
-                if ts - 3 <= sb1 <= te + 4 and sa0 < sb1 < sa1:
+                if ts - 3 * stride <= sb1 <= te + 4 * stride and sa0 < sb1 < sa1:
                     ka = int(np.searchsorted(fa, sb1, side="right"))
                     _add_split(ta, ka, b_junc, True, la, min_side=3)
-                if ts - 4 <= sb0 <= te + 3 and sa0 < sb0 < sa1:
+                if ts - 4 * stride <= sb0 <= te + 3 * stride and sa0 < sb0 < sa1:
                     ka = int(np.searchsorted(fa, sb0, side="left"))
                     _add_split(ta, ka, b_junc, True, la, min_side=3)
-                if ts - 3 <= sa1 <= te + 4 and sb0 < sa1 < sb1:
+                if ts - 3 * stride <= sa1 <= te + 4 * stride and sb0 < sa1 < sb1:
                     kb = int(np.searchsorted(fb, sa1, side="right"))
                     _add_split(tb, kb, b_junc, True, lb, min_side=3)
-                if ts - 4 <= sa0 <= te + 3 and sb0 < sa0 < sb1:
+                if ts - 4 * stride <= sa0 <= te + 3 * stride and sb0 < sa0 < sb1:
                     kb = int(np.searchsorted(fb, sa0, side="left"))
                     _add_split(tb, kb, b_junc, True, lb, min_side=3)
 
@@ -658,10 +665,10 @@ def _detect_split_points(
             if (
                 ep_len <= 30
                 and peak_iou >= 0.30
-                and sa0 < ts - 2
-                and sa1 > te + 2
-                and sb0 < ts - 2
-                and sb1 > te + 2
+                and sa0 < ts - 2 * stride
+                and sa1 > te + 2 * stride
+                and sb0 < ts - 2 * stride
+                and sb1 > te + 2 * stride
             ):
                 # Compare the two possible continuations using motion on either
                 # side of the overlap. Both fits use the peak's camera coordinates.
@@ -1416,8 +1423,10 @@ class PostprocessResult:
     unique_tracks_after: int
     interpolated_rows: int
     merges: int
+    reid_merges: int
     splits: int
     elapsed_ms: float
+    reid_merge_events: list[dict[str, Any]]
 
 
 def _cross_exit_reid_merge(
@@ -1437,23 +1446,27 @@ def _cross_exit_reid_merge(
     min_samples: int = 3,
     threshold: float = 0.80,
     margin: float = 0.05,
-) -> tuple[list[_Tracklet], int]:
+) -> tuple[list[_Tracklet], list[tuple[int, int, int, float]]]:
     """Opt-in global cross-exit appearance merge (unifies ``--reid-merge`` with ``--postprocess``).
 
     Links non-overlapping same-class tracklets separated by at least ``min_exit_gap_frames``
     when both have at least ``min_samples`` embeddings, cosine similarity clears ``threshold``,
-    and the best match beats every competing non-overlapping candidate on both ends by ``margin``.
+    and the match beats every temporally competing (overlapping) alternative on both ends by
+    ``margin``. Non-overlapping third appearances of the same person do not block A->B->C chains.
     """
     if embeddings is None or emb_valid is None or len(tracklets) < 2:
-        return tracklets, 0
+        return tracklets, []
 
     eligible = [
         i for i, t in enumerate(tracklets) if t.emb_full is not None and t.n_emb >= min_samples
     ]
     if len(eligible) < 2:
-        return tracklets, 0
+        return tracklets, []
 
-    # Score all temporally valid (end_i + gap <= start_j) same-class pairs.
+    def _overlaps(a: _Tracklet, b: _Tracklet) -> bool:
+        return a.start_frame <= b.end_frame and b.start_frame <= a.end_frame
+
+    # Score all temporally valid (end_u + gap <= start_v) same-class pairs.
     pair_sims: list[tuple[float, int, int]] = []
     out_sims: dict[int, list[tuple[float, int]]] = {}
     in_sims: dict[int, list[tuple[float, int]]] = {}
@@ -1478,33 +1491,32 @@ def _cross_exit_reid_merge(
                 pair_sims.append((sim, u, v))
 
     if not pair_sims:
-        return tracklets, 0
+        return tracklets, []
 
-    # Require strict margin over runner-up on both source and destination.
-    for lst in out_sims.values():
-        lst.sort(reverse=True)
-    for lst in in_sims.values():
-        lst.sort(reverse=True)
-
-    pair_sims.sort(reverse=True)
+    # Sort earliest valid chronological transition first on ties, preferring highest similarity.
+    pair_sims.sort(key=lambda x: (-x[0], tracklets[x[2]].start_frame - tracklets[x[1]].end_frame))
     links: dict[int, int] = {}
     used_dst: set[int] = set()
+    link_meta: list[tuple[int, int, int, float]] = []
     for sim, u, v in pair_sims:
         if u in links or v in used_dst:
             continue
-        o_list = out_sims[u]
-        i_list = in_sims[v]
-        o_runner = o_list[1][0] if len(o_list) > 1 else -1.0
-        i_runner = i_list[1][0] if len(i_list) > 1 else -1.0
-        if o_list[0][1] != v or i_list[0][1] != u:
-            continue
+        tu, tv = tracklets[u], tracklets[v]
+        # Only candidates that overlap in time with v (or u) are mutually exclusive look-alikes;
+        # a later non-overlapping return C of the same person must not block A -> B.
+        o_comp = [s for s, cand in out_sims[u] if cand != v and _overlaps(tracklets[cand], tv)]
+        i_comp = [s for s, cand in in_sims[v] if cand != u and _overlaps(tracklets[cand], tu)]
+        o_runner = max(o_comp, default=-1.0)
+        i_runner = max(i_comp, default=-1.0)
         if sim - o_runner < margin or sim - i_runner < margin:
             continue
         links[u] = v
         used_dst.add(v)
+        # Record (reentry_frame, src_row_of_u, src_row_of_v, similarity)
+        link_meta.append((tv.start_frame, int(tu.row_indices[0]), int(tv.row_indices[0]), sim))
 
     if not links:
-        return tracklets, 0
+        return tracklets, []
 
     merged = _merge_chains(
         tracklets,
@@ -1520,7 +1532,7 @@ def _cross_exit_reid_merge(
         embeddings,
         emb_valid,
     )
-    return merged, len(links)
+    return merged, link_meta
 
 
 def _postprocess_tracks_core(
@@ -1537,7 +1549,7 @@ def _postprocess_tracks_core(
     frame_stride: int = 1,
     allow_long_reid_merge: bool = False,
     min_exit_gap_frames: int = 8,
-) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """Core post-processing engine returning ``(out_rows, source_row_indices, stats)``."""
     arr = np.asarray(rows, dtype=np.float64).reshape(-1, 7)
     if len(arr) == 0:
@@ -1549,14 +1561,31 @@ def _postprocess_tracks_core(
                 "unique_tracks_after": 0,
                 "interpolated_rows": 0,
                 "merges": 0,
+                "reid_merges": 0,
                 "splits": 0,
+                "reid_merge_events": [],
             },
         )
 
     frames = np.rint(arr[:, 0]).astype(np.int64)
+    if int(frames.min()) < 0:
+        raise ValueError(f"frame_idx must be nonnegative, got min {int(frames.min())}.")
+    if embeddings is not None:
+        if len(embeddings) != len(arr):
+            raise ValueError(
+                f"embeddings length ({len(embeddings)}) must match rows length ({len(arr)})."
+            )
+        if emb_valid is None:
+            emb_valid = np.ones((len(arr),), dtype=bool)
+        elif len(emb_valid) != len(arr):
+            raise ValueError(
+                f"emb_valid length ({len(emb_valid)}) must match rows length ({len(arr)})."
+            )
+
     tids = np.rint(arr[:, 1]).astype(np.int64)
     boxes = arr[:, 2:6]
     confs = arr[:, 6]
+    stride = max(1, int(frame_stride))
 
     num_frames = int(frames.max()) + 1
     if cmc_warps is not None:
@@ -1600,7 +1629,8 @@ def _postprocess_tracks_core(
         mu_same,
         p70_diff,
         crossing_swaps,
-        frame_stride=frame_stride,
+        class_ids=class_ids,
+        frame_stride=stride,
         fps=fps,
     )
     tracklets = _build_tracklets(
@@ -1636,7 +1666,7 @@ def _postprocess_tracks_core(
         paired.update((ra, rb))
 
     # Stage 2, Pass 1 (Local Repair): resolve crossing swaps, Y/T-junction hijacks & restore soft splits
-    p1_gap = max(20, int(round(0.9 * fps)))
+    p1_gap = max(2 * stride, int(round(0.9 * fps)))
     p1_max_cost = 0.54 + 0.18 * reid_trust
     links_p1 = _stitch_pass(
         tracklets,
@@ -1673,9 +1703,8 @@ def _postprocess_tracks_core(
     p2_max_cost = 0.54 + 0.28 * reid_trust
     # With trusted Re-ID, commit medium-range links before the long-range pass.
     horizons = [2.5, long_gap_s] if reid_trust >= 0.50 else [long_gap_s]
-    n_long_merges = 0
     for horizon_s in horizons:
-        long_gap = max(75, int(round(horizon_s * fps)))
+        long_gap = max(4 * stride, int(round(horizon_s * fps)))
         links_p2 = _stitch_pass(
             tracklets,
             W,
@@ -1692,8 +1721,7 @@ def _postprocess_tracks_core(
             margin_apply_above=0.22,
         )
         if not links_p2:
-            break
-        n_long_merges += len(links_p2)
+            continue
         tracklets = _merge_chains(
             tracklets,
             links_p2,
@@ -1710,8 +1738,9 @@ def _postprocess_tracks_core(
         )
 
     # Optional cross-exit Re-ID merge pass (when user passes both --postprocess and --reid-merge)
+    reid_link_meta: list[tuple[int, int, int, float]] = []
     if allow_long_reid_merge:
-        tracklets, n_reentry = _cross_exit_reid_merge(
+        tracklets, reid_link_meta = _cross_exit_reid_merge(
             tracklets,
             frames,
             boxes,
@@ -1725,7 +1754,6 @@ def _postprocess_tracks_core(
             emb_valid,
             min_exit_gap_frames=min_exit_gap_frames,
         )
-        n_long_merges += n_reentry
 
     # Reconstruct output rows with clean contiguous 1-based track IDs
     tracklets.sort(key=lambda t: (t.start_frame, t.raw_id, t.part_id))
@@ -1743,7 +1771,7 @@ def _postprocess_tracks_core(
         W_inv,
         use_cmc,
         fps,
-        frame_stride,
+        stride,
         frame_width,
         frame_height,
         embeddings,
@@ -1760,19 +1788,31 @@ def _postprocess_tracks_core(
         src_idx = np.concatenate((src_idx, np.full(n_interp, -1, dtype=np.int64)))
 
     # Stage 4: Motion- and curvature-adaptive image-space smoothing
-    out = _smooth_tracks(out, fps, frame_stride, is_interp=is_interp)
+    out = _smooth_tracks(out, fps, stride, is_interp=is_interp)
 
     out_order = np.lexsort((out[:, 1], out[:, 0]))
-    # Count raw-ID merges realized in the final tracklets (distinct raw IDs folded into one track)
+    # Realized raw-ID merges (distinct raw IDs folded into the same final track)
     raw_merges = sum(
         max(0, len({int(tids[i]) for i in t.row_indices.tolist()}) - 1) for t in tracklets
     )
+    reid_merge_events = [
+        {
+            "frame_idx": int(f_re),
+            "type": "reid_cross_exit_merge",
+            "raw_track_id": int(tids[row_v]),
+            "canonical_track_id": int(new_tid[row_u]),
+            "similarity": round(float(sim), 3),
+        }
+        for f_re, row_u, row_v, sim in reid_link_meta
+    ]
     stats = {
         "unique_tracks_before": unique_before,
         "unique_tracks_after": len(tracklets),
         "interpolated_rows": n_interp,
-        "merges": max(raw_merges, n_long_merges),
+        "merges": raw_merges,
+        "reid_merges": len(reid_merge_events),
         "splits": n_splits,
+        "reid_merge_events": reid_merge_events,
     }
     return out[out_order], src_idx[out_order], stats
 
@@ -1838,8 +1878,10 @@ def postprocess_records(
             unique_tracks_after=0,
             interpolated_rows=0,
             merges=0,
+            reid_merges=0,
             splits=0,
             elapsed_ms=0.0,
+            reid_merge_events=[],
         )
 
     n = len(records)
@@ -1944,8 +1986,10 @@ def postprocess_records(
         unique_tracks_after=stats["unique_tracks_after"],
         interpolated_rows=stats["interpolated_rows"],
         merges=stats["merges"],
+        reid_merges=stats["reid_merges"],
         splits=stats["splits"],
         elapsed_ms=elapsed_ms,
+        reid_merge_events=stats["reid_merge_events"],
     )
 
 

@@ -642,7 +642,7 @@ class TrackCardIndex:
         raw_track_ids: list[int],
         *,
         frame_dt_s: float = 0.0,
-        merges: int = 0,
+        reid_merges: int = 0,
     ) -> None:
         """Rebuild Track Cards from finalized offline post-processed records.
 
@@ -653,7 +653,6 @@ class TrackCardIndex:
         """
         old_cards = self.cards
         old_vlm_sum = self._vlm_sum
-        old_reid_sum = self._reid_sum
 
         by_tid: dict[int, list[tuple[dict[str, Any], int]]] = {}
         for rec, src_i in zip(records, source_row_indices.tolist(), strict=True):
@@ -662,7 +661,6 @@ class TrackCardIndex:
         new_cards: dict[int, TrackCard] = {}
         new_vlm_sum: dict[int, np.ndarray] = {}
         new_vlm_emb: dict[int, np.ndarray] = {}
-        new_reid_sum: dict[int, np.ndarray] = {}
 
         for tid, items in sorted(by_tid.items()):
             first_rec = items[0][0]
@@ -702,18 +700,19 @@ class TrackCardIndex:
                 best_thumb_conf = -1.0
                 for rid in contrib_raw_ids:
                     oc = old_cards.get(rid)
-                    if oc is not None and oc.thumbnail_relpath and oc.best_confidence > best_thumb_conf:
+                    if (
+                        oc is not None
+                        and oc.thumbnail_relpath
+                        and oc.best_confidence > best_thumb_conf
+                    ):
                         best_thumb_conf = oc.best_confidence
                         thumb = oc.thumbnail_relpath
 
-            # Aggregate VLM & Re-ID sums from contributing raw cards
+            # Aggregate VLM sums from contributing raw cards
             v_sum: np.ndarray | None = None
-            r_sum: np.ndarray | None = None
             for rid in contrib_raw_ids:
                 if rid in old_vlm_sum:
                     v_sum = old_vlm_sum[rid].copy() if v_sum is None else v_sum + old_vlm_sum[rid]
-                if rid in old_reid_sum:
-                    r_sum = old_reid_sum[rid].copy() if r_sum is None else r_sum + old_reid_sum[rid]
 
             emb_list: list[float] | None = None
             q_score: float | None = None
@@ -728,9 +727,6 @@ class TrackCardIndex:
                     q_match = q_score >= self.query_threshold
             elif self._query_vec is not None:
                 q_match = False
-
-            if r_sum is not None:
-                new_reid_sum[tid] = r_sum
 
             for rec, _ in items:
                 rec["query_score"] = None if q_score is None else round(float(q_score), 4)
@@ -756,7 +752,7 @@ class TrackCardIndex:
                 embedding=emb_list,
                 query_score=q_score,
                 query_match=q_match,
-                merged_track_ids=contrib_raw_ids[1:] if len(contrib_raw_ids) > 1 else [],
+                merged_track_ids=[],
                 zones_visited=zones_visited,
                 dwell_seconds=dwell_seconds,
             )
@@ -764,9 +760,9 @@ class TrackCardIndex:
         self.cards = new_cards
         self._vlm_sum = new_vlm_sum
         self._vlm_emb = new_vlm_emb
-        self._reid_sum = new_reid_sum
+        self._reid_sum.clear()
         self._alias.clear()
-        self.reid_merges = int(merges)
+        self.reid_merges = int(reid_merges)
 
     def save_json(
         self, path: Path, *, reid_backend: str = "none", vlm_backend: str = "none"

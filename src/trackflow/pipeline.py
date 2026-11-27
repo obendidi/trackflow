@@ -222,8 +222,6 @@ def _is_replayable_source(source: str | Path | int) -> bool:
     """Return True when ``source`` is a local video file or image directory that can be re-read."""
     if isinstance(source, int) or _is_stream_url(source):
         return False
-    if isinstance(source, str) and (source.isdigit() or source.lower() == "camera"):
-        return Path(source).exists()
     p = Path(source)
     return p.is_file() or p.is_dir()
 
@@ -231,12 +229,20 @@ def _is_replayable_source(source: str | Path | int) -> bool:
 def _match_track_embeddings(
     tracks: list[Track],
     detections: list[Detection],
-    frame_bgr: np.ndarray,
+    frame_bgr: np.ndarray | None,
     reid_embedder: ReidEmbedder | None,
+    *,
+    seen_counts: dict[int, int] | None = None,
+    sample_every: int = 3,
 ) -> list[np.ndarray | None]:
-    """Attach a Re-ID embedding to each track, reusing detection embeddings when already computed."""
-    if not tracks or reid_embedder is None:
-        return [None] * len(tracks)
+    """Attach a float16 Re-ID embedding to each track, reusing detection embeddings when present.
+
+    When a tracker did not attach embeddings to detections (e.g. ByteTrack/OC-SORT with
+    ``--reid osnet``), crops are encoded on track birth and every ``sample_every`` observations of
+    each raw track to match ``TrackCardIndex.reid_sample_every`` and bound CPU overhead.
+    """
+    if not tracks:
+        return []
 
     out: list[np.ndarray | None] = [None] * len(tracks)
     det_with_emb = [d for d in detections if d.embedding is not None]
@@ -247,16 +253,94 @@ def _match_track_embeddings(
         for i, tr in enumerate(tracks):
             j = int(np.argmax(iou[i]))
             if float(iou[i, j]) >= 0.5 and det_with_emb[j].class_id == tr.class_id:
-                out[i] = det_with_emb[j].embedding
+                emb = det_with_emb[j].embedding
+                if emb is not None:
+                    out[i] = np.asarray(emb, dtype=np.float16)
 
-    missing = [
-        i for i, tr in enumerate(tracks) if out[i] is None and tr.class_name.lower() == "person"
-    ]
+    if reid_embedder is None or frame_bgr is None:
+        return out
+
+    missing: list[int] = []
+    for i, tr in enumerate(tracks):
+        obs_n = seen_counts.get(tr.track_id, 0) if seen_counts is not None else 0
+        if seen_counts is not None:
+            seen_counts[tr.track_id] = obs_n + 1
+        if (
+            out[i] is None
+            and tr.class_name.lower() == "person"
+            and (sample_every <= 1 or obs_n % sample_every == 0)
+        ):
+            missing.append(i)
     if missing:
         crops = [_crop(frame_bgr, tracks[i].bbox) for i in missing]
         for i, emb in zip(missing, reid_embedder.encode_images(crops), strict=True):
-            out[i] = emb
+            if emb is not None:
+                out[i] = np.asarray(emb, dtype=np.float16)
     return out
+
+
+def _pack_postprocess_embeddings(
+    embs: Sequence[np.ndarray | None],
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Pack per-observation optional embeddings into dense ``(N, D)`` float32 + bool mask."""
+    dim = next((int(e.shape[0]) for e in embs if e is not None), 0)
+    if dim <= 0:
+        return None, None
+    dense = np.zeros((len(embs), dim), dtype=np.float32)
+    valid = np.zeros((len(embs),), dtype=bool)
+    for i, emb in enumerate(embs):
+        if emb is not None:
+            dense[i] = np.asarray(emb, dtype=np.float32)
+            valid[i] = True
+    return dense, valid
+
+
+def _remap_tracker_events(
+    raw_events: list[dict[str, Any]],
+    records: list[dict[str, Any]],
+    source_row_indices: np.ndarray,
+    raw_tids: list[int],
+    raw_frames: list[int],
+) -> list[dict[str, Any]]:
+    """Remap Pass-1 tracker lifecycle events from raw IDs to finalized post-processed IDs."""
+    exact: dict[tuple[int, int], int] = {}
+    by_raw: dict[int, list[tuple[int, int]]] = defaultdict(list)
+    for rec, si in zip(records, source_row_indices.tolist(), strict=True):
+        if si < 0:
+            continue
+        fid = int(rec["track_id"])
+        rid = raw_tids[si]
+        f_i = raw_frames[si]
+        exact[(f_i, rid)] = fid
+        by_raw[rid].append((f_i, fid))
+
+    def _resolve(frame_idx: int, raw_id: int) -> int | None:
+        hit = exact.get((frame_idx, raw_id))
+        if hit is not None:
+            return hit
+        hist = by_raw.get(raw_id)
+        if not hist:
+            return None
+        return min(hist, key=lambda pair: abs(pair[0] - frame_idx))[1]
+
+    remapped: list[dict[str, Any]] = []
+    for ev in raw_events:
+        f_i = int(ev.get("frame_idx", 0))
+        et = ev.get("type")
+        if et == "possible_id_switch":
+            new_id = _resolve(f_i, int(ev["new_track_id"]))
+            prev_id = _resolve(f_i, int(ev["previous_track_id"]))
+            if new_id is None or prev_id is None or new_id == prev_id:
+                continue
+            remapped.append({**ev, "new_track_id": new_id, "previous_track_id": prev_id})
+        elif "track_id" in ev:
+            fid = _resolve(f_i, int(ev["track_id"]))
+            if fid is None:
+                continue
+            remapped.append({**ev, "track_id": fid})
+        else:
+            remapped.append(ev)
+    return remapped
 
 
 class TrackflowPipeline:
@@ -502,6 +586,226 @@ class TrackflowPipeline:
             )
             yield result
 
+    def _finalize_postprocess(
+        self,
+        pp_records: list[dict[str, Any]],
+        pp_embs: list[np.ndarray | None],
+        pp_cmc_by_frame: dict[int, np.ndarray],
+        pp_frame_indices: list[int],
+        raw_events: list[dict[str, Any]],
+        *,
+        tracker: Tracker,
+        card_index: TrackCardIndex,
+        floorplan: FloorplanHomography | None,
+        counter: LineCounter | None,
+        src_fps: float,
+        frame_dt_s: float,
+        stride: int,
+        width: int,
+        height: int,
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[int, list[dict[str, Any]]],
+        list[dict[str, Any]],
+        dict[int, dict[str, dict[str, int]]],
+        int,
+    ]:
+        """Run offline post-processing and recompute floorplan, line counts, cards, and events."""
+        raw_tids = [int(r["track_id"]) for r in pp_records]
+        raw_frames = [int(r["frame_idx"]) for r in pp_records]
+        emb_dense, emb_valid = _pack_postprocess_embeddings(pp_embs)
+
+        cmc_warps: np.ndarray | None = None
+        cmc_valid: np.ndarray | None = None
+        if pp_cmc_by_frame:
+            n_cmc = max(pp_frame_indices[-1] + 1, max(pp_cmc_by_frame) + 1)
+            cmc_warps = np.broadcast_to(
+                np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+                (n_cmc, 2, 3),
+            ).copy()
+            cmc_valid = np.zeros((n_cmc,), dtype=bool)
+            for f_i, w_mat in pp_cmc_by_frame.items():
+                cmc_warps[f_i] = w_mat
+                cmc_valid[f_i] = True
+
+        buf = getattr(tracker, "track_buffer", None)
+        min_exit_gap = max(8, ((buf or 0) + 1) * stride)
+        pp_res = postprocess_records(
+            pp_records,
+            fps=src_fps,
+            frame_width=width,
+            frame_height=height,
+            embeddings=emb_dense,
+            emb_valid=emb_valid,
+            cmc_warps=cmc_warps,
+            cmc_valid=cmc_valid,
+            frame_stride=stride,
+            allow_long_reid_merge=self.reid_merge,
+            min_exit_gap_frames=min_exit_gap,
+        )
+        final_records = pp_res.records
+
+        by_frame: dict[int, list[dict[str, Any]]] = defaultdict(list)
+        by_frame_src: dict[int, list[int]] = defaultdict(list)
+        for rec, si in zip(final_records, pp_res.source_row_indices.tolist(), strict=True):
+            f_i = int(rec["frame_idx"])
+            by_frame[f_i].append(rec)
+            by_frame_src[f_i].append(int(si))
+
+        if floorplan is not None:
+            for f_i in pp_frame_indices:
+                for rec in by_frame.get(f_i, ()):
+                    foot = (0.5 * (rec["x1"] + rec["x2"]), rec["y2"])
+                    wxy, zone = floorplan.observe(int(rec["track_id"]), foot, dt_s=frame_dt_s)
+                    rec["world_x"] = round(float(wxy[0]), 3)
+                    rec["world_y"] = round(float(wxy[1]), 3)
+                    rec["zone"] = zone
+
+        final_events = _remap_tracker_events(
+            raw_events, final_records, pp_res.source_row_indices, raw_tids, raw_frames
+        )
+        for ev in pp_res.reid_merge_events:
+            final_events.append(
+                {**ev, "timestamp_s": round(int(ev["frame_idx"]) / max(src_fps, 1e-6), 3)}
+            )
+
+        line_counts_by_frame: dict[int, dict[str, dict[str, int]]] = {}
+        if counter is not None:
+            last_obs: dict[int, tuple[int, int]] = {}  # final_tid -> (last_frame, last_raw_id)
+            for f_i in pp_frame_indices:
+                f_recs = by_frame.get(f_i, ())
+                f_srcs = by_frame_src.get(f_i, ())
+                if f_recs:
+                    f_tracks: list[Track] = []
+                    ts = float(f_recs[0]["timestamp_s"])
+                    for rec, si in zip(f_recs, f_srcs, strict=True):
+                        tid = int(rec["track_id"])
+                        if si >= 0:
+                            cur_raw = raw_tids[si]
+                            prev = last_obs.get(tid)
+                            # Reset line state only across stitched exits between different raw IDs.
+                            if (
+                                prev is not None
+                                and cur_raw != prev[1]
+                                and f_i - prev[0] >= min_exit_gap
+                            ):
+                                counter.forget_track(tid)
+                            last_obs[tid] = (f_i, cur_raw)
+                        f_tracks.append(
+                            Track(
+                                track_id=tid,
+                                bbox=(rec["x1"], rec["y1"], rec["x2"], rec["y2"]),
+                                confidence=rec["confidence"],
+                                class_id=rec["class_id"],
+                                class_name=rec["class_name"],
+                            )
+                        )
+                    for ev in counter.update(f_tracks, ts):
+                        final_events.append({"frame_idx": f_i, "timestamp_s": round(ts, 3), **ev})
+                line_counts_by_frame[f_i] = {name: dict(c) for name, c in counter.counts.items()}
+
+        card_index.rebuild_from_postprocess(
+            final_records,
+            pp_res.source_row_indices,
+            raw_tids,
+            frame_dt_s=frame_dt_s,
+            reid_merges=pp_res.reid_merges,
+        )
+        final_events.append(
+            {
+                "frame_idx": pp_frame_indices[-1],
+                "timestamp_s": round(pp_frame_indices[-1] / src_fps, 3),
+                "type": "offline_postprocess",
+                "unique_tracks_before": pp_res.unique_tracks_before,
+                "unique_tracks_after": pp_res.unique_tracks_after,
+                "interpolated_rows": pp_res.interpolated_rows,
+                "merges": pp_res.merges,
+                "reid_merges": pp_res.reid_merges,
+                "splits": pp_res.splits,
+                "elapsed_ms": round(pp_res.elapsed_ms, 2),
+            }
+        )
+        final_events.sort(key=lambda e: int(e.get("frame_idx", 0)))
+        return final_records, by_frame, final_events, line_counts_by_frame, min_exit_gap
+
+    def _replay_postprocess_video(
+        self,
+        source: str | Path | int,
+        video_path: Path,
+        by_frame: dict[int, list[dict[str, Any]]],
+        pp_privacy_masks: dict[int, tuple[list[Detection], list[Track]]],
+        line_counts_by_frame: dict[int, dict[str, dict[str, int]]],
+        *,
+        seen_frames: int,
+        src_fps: float,
+        skip: int,
+        width: int,
+        height: int,
+        gap_reset_frames: int,
+        stop: threading.Event,
+    ) -> None:
+        """Render ``annotated.mp4`` from finalized post-processed tracks while preserving masks."""
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out_fps = src_fps / max(1, skip + 1)
+        v_writer = cv2.VideoWriter(str(video_path), fourcc, out_fps, (width, height))
+        if not v_writer.isOpened():
+            v_writer.release()
+            raise RuntimeError(f"Could not open MP4 video writer at {video_path}")
+        pp_trails: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        last_trail_frame: dict[int, int] = {}
+        replay_iter, _, _, _, _ = _iter_frames(source, max_frames=seen_frames, fps=src_fps)
+        try:
+            for f_i, _ts, f_bgr in replay_iter:
+                if stop.is_set():
+                    break
+                if skip > 0 and (f_i % (skip + 1) != 0):
+                    continue
+                f_recs = by_frame.get(f_i, ())
+                f_tracks = [
+                    Track(
+                        track_id=int(r["track_id"]),
+                        bbox=(r["x1"], r["y1"], r["x2"], r["y2"]),
+                        confidence=float(r["confidence"]),
+                        class_id=int(r["class_id"]),
+                        class_name=str(r["class_name"]),
+                        query_score=r["query_score"],
+                        query_match=bool(r["query_match"]),
+                        zone=r["zone"],
+                    )
+                    for r in f_recs
+                ]
+                for tr in f_tracks:
+                    prev_f = last_trail_frame.get(tr.track_id)
+                    if prev_f is not None and f_i - prev_f > gap_reset_frames:
+                        pp_trails[tr.track_id].clear()
+                    last_trail_frame[tr.track_id] = f_i
+                    fx, fy = tr.foot_point
+                    trl = pp_trails[tr.track_id]
+                    trl.append((int(round(fx)), int(round(fy))))
+                    del trl[:-48]
+                saved_dets, saved_coasting = pp_privacy_masks.get(f_i, ([], []))
+                # In skeleton mode, draw only finalized tracks (avoid double-drawing stale coasting).
+                mask_coasting = () if self.anonymize_mode == "skeleton" else saved_coasting
+                anon_frame = self.anonymizer.apply(
+                    f_bgr,
+                    f_tracks,
+                    detections=saved_dets,
+                    coasting=mask_coasting,
+                )
+                rendered = draw_tracks(
+                    anon_frame,
+                    f_tracks,
+                    trails=pp_trails,
+                    query=self.query,
+                    anonymize_mode=self.anonymize_mode,
+                    lines=self.lines,
+                    line_counts=line_counts_by_frame.get(f_i) if self.lines else None,
+                )
+                v_writer.write(rendered)
+        finally:
+            replay_iter.close()
+            v_writer.release()
+
     def run(
         self,
         source: str | Path | int,
@@ -522,6 +826,8 @@ class TrackflowPipeline:
         """
         if skip < 0 or (max_frames is not None and max_frames < 1):
             raise ValueError("skip must be nonnegative and max_frames must be positive.")
+        if self.postprocess and not _is_replayable_source(source):
+            raise ValueError("--postprocess requires a recorded video file or image directory.")
         if isinstance(exports, str):
             exports = exports.split(",")
         export_set = {e.lower().strip() for e in exports}
@@ -550,7 +856,7 @@ class TrackflowPipeline:
             floorplan = self.homography.fresh() if self.homography else None
             counter = self._new_counter()
 
-            defer_video = self.postprocess and save_video and _is_replayable_source(source)
+            defer_video = self.postprocess and save_video
             video_writer: cv2.VideoWriter | None = None
             video_path = out_dir / "annotated.mp4"
             if save_video and not defer_video:
@@ -582,6 +888,7 @@ class TrackflowPipeline:
             )
             pp_records: list[dict[str, Any]] = []
             pp_embs: list[np.ndarray | None] = []
+            pp_seen_counts: dict[int, int] = {}
             pp_cmc_by_frame: dict[int, np.ndarray] = {}
             pp_frame_indices: list[int] = []
             pp_privacy_masks: dict[int, tuple[list[Detection], list[Track]]] = {}
@@ -633,7 +940,12 @@ class TrackflowPipeline:
                         if warp is not None:
                             pp_cmc_by_frame[frame_idx] = np.asarray(warp, dtype=np.float32)
                         obs_embs = _match_track_embeddings(
-                            tracks, dets, frame_bgr, self.reid_embedder
+                            tracks,
+                            dets,
+                            frame_bgr,
+                            self.reid_embedder,
+                            seen_counts=pp_seen_counts,
+                            sample_every=card_index.reid_sample_every,
                         )
                         for tr, emb in zip(tracks, obs_embs, strict=True):
                             if tr.recovered:
@@ -643,6 +955,11 @@ class TrackflowPipeline:
                             rec["x1"], rec["y1"], rec["x2"], rec["y2"] = tr.bbox
                             pp_records.append(rec)
                             pp_embs.append(emb)
+                            if display:
+                                fx, fy = tr.foot_point
+                                trail = trails[tr.track_id]
+                                trail.append((int(round(fx)), int(round(fy))))
+                                del trail[:-48]
                     else:
                         for tr in tracks:
                             if tr.recovered:
@@ -671,8 +988,12 @@ class TrackflowPipeline:
                             if hasattr(tracker, "coasting_tracks")
                             else []
                         )
-                        # Preserve all raw detections & coasting boxes so Pass 2 privacy masking
-                        # covers every box that online anonymization would mask.
+                        # Preserve all raw detections, Pass-1 track boxes & coasting boxes so
+                        # Pass-2 privacy masking covers every box even after smoothing shifts.
+                        raw_track_masks = [
+                            Track(tr.track_id, tr.bbox, tr.confidence, tr.class_id, tr.class_name)
+                            for tr in tracks
+                        ]
                         pp_privacy_masks[frame_idx] = (
                             [
                                 Detection(
@@ -683,7 +1004,7 @@ class TrackflowPipeline:
                                 )
                                 for d in dets
                             ],
-                            coasting,
+                            [*coasting, *raw_track_masks],
                         )
 
                     if (save_video and not defer_video) or display:
@@ -735,176 +1056,49 @@ class TrackflowPipeline:
                 raise RuntimeError(f"No readable frames in {source}")
 
             if self.postprocess:
-                raw_tids = [int(r["track_id"]) for r in pp_records]
-                emb_dense: np.ndarray | None = None
-                emb_valid: np.ndarray | None = None
-                if any(e is not None for e in pp_embs):
-                    dim = next(e.shape[0] for e in pp_embs if e is not None)
-                    emb_dense = np.zeros((len(pp_embs), dim), dtype=np.float32)
-                    emb_valid = np.zeros((len(pp_embs),), dtype=bool)
-                    for idx_e, emb in enumerate(pp_embs):
-                        if emb is not None:
-                            emb_dense[idx_e] = np.asarray(emb, dtype=np.float32)
-                            emb_valid[idx_e] = True
-
-                cmc_warps: np.ndarray | None = None
-                cmc_valid: np.ndarray | None = None
-                if pp_cmc_by_frame:
-                    n_cmc = max(pp_frame_indices[-1] + 1, max(pp_cmc_by_frame) + 1)
-                    cmc_warps = np.broadcast_to(
-                        np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
-                        (n_cmc, 2, 3),
-                    ).copy()
-                    cmc_valid = np.zeros((n_cmc,), dtype=bool)
-                    for f_i, w_mat in pp_cmc_by_frame.items():
-                        cmc_warps[f_i] = w_mat
-                        cmc_valid[f_i] = True
-
-                buf = getattr(tracker, "track_buffer", None)
-                pp_res = postprocess_records(
-                    pp_records,
-                    fps=src_fps,
-                    frame_width=width,
-                    frame_height=height,
-                    embeddings=emb_dense,
-                    emb_valid=emb_valid,
-                    cmc_warps=cmc_warps,
-                    cmc_valid=cmc_valid,
-                    frame_stride=stride,
-                    allow_long_reid_merge=self.reid_merge,
-                    min_exit_gap_frames=max(8, ((buf or 0) + 1) * stride),
-                )
-                final_records = pp_res.records
-                observations = len(final_records)
-
-                # Group finalized records by frame for floorplan, line counting, exports & Pass 2 video.
-                by_frame: dict[int, list[dict[str, Any]]] = defaultdict(list)
-                for rec in final_records:
-                    by_frame[int(rec["frame_idx"])].append(rec)
-
-                # Recompute floorplan projections & dwell totals from finalized boxes.
-                if floorplan is not None:
-                    for f_i in pp_frame_indices:
-                        for rec in by_frame.get(f_i, ()):
-                            foot = (0.5 * (rec["x1"] + rec["x2"]), rec["y2"])
-                            wxy, zone = floorplan.observe(
-                                int(rec["track_id"]), foot, dt_s=frame_dt_s
-                            )
-                            rec["world_x"] = round(float(wxy[0]), 3)
-                            rec["world_y"] = round(float(wxy[1]), 3)
-                            rec["zone"] = zone
-
-                # Recompute line crossings strictly within continuous segments (reset across long gaps).
-                if counter is not None:
-                    gap_reset_frames = max(3 * stride, int(round(0.5 * src_fps)))
-                    last_seen_frame: dict[int, int] = {}
-                    for f_i in pp_frame_indices:
-                        f_recs = by_frame.get(f_i, ())
-                        if not f_recs:
-                            continue
-                        f_tracks: list[Track] = []
-                        ts = float(f_recs[0]["timestamp_s"])
-                        for rec in f_recs:
-                            tid = int(rec["track_id"])
-                            prev_f = last_seen_frame.get(tid)
-                            if prev_f is not None and f_i - prev_f > gap_reset_frames:
-                                counter.forget_track(tid)
-                            last_seen_frame[tid] = f_i
-                            f_tracks.append(
-                                Track(
-                                    track_id=tid,
-                                    bbox=(rec["x1"], rec["y1"], rec["x2"], rec["y2"]),
-                                    confidence=rec["confidence"],
-                                    class_id=rec["class_id"],
-                                    class_name=rec["class_name"],
-                                )
-                            )
-                        for ev in counter.update(f_tracks, ts):
-                            all_events.append(
-                                {"frame_idx": f_i, "timestamp_s": round(ts, 3), **ev}
-                            )
-
-                card_index.rebuild_from_postprocess(
+                (
                     final_records,
-                    pp_res.source_row_indices,
-                    raw_tids,
+                    by_frame,
+                    all_events,
+                    line_counts_by_frame,
+                    gap_reset_frames,
+                ) = self._finalize_postprocess(
+                    pp_records,
+                    pp_embs,
+                    pp_cmc_by_frame,
+                    pp_frame_indices,
+                    all_events,
+                    tracker=tracker,
+                    card_index=card_index,
+                    floorplan=floorplan,
+                    counter=counter,
+                    src_fps=src_fps,
                     frame_dt_s=frame_dt_s,
-                    merges=pp_res.merges,
+                    stride=stride,
+                    width=width,
+                    height=height,
                 )
-                all_events.append(
-                    {
-                        "frame_idx": pp_frame_indices[-1],
-                        "timestamp_s": round(pp_frame_indices[-1] / src_fps, 3),
-                        "type": "offline_postprocess",
-                        "unique_tracks_before": pp_res.unique_tracks_before,
-                        "unique_tracks_after": pp_res.unique_tracks_after,
-                        "interpolated_rows": pp_res.interpolated_rows,
-                        "merges": pp_res.merges,
-                        "splits": pp_res.splits,
-                        "elapsed_ms": round(pp_res.elapsed_ms, 2),
-                    }
-                )
-
+                observations = len(final_records)
                 if paths:
                     for rec in final_records:
                         sink.append(rec)
                 if "html" in export_set:
                     counts = [len(by_frame.get(f_i, ())) for f_i in pp_frame_indices]
-
                 if defer_video:
-                    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    out_fps = src_fps / max(1, skip + 1)
-                    v_writer = cv2.VideoWriter(str(video_path), fourcc, out_fps, (width, height))
-                    if not v_writer.isOpened():
-                        v_writer.release()
-                        raise RuntimeError(f"Could not open MP4 video writer at {video_path}")
-                    pp_trails: dict[int, list[tuple[int, int]]] = defaultdict(list)
-                    replay_iter, _, _, _, _ = _iter_frames(
-                        source, max_frames=seen_frames, fps=src_fps
+                    self._replay_postprocess_video(
+                        source,
+                        video_path,
+                        by_frame,
+                        pp_privacy_masks,
+                        line_counts_by_frame,
+                        seen_frames=seen_frames,
+                        src_fps=src_fps,
+                        skip=skip,
+                        width=width,
+                        height=height,
+                        gap_reset_frames=gap_reset_frames,
+                        stop=stop,
                     )
-                    try:
-                        for f_i, _ts, f_bgr in replay_iter:
-                            if skip > 0 and (f_i % (skip + 1) != 0):
-                                continue
-                            f_recs = by_frame.get(f_i, ())
-                            f_tracks = [
-                                Track(
-                                    track_id=int(r["track_id"]),
-                                    bbox=(r["x1"], r["y1"], r["x2"], r["y2"]),
-                                    confidence=float(r["confidence"]),
-                                    class_id=int(r["class_id"]),
-                                    class_name=str(r["class_name"]),
-                                    query_score=r["query_score"],
-                                    query_match=bool(r["query_match"]),
-                                    zone=r["zone"],
-                                )
-                                for r in f_recs
-                            ]
-                            for tr in f_tracks:
-                                fx, fy = tr.foot_point
-                                trl = pp_trails[tr.track_id]
-                                trl.append((int(round(fx)), int(round(fy))))
-                                del trl[:-48]
-                            saved_dets, saved_coasting = pp_privacy_masks.get(f_i, ([], []))
-                            anon_frame = self.anonymizer.apply(
-                                f_bgr,
-                                f_tracks,
-                                detections=saved_dets,
-                                coasting=saved_coasting,
-                            )
-                            rendered = draw_tracks(
-                                anon_frame,
-                                f_tracks,
-                                trails=pp_trails,
-                                query=self.query,
-                                anonymize_mode=self.anonymize_mode,
-                                lines=self.lines,
-                                line_counts=counter.counts if counter else None,
-                            )
-                            v_writer.write(rendered)
-                    finally:
-                        replay_iter.close()
-                        v_writer.release()
             elif spool is not None:
                 spool.seek(0)
                 for line in spool:
