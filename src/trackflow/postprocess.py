@@ -1504,11 +1504,12 @@ def _cross_exit_reid_merge(
             x = parent[x]
         return x
 
-    def _separated(a: _Tracklet, b: _Tracklet) -> bool:
+    def _compatible(a: _Tracklet, b: _Tracklet) -> bool:
+        assert a.emb_full is not None and b.emb_full is not None
         return (
             a.end_frame + min_exit_gap_frames <= b.start_frame
             or b.end_frame + min_exit_gap_frames <= a.start_frame
-        )
+        ) and float(np.dot(a.emb_full, b.emb_full)) >= threshold
 
     pair_sims.sort(key=lambda x: (-x[0], tracklets[x[2]].start_frame - tracklets[x[1]].end_frame))
     for sim, u, v in pair_sims:
@@ -1525,7 +1526,7 @@ def _cross_exit_reid_merge(
         if sim - o_runner < margin or sim - i_runner < margin:
             continue
         if not all(
-            _separated(tracklets[a], tracklets[b]) for a in members[ru] for b in members[rv]
+            _compatible(tracklets[a], tracklets[b]) for a in members[ru] for b in members[rv]
         ):
             continue
         if len(members[ru]) < len(members[rv]):

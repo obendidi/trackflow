@@ -750,15 +750,17 @@ class TrackflowPipeline:
         gap_reset_frames: int,
     ) -> None:
         """Render ``annotated.mp4`` from finalized post-processed tracks while preserving masks."""
+        replay_iter, _, _, _, _ = _iter_frames(source, max_frames=seen_frames, fps=src_fps)
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         out_fps = src_fps / max(1, skip + 1)
         v_writer = cv2.VideoWriter(str(video_path), fourcc, out_fps, (width, height))
         if not v_writer.isOpened():
+            replay_iter.close()
             v_writer.release()
+            video_path.unlink(missing_ok=True)
             raise RuntimeError(f"Could not open MP4 video writer at {video_path}")
         pp_trails: dict[int, list[tuple[int, int]]] = defaultdict(list)
         last_trail_frame: dict[int, int] = {}
-        replay_iter, _, _, _, _ = _iter_frames(source, max_frames=seen_frames, fps=src_fps)
         written_frames = 0
         try:
             with _stop_on_interrupt() as replay_stop:

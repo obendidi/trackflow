@@ -299,6 +299,43 @@ def test_postprocess_cross_exit_reid_rejects_overlapping_lookalikes() -> None:
     assert res.reid_merges == 0
 
 
+def test_postprocess_cross_exit_reid_rejects_single_linkage_bridge() -> None:
+    # Complete-linkage guard: sim(A, C) ~= 0.86 and sim(B, C) ~= 0.84 both clear 0.80,
+    # but sim(A, B) ~= 0.55 < 0.80 so B must NOT be bridged into A+C.
+    def _unit(v: list[float]) -> np.ndarray:
+        a = np.array(v, dtype=np.float32)
+        return a / float(np.linalg.norm(a))
+
+    e_c = _unit([1.0, 0.0, 0.0, 0.0])
+    e_a = _unit([0.86, 0.5103, 0.0, 0.0])
+    e_b = _unit([0.84, -0.34, 0.423, 0.0])
+    assert float(e_a @ e_c) > 0.85 and float(e_b @ e_c) > 0.83 and float(e_a @ e_b) < 0.60
+
+    recs: list[dict] = []
+    embs: list[np.ndarray] = []
+    for seg_tid, start_f, x0, vec in (
+        (1, 0, 20, e_a),
+        (2, 45, 220, e_b),
+        (3, 90, 420, e_c),
+    ):
+        for f in range(start_f, start_f + 10):
+            recs.append(Track(seg_tid, (x0, 40, x0 + 60, 180), 0.9, 0, "person").to_record(f, f / 10.0))
+            embs.append(vec)
+
+    res = postprocess_records(
+        recs,
+        fps=10.0,
+        frame_width=640,
+        frame_height=480,
+        embeddings=np.stack(embs),
+        allow_long_reid_merge=True,
+        min_exit_gap_frames=8,
+    )
+    assert res.unique_tracks_after == 2
+    assert res.reid_merges == 1
+    assert all(ev["similarity"] >= 0.80 for ev in res.reid_merge_events)
+
+
 def test_postprocess_low_fps_horizon_scales_in_seconds() -> None:
     r1 = _linear_track_rows(1, list(range(0, 10)), x0=100.0, y0=150.0, vx=0.0, vy=0.0)
     r_far = _linear_track_rows(2, list(range(70, 80)), x0=102.0, y0=150.0, vx=0.0, vy=0.0)
