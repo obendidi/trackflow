@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import functools
+import hashlib
 import json
 import os
 import platform
+import shutil
+import site
+import subprocess
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Protocol
@@ -132,6 +138,106 @@ def _allowed_classes(classes: Sequence[str] | None) -> set[str] | None:
     return names
 
 
+_CUDA_INSTALL_HINT = (
+    "Install NVIDIA CUDA support in one command: "
+    "`pip uninstall -y onnxruntime && pip install 'onnxruntime-gpu[cuda,cudnn]>=1.22'` "
+    "(never keep both `onnxruntime` and `onnxruntime-gpu` in the same environment)."
+)
+_TRT_INSTALL_HINT = (
+    "Install NVIDIA TensorRT support in one command (Python 3.11+): "
+    "`pip uninstall -y onnxruntime && pip install 'onnxruntime-gpu[cuda,cudnn]>=1.28' 'tensorrt-cu13-libs>=10,<11'` "
+    "(never keep both `onnxruntime` and `onnxruntime-gpu` in the same environment)."
+)
+
+
+def detect_nvidia_gpu() -> str | None:
+    """Return ``'<name>, <driver>'`` from ``nvidia-smi`` when an NVIDIA GPU is present."""
+    if shutil.which("nvidia-smi") is None:
+        return None
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+            check=False,
+        )
+    except Exception:
+        return None
+    if res.returncode != 0:
+        return None
+    first = next((line.strip() for line in res.stdout.splitlines() if line.strip()), None)
+    return first or None
+
+
+@functools.lru_cache(maxsize=1)
+def preload_gpu_libraries() -> tuple[str, ...]:
+    """Preload pip-bundled CUDA, cuDNN, and TensorRT libraries so LD_LIBRARY_PATH is unneeded."""
+    available = ort.get_available_providers()
+    if (
+        "CUDAExecutionProvider" not in available
+        and "TensorrtExecutionProvider" not in available
+    ):
+        return ()
+    if hasattr(ort, "preload_dlls"):
+        with contextlib.suppress(Exception):
+            ort.preload_dlls(cuda=True, cudnn=True, msvc=(os.name == "nt"))
+
+    loaded: list[str] = []
+    seen_dirs: set[Path] = set()
+    search_roots: list[str] = []
+    with contextlib.suppress(Exception):
+        search_roots.extend(site.getsitepackages())
+    with contextlib.suppress(Exception):
+        user_site = site.getusersitepackages()
+        if user_site:
+            search_roots.append(user_site)
+
+    for root in search_roots:
+        root_path = Path(root)
+        if not root_path.is_dir():
+            continue
+        for lib_dir in sorted(root_path.glob("tensorrt*libs")):
+            if not lib_dir.is_dir() or lib_dir in seen_dirs:
+                continue
+            seen_dirs.add(lib_dir)
+            if os.name == "nt":
+                if hasattr(os, "add_dll_directory"):
+                    with contextlib.suppress(OSError):
+                        os.add_dll_directory(str(lib_dir))
+                for dll in sorted(lib_dir.glob("nvinfer*.dll")):
+                    loaded.append(dll.name)
+                continue
+            # Load core nvinfer before plugin and onnxparser so shared symbols resolve in order.
+            for pat in ("libnvinfer.so.*", "libnvinfer_plugin.so.*", "libnvonnxparser.so.*"):
+                for so in sorted(lib_dir.glob(pat)):
+                    if so.is_symlink():
+                        continue
+                    with contextlib.suppress(OSError):
+                        ctypes.CDLL(str(so), mode=ctypes.RTLD_GLOBAL)
+                        loaded.append(so.name)
+    return tuple(loaded)
+
+
+def _trt_cache_paths(
+    onnx_path: Path, *, trt_fp16: bool, cache_dir: str | Path | None = None
+) -> tuple[Path, Path]:
+    """Return ``(engine_dir, timing_cache_dir)`` for persistent TensorRT engine caching."""
+    if cache_dir is not None:
+        root = Path(cache_dir) / "trt_cache"
+    else:
+        env_dir = os.environ.get("TRACKFLOW_TRT_CACHE_DIR", "").strip()
+        root = Path(env_dir) if env_dir else Path.home() / ".cache" / "trackflow" / "trt_cache"
+    resolved = onnx_path.resolve()
+    key_parts = [str(resolved), "fp16" if trt_fp16 else "fp32"]
+    with contextlib.suppress(OSError):
+        st = resolved.stat()
+        key_parts.extend([str(st.st_size), str(st.st_mtime_ns)])
+    digest = hashlib.sha256("|".join(key_parts).encode("utf-8")).hexdigest()[:12]
+    engine_dir = root / f"{onnx_path.stem}_{digest}_{'fp16' if trt_fp16 else 'fp32'}"
+    return engine_dir, root
+
+
 def select_providers(device: str = "auto") -> list[str]:
     """Choose ONNX Runtime execution providers based on requested device."""
     available = ort.get_available_providers()
@@ -149,8 +255,13 @@ def select_providers(device: str = "auto") -> list[str]:
                 f"Unknown ONNX device {device!r}. Choose auto, cpu, coreml, cuda, or tensorrt."
             )
         if options[req][0] not in available:
+            hint = ""
+            if req == "cuda":
+                hint = f" {_CUDA_INSTALL_HINT}"
+            elif req == "tensorrt":
+                hint = f" {_TRT_INSTALL_HINT}"
             raise ValueError(
-                f"{device} requires {options[req][0]}. Available providers: {available}"
+                f"{device} requires {options[req][0]}. Available providers: {available}.{hint}"
             )
         return [p for p in options[req] if p in available]
 
@@ -199,17 +310,51 @@ def create_onnx_session(
     *,
     optimization: ort.GraphOptimizationLevel = ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
     coreml_format: str | None = "MLProgram",
+    trt_fp16: bool = True,
+    cache_dir: str | Path | None = None,
 ) -> tuple[ort.InferenceSession, str]:
     """Create an ONNX Runtime session with safe fallback to CPU if an EP fails."""
     providers = select_providers(device)
-    # CoreML runs on the GPU, not the Neural Engine, so results match the CPU's fp32.
-    # ``coreml_format=None`` keeps ONNX Runtime's default CoreML setup.
-    provider_options = [
-        {"ModelFormat": coreml_format, "MLComputeUnits": "CPUAndGPU"}
-        if p == "CoreMLExecutionProvider" and coreml_format is not None
-        else {}
-        for p in providers
-    ]
+    if (
+        "CUDAExecutionProvider" in providers
+        or "TensorrtExecutionProvider" in providers
+    ):
+        preload_gpu_libraries()
+
+    provider_options: list[dict[str, Any]] = []
+    for p in providers:
+        if p == "CoreMLExecutionProvider" and coreml_format is not None:
+            # CoreML runs on the GPU, not the Neural Engine, so results match the CPU's fp32.
+            # ``coreml_format=None`` keeps ONNX Runtime's default CoreML setup.
+            provider_options.append({"ModelFormat": coreml_format, "MLComputeUnits": "CPUAndGPU"})
+        elif p == "CUDAExecutionProvider":
+            # HEURISTIC cuts cuDNN startup search ~4-5x with identical steady-state throughput.
+            provider_options.append({"cudnn_conv_algo_search": "HEURISTIC"})
+        elif p == "TensorrtExecutionProvider":
+            engine_dir, timing_root = _trt_cache_paths(
+                onnx_path, trt_fp16=trt_fp16, cache_dir=cache_dir
+            )
+            engine_dir.mkdir(parents=True, exist_ok=True)
+            if not any(engine_dir.glob("*.engine")):
+                precision_label = "FP16" if trt_fp16 else "FP32"
+                print(
+                    f"Building TensorRT {precision_label} engine for {onnx_path.name} "
+                    f"(first run only; cached in {engine_dir})...",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            provider_options.append(
+                {
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path": str(engine_dir),
+                    "trt_timing_cache_enable": True,
+                    "trt_timing_cache_path": str(timing_root),
+                    "trt_fp16_enable": bool(trt_fp16),
+                }
+            )
+        else:
+            provider_options.append({})
+
     sess_opts = ort.SessionOptions()
     sess_opts.graph_optimization_level = optimization
     sess_opts.intra_op_num_threads = _default_onnx_threads()
@@ -233,8 +378,16 @@ def create_onnx_session(
 
     active = session.get_providers()
     active_name = active[0] if active else "CPUExecutionProvider"
-    if device.strip().lower() != "auto" and active_name != providers[0]:
-        raise RuntimeError(f"Could not start {providers[0]}. ONNX Runtime selected {active_name}.")
+    req = device.strip().lower()
+    if req != "auto" and active_name != providers[0]:
+        hint = ""
+        if providers[0] == "TensorrtExecutionProvider":
+            hint = f" {_TRT_INSTALL_HINT}"
+        elif providers[0] == "CUDAExecutionProvider":
+            hint = f" {_CUDA_INSTALL_HINT}"
+        raise RuntimeError(
+            f"Could not start {providers[0]}. ONNX Runtime selected {active_name}.{hint}"
+        )
     return session, active_name
 
 
@@ -425,6 +578,8 @@ class OnnxDetrDetector:
             device=effective_device,
             optimization=optimization,
             coreml_format=spec.coreml_format if spec else "MLProgram",
+            trt_fp16=spec.trt_fp16 if spec else True,
+            cache_dir=cache_dir,
         )
 
         self.input_name = self.session.get_inputs()[0].name
@@ -512,15 +667,17 @@ class OnnxDetrDetector:
     def preprocess(self, frame_bgr: np.ndarray) -> np.ndarray:
         """Convert OpenCV BGR uint8 frame to NCHW float tensor."""
         target_h, target_w = self.input_hw
-        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        resized = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        arr = resized.astype(np.float32)
+        # Resize before BGR->RGB so 1080p/4K frames color-convert 5-20x fewer pixels.
+        resized = cv2.resize(frame_bgr, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        arr = rgb.astype(np.float32)
         if self.do_rescale:
             arr *= 1.0 / 255.0
-        chw = np.transpose(arr, (2, 0, 1))
         if self.do_normalize:
-            chw = (chw - self.mean) / self.std
-        return np.expand_dims(chw, axis=0).astype(self.input_dtype, copy=False)
+            arr -= self.mean.reshape(1, 1, 3)
+            arr /= self.std.reshape(1, 1, 3)
+        chw = np.transpose(arr, (2, 0, 1))
+        return np.ascontiguousarray(np.expand_dims(chw, axis=0), dtype=self.input_dtype)
 
     def detect(self, frame_bgr: np.ndarray, threshold: float | None = None) -> list[Detection]:
         """Run object detection on a single BGR frame."""

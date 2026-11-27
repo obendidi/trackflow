@@ -30,6 +30,9 @@ class ModelSpec:
     # CoreML graph format for --device coreml. MLProgram covers more operators and gives the same
     # boxes as the CPU; NeuralNetwork is for graphs that MLProgram can't compile or crashes on.
     coreml_format: Literal["MLProgram", "NeuralNetwork"] = "MLProgram"
+    # Whether TensorRT EP can safely enable FP16 Tensor Cores for this graph. False keeps FP32
+    # when FP16 activations overflow and drop recall (e.g. DINOv2 backbones in RF-DETR).
+    trt_fp16: bool = True
     letterbox: bool = False  # keep the aspect ratio and pad with gray, as YOLO is trained
 
     @property
@@ -66,6 +69,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         description="384x384 DINOv2 detection transformer; fast on Apple Silicon and WebGPU.",
         revision="eae21cee0687a91bcf9fa071605c48d7705d2d91",
         normalize=True,  # onnx-community sidecar sets do_normalize=False, but RF-DETR expects ImageNet norm
+        trt_fp16=False,  # DINOv2 activations overflow FP16 in TensorRT and drop detections
     ),
     "dfine-n": ModelSpec(
         name="dfine-n",
@@ -118,6 +122,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         revision="7b18fa82ba7b1d6bc9446518cf2cc1d991097a3f",
         normalize=True,
         coreml_format="NeuralNetwork",  # MLProgram aborts the process in Metal's graph compiler
+        trt_fp16=False,  # DINOv2 activations overflow FP16 in TensorRT and drop detections
     ),
     "rfdetr-small": ModelSpec(
         "rfdetr-small",
@@ -129,6 +134,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         "512px COCO detector.",
         "63463b68b200177d1fea7015f11f3cebb0ba4eeb",
         normalize=True,
+        trt_fp16=False,  # DINOv2 activations overflow FP16 in TensorRT and drop detections
     ),
     "rfdetr-medium": ModelSpec(
         "rfdetr-medium",
@@ -140,6 +146,7 @@ MODEL_REGISTRY: dict[str, ModelSpec] = {
         "576px COCO detector.",
         "8553cefdd984bbaeb9d9ca8743d6a6a1c3e29dce",
         normalize=True,
+        trt_fp16=False,  # DINOv2 activations overflow FP16 in TensorRT and drop detections
     ),
     "rfdetr-large": ModelSpec(
         "rfdetr-large",

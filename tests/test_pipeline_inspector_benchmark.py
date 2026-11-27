@@ -326,8 +326,43 @@ def test_agent_cli_json_and_llms_txt(tmp_path: Path, monkeypatch) -> None:
     info_res = runner.invoke(app, ["info", "--json"])
     assert info_res.exit_code == 0, info_res.output
     info_data = json.loads(info_res.output)
-    assert {"version", "python", "platform", "onnxruntime", "available_providers"} <= set(info_data)
+    assert {
+        "version",
+        "python",
+        "platform",
+        "onnxruntime",
+        "available_providers",
+        "nvidia_gpu",
+        "apple_p_cores",
+        "tensorrt_libs",
+        "default_device",
+        "recommended_command",
+    } <= set(info_data)
     assert isinstance(info_data["available_providers"], list)
+
+    # When an NVIDIA GPU is present on a CPU-only ORT install, `info` prints the 1-line GPU command.
+    monkeypatch.setattr("trackflow.cli.detect_nvidia_gpu", lambda: "Tesla T4, 580.82")
+    monkeypatch.setattr("trackflow.cli.ort.get_available_providers", lambda: ["CPUExecutionProvider"])
+    gpu_info = json.loads(runner.invoke(app, ["info", "--json"]).output)
+    assert gpu_info["nvidia_gpu"] == "Tesla T4, 580.82"
+    assert "onnxruntime-gpu" in gpu_info["recommended_command"]
+
+    # TRACKFLOW_DEFAULT_DEVICE flows into `trackflow run` when --device is omitted.
+    seen_device: list[str] = []
+
+    def fake_create_det(**kwargs):
+        seen_device.append(kwargs["device"])
+        return _SyntheticMotionDetector()
+
+    vid = generate_synthetic_crowd_video(tmp_path / "env_dev.mp4", num_frames=4)
+    monkeypatch.setenv("TRACKFLOW_DEFAULT_DEVICE", "tensorrt")
+    monkeypatch.setattr("trackflow.pipeline.create_detector", fake_create_det)
+    run_res = runner.invoke(
+        app,
+        ["run", str(vid), "--no-video", "--export", "jsonl", "-o", str(tmp_path / "env_out")],
+    )
+    assert run_res.exit_code == 0, run_res.output
+    assert seen_device == ["tensorrt"]
 
     fake_hits = [
         {

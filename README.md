@@ -17,23 +17,52 @@ Try it in the browser without installing anything: [obendidi.github.io/trackflow
 
 ## Quickstart
 
-Run directly with `uvx`:
+One command for your hardware — no system CUDA Toolkit, cuDNN, or TensorRT setup required:
+
+| Environment | Install & run | Notes |
+| :--- | :--- | :--- |
+| **CPU / macOS** *(default)* | `uvx trackflow-python run street.mp4` *(or `pip install trackflow-python`)* | Auto-pins Apple Silicon to P-cores (~14 FPS on M4 Pro CPU) |
+| **macOS GPU (CoreML)** | `uvx trackflow-python run street.mp4 --device coreml` | Runs detector + static-batch OSNet Re-ID on Apple GPU |
+| **NVIDIA CUDA** | `pip install trackflow-python && pip uninstall -y onnxruntime && pip install "onnxruntime-gpu[cuda,cudnn]>=1.22"` then `trackflow run street.mp4` | Bundles CUDA + cuDNN; auto-selects CUDA (~37–105 FPS on T4) |
+| **NVIDIA TensorRT** *(Py 3.11+)* | `pip install trackflow-python && pip uninstall -y onnxruntime && pip install "onnxruntime-gpu[cuda,cudnn]>=1.28" "tensorrt-cu13-libs>=10,<11"` then `trackflow run street.mp4 --device tensorrt` | Bundles CUDA 13 + TensorRT 10 FP16; cached engines (~94–136 FPS on T4) |
+
+Or run via Docker with zero Python setup (`--target cpu`, `cuda`, or `tensorrt` in [Dockerfile](Dockerfile)):
 
 ```bash
-uvx trackflow-python run street.mp4
+docker build --target tensorrt -t trackflow:tensorrt .
+docker run --rm --gpus all -v "$PWD:/work" \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  -v "$HOME/.cache/trackflow:/root/.cache/trackflow" \
+  trackflow:tensorrt run /work/street.mp4
 ```
 
-Or install with `pip` / `uv` (provides the `trackflow` CLI and `import trackflow`):
+After a run finishes, open the local visual inspector:
 
 ```bash
-pip install trackflow-python
-trackflow run street.mp4
 trackflow inspect          # opens the most recent run
+trackflow info             # checks GPU, execution providers, and recommended command
 ```
 
 Each run writes to a new folder (`runs/run-1`, `runs/run-2`, …). Pass `-o <dir>` to choose one yourself; it must be empty, so a new run never mixes with files from an old one.
 
-Model weights download from Hugging Face on first run and are cached locally. Every preset is pinned to a specific model revision, so the same command gives the same weights later. ONNX Runtime picks CUDA or CPU automatically; `--device cpu|cuda|coreml|tensorrt` forces one and fails loudly if it isn't available. On Apple Silicon, `--device coreml` runs detection on the GPU: the default model runs at about CPU speed with a third of the CPU load, while RF-DETR runs slower than on the CPU.
+Model weights download from Hugging Face on first run and are cached locally. Every preset is pinned to a specific model revision, so the same command gives the same weights later. ONNX Runtime picks CUDA or CPU automatically; `--device cpu|cuda|coreml|tensorrt` forces one and fails loudly with the exact install command if the matching runtime isn't present. TensorRT builds and caches its engine once per model under `~/.cache/trackflow/trt_cache/` (subsequent runs load in <1s) and automatically keeps `rfdetr-*` in FP32 so DINOv2 activations don't overflow. *Never keep both `onnxruntime` and `onnxruntime-gpu` in the same environment—they share the `onnxruntime` import path and silently break GPU providers.*
+
+<details>
+<summary>Verified NVIDIA T4 GPU throughput & parity (CUDA FP32 vs TensorRT 10 FP16)</summary>
+
+Measured on an isolated venv (system CUDA/TRT paths stripped, proving zero-config pip library preloading) on an NVIDIA Tesla T4 (`vtest.avi`, 5-frame box IoU parity vs CPU + 40-frame steady-state timing):
+
+| Model | CUDA FP32 | TensorRT FP16 *(warm)* | Speedup vs CUDA | Mean IoU vs CPU | Cold build → Warm load |
+| :--- | ---: | ---: | ---: | ---: | :--- |
+| `rtdetr-v2-r18` *(default)* | 26.4 ms (37.9 FPS) | **8.95 ms (111.7 FPS)** | **3.0x** | 0.988 (`37/37`) | 205 s → **0.95 s** |
+| `dfine-s` | 21.5 ms (46.5 FPS) | **8.21 ms (121.8 FPS)** | **2.6x** | 0.980 (`54/53`) | 262 s → **0.68 s** |
+| `dfine-m` | 33.7 ms (29.6 FPS) | **10.65 ms (93.9 FPS)** | **3.2x** | 0.984 (`42/42`) | 247 s → **1.32 s** |
+| `yolo26n` *(AGPL)* | 11.5 ms (86.8 FPS) | **7.37 ms (135.6 FPS)** | **1.6x** | 0.985 (`26/26`) | 261 s → **0.16 s** |
+| `rfdetr-nano` | **18.1 ms (55.4 FPS)** | FP32 (`trt_fp16=False`) | — | 1.000 (`30/30`) | Kept in FP32 (FP16 overflows DINOv2) |
+| `rfdetr-medium` | **40.5 ms (24.7 FPS)** | FP32 (`trt_fp16=False`) | — | 1.000 (`31/31`) | Kept in FP32 (FP16 overflows DINOv2) |
+| `osnet` Re-ID *(8 crops)* | 19.2 ms | **10.5 ms** *(static B=8)* | **1.8x** | 1.000 cos (`0.99996`) | 0.15 s load |
+
+</details>
 
 ## Usage
 
