@@ -10,12 +10,17 @@
 ## Quickstart
 
 ```bash
-# Zero-install CLI via uvx
-uvx trackflow-python run street.mp4
+# Zero-install CLI via uvx (CPU / macOS)
+uvx trackflow-python run street.mp4                  # CPU / macOS (auto-pins Apple Silicon P-cores)
+uvx trackflow-python run street.mp4 --device coreml  # macOS Apple Silicon GPU
 
-# Or install library + CLI
-pip install trackflow-python
-trackflow run crowd.mp4 --tracker botsort --reid osnet --export parquet,jsonl,mot,html
+# NVIDIA CUDA (bundles CUDA + cuDNN; never mix CPU onnxruntime and onnxruntime-gpu)
+pip install trackflow-python && pip uninstall -y onnxruntime && pip install "onnxruntime-gpu[cuda,cudnn]>=1.22"
+trackflow run street.mp4
+
+# NVIDIA TensorRT FP16 (Python 3.11+, bundles CUDA 13 + TensorRT 10, cached engines)
+pip install trackflow-python && pip uninstall -y onnxruntime && pip install "onnxruntime-gpu[cuda,cudnn]>=1.28" "tensorrt-cu13-libs>=10,<11"
+trackflow run street.mp4 --device tensorrt
 trackflow inspect
 ```
 
