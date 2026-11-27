@@ -2,8 +2,9 @@
 
 Implements suspect-transition track splitting (internal gaps, crossing overlaps, and
 birth/death overlap junctions) followed by two-stage global CMC-kinematic and
-sequence-calibrated appearance re-stitching via exact bipartite assignment, plus
-strictly gated CMC-compensated short-gap interpolation.
+sequence-calibrated appearance re-stitching via exact bipartite assignment, then
+support- and motion-gated CMC-compensated short-gap interpolation, and finally gated
+image-space smoothing of box jitter.
 """
 
 from __future__ import annotations
@@ -11,7 +12,24 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import linear_sum_assignment
+
+# Stage 3 gap interpolation gates.
+_INTERP_MAX_GAP_S = 20.0 / 30.0  # longest filled gap, seconds
+_INTERP_ENDPOINT_CONF = 0.25
+_INTERP_SUPPORT_CONF = 0.40  # mean confidence of the support observations on each side
+_INTERP_SUPPORT_WINDOW = 5
+_INTERP_MIN_SUPPORT = 3
+_INTERP_TRAVEL_BASE = 0.5  # camera-compensated centre travel, box heights
+_INTERP_TRAVEL_PER_FRAME = 0.08
+_INTERP_MAX_BIDIR = 1.0  # forward/backward extrapolation disagreement at midpoint, box heights
+_INTERP_MAX_HEIGHT_RATIO = 1.6
+_INTERP_MIN_COS = 0.5
+_INTERP_CONF_DECAY = 0.9
+# Stage 4 image-space smoothing: Gaussian sigma in seconds, max accepted shift in box heights.
+_SMOOTH_SIGMA_S = 1.0 / 30.0
+_SMOOTH_GATE = 0.15
 
 
 @dataclass
@@ -997,6 +1015,31 @@ def _stitch_pass(
     return links
 
 
+def _side_velocity(frames: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """Least-squares velocity (px/frame) of a short run of points, zero if degenerate."""
+    if len(frames) < 2:
+        return np.zeros(2, dtype=np.float64)
+    t = frames - frames.mean()
+    denom = float(np.dot(t, t))
+    if denom <= 0.0:
+        return np.zeros(2, dtype=np.float64)
+    return (t[:, None] * (pts - pts.mean(axis=0))).sum(axis=0) / denom
+
+
+def _mean_embedding(
+    embeddings: np.ndarray | None, emb_valid: np.ndarray | None, idx: np.ndarray
+) -> np.ndarray | None:
+    if embeddings is None:
+        return None
+    if emb_valid is not None:
+        idx = idx[emb_valid[idx]]
+    if len(idx) == 0:
+        return None
+    e = embeddings[idx].astype(np.float64)
+    e /= np.maximum(np.linalg.norm(e, axis=1, keepdims=True), 1e-12)
+    return _l2_norm_vec(e.mean(axis=0))
+
+
 def _gated_cmc_interpolate(
     tracklets: list[_Tracklet],
     W: np.ndarray,
@@ -1006,77 +1049,154 @@ def _gated_cmc_interpolate(
     frame_stride: int,
     frame_width: int | None,
     frame_height: int | None,
+    embeddings: np.ndarray | None,
+    emb_valid: np.ndarray | None,
 ) -> np.ndarray:
-    """Fill only clean, high-confidence, unoccluded short gaps in CMC-compensated coordinates."""
+    """Fill short gaps whose both sides are well supported and kinematically consistent.
+
+    A gap is filled when each side has at least `_INTERP_MIN_SUPPORT` nearby observations with
+    mean confidence `>= _INTERP_SUPPORT_CONF`, both endpoints have confidence
+    `>= _INTERP_ENDPOINT_CONF`, the camera-compensated travel and bidirectional velocity
+    extrapolations agree, and (when embeddings exist) both sides look alike. Centres are
+    interpolated in the coordinates of the gap's last frame and mapped back to each filled frame.
+    """
     stride = max(1, int(frame_stride))
-    max_gap = max(8, int(round(0.50 * fps)))
-    extra: list[tuple[float, float, float, float, float, float, float]] = []
+    max_gap = max(2 * stride, int(round(_INTERP_MAX_GAP_S * fps)))
+    win = _INTERP_SUPPORT_WINDOW
+    out: list[np.ndarray] = []
 
     for assigned_id, t in enumerate(tracklets, start=1):
-        if len(t.frames) < 8:
+        L = len(t.frames)
+        if L < 2 * _INTERP_MIN_SUPPORT:
             continue
-        diffs = np.diff(t.frames)
-        gap_idxs = np.where((diffs >= 2 * stride) & (diffs <= max_gap))[0]
+        fr = t.frames
+        diffs = np.diff(fr)
+        gap_idxs = np.nonzero((diffs > stride) & (diffs - 1 <= max_gap))[0]
         for g in gap_idxs.tolist():
+            f0 = int(fr[g])
+            f1 = int(fr[g + 1])
+            span = f1 - f0
             c0 = float(t.confs[g])
             c1 = float(t.confs[g + 1])
-            if c0 < 0.60 or c1 < 0.60:
+            if min(c0, c1) < _INTERP_ENDPOINT_CONF:
                 continue
-            if float(t.ioa[g]) >= 0.20 or float(t.ioa[g + 1]) >= 0.20:
+            before = np.arange(max(0, g + 1 - win), g + 1)
+            after = np.arange(g + 1, min(L, g + 1 + win))
+            before = before[fr[before] >= f0 - 2 * stride * win]
+            after = after[fr[after] <= f1 + 2 * stride * win]
+            if len(before) < _INTERP_MIN_SUPPORT or len(after) < _INTERP_MIN_SUPPORT:
                 continue
-
-            f0 = int(t.frames[g])
-            f1 = int(t.frames[g + 1])
+            if (
+                float(t.confs[before].mean()) < _INTERP_SUPPORT_CONF
+                or float(t.confs[after].mean()) < _INTERP_SUPPORT_CONF
+            ):
+                continue
             b0 = t.boxes[g]
             b1 = t.boxes[g + 1]
             h0 = float(b0[3] - b0[1])
             h1 = float(b1[3] - b1[1])
-            w0 = float(b0[2] - b0[0])
-            w1 = float(b1[2] - b1[0])
-            if h0 <= 1.0 or h1 <= 1.0 or max(h0 / h1, h1 / h0) > 1.35:
+            if h0 <= 1.0 or h1 <= 1.0 or max(h0, h1) / min(h0, h1) > _INTERP_MAX_HEIGHT_RATIO:
+                continue
+            hm = 0.5 * (h0 + h1)
+
+            side = np.concatenate((before, after))
+            sb = t.boxes[side]
+            pts = _warp_points(
+                0.5 * (sb[:, 0] + sb[:, 2]),
+                0.5 * (sb[:, 1] + sb[:, 3]),
+                fr[side],
+                f1,
+                W,
+                W_inv,
+                use_cmc,
+            )
+            pb = pts[: len(before)]
+            pa = pts[len(before) :]
+            p0 = pb[-1]
+            p1 = pa[0]
+            travel = float(np.hypot(*(p1 - p0))) / hm
+            if travel > _INTERP_TRAVEL_BASE + _INTERP_TRAVEL_PER_FRAME * span:
+                continue
+            v0 = _side_velocity(fr[before].astype(np.float64), pb)
+            v1 = _side_velocity(fr[after].astype(np.float64), pa)
+            half = 0.5 * span
+            bidir = float(np.hypot(*((p0 + v0 * half) - (p1 - v1 * half)))) / hm
+            if bidir > _INTERP_MAX_BIDIR:
+                continue
+            e0 = _mean_embedding(embeddings, emb_valid, t.row_indices[before])
+            e1 = _mean_embedding(embeddings, emb_valid, t.row_indices[after])
+            if e0 is not None and e1 is not None and float(e0 @ e1) < _INTERP_MIN_COS:
                 continue
 
-            h = max(12.0, 0.5 * (h0 + h1))
-            c0p = np.array([0.5 * (b0[0] + b0[2]), 0.5 * (b0[1] + b0[3])], dtype=np.float64)
-            c1p = np.array([0.5 * (b1[0] + b1[2]), 0.5 * (b1[1] + b1[3])], dtype=np.float64)
+            fill = np.arange(f0 + stride, f1, stride, dtype=np.int64)
+            if len(fill) == 0:
+                continue
+            s = ((fill - f0) / float(span))[:, None]
+            centers = p0[None] + s * (p1 - p0)[None]
             if use_cmc:
-                M01 = W[f1] @ W_inv[f0]
-                c0w = M01[:2, :2] @ c0p + M01[:2, 2]
-            else:
-                c0w = c0p
-            if float(np.hypot(c1p[0] - c0w[0], c1p[1] - c0w[1])) / h > 1.15:
+                M = W[fill] @ W_inv[f1][None, :, :]
+                centers = np.einsum("nij,nj->ni", M[:, :2, :2], centers) + M[:, :2, 2]
+            wh0 = b0[2:4] - b0[0:2]
+            wh1 = b1[2:4] - b1[0:2]
+            wh = wh0[None] + s * (wh1 - wh0)[None]
+            bx = np.concatenate((centers - 0.5 * wh, centers + 0.5 * wh), axis=1)
+            if frame_width is not None:
+                bx[:, [0, 2]] = np.clip(bx[:, [0, 2]], 0.0, float(frame_width))
+            if frame_height is not None:
+                bx[:, [1, 3]] = np.clip(bx[:, [1, 3]], 0.0, float(frame_height))
+            keep = ((bx[:, 2] - bx[:, 0]) >= 1.0) & ((bx[:, 3] - bx[:, 1]) >= 1.0)
+            keep &= np.isfinite(bx).all(axis=1)
+            if not keep.any():
                 continue
+            rows = np.empty((int(keep.sum()), 7), dtype=np.float64)
+            rows[:, 0] = fill[keep]
+            rows[:, 1] = float(assigned_id)
+            rows[:, 2:6] = bx[keep]
+            rows[:, 6] = min(c0, c1) * _INTERP_CONF_DECAY
+            out.append(rows)
 
-            base_conf = min(c0, c1) * 0.85
-            inv_span = 1.0 / float(f1 - f0)
-            for f in range(f0 + stride, f1, stride):
-                alpha = float(f - f0) * inv_span
-                if use_cmc:
-                    M0f = W[f] @ W_inv[f0]
-                    M1f = W[f] @ W_inv[f1]
-                    p_a = M0f[:2, :2] @ c0p + M0f[:2, 2]
-                    p_b = M1f[:2, :2] @ c1p + M1f[:2, 2]
-                    p_f = (1.0 - alpha) * p_a + alpha * p_b
-                else:
-                    p_f = (1.0 - alpha) * c0p + alpha * c1p
-                wf = (1.0 - alpha) * w0 + alpha * w1
-                hf = (1.0 - alpha) * h0 + alpha * h1
-                x1 = float(p_f[0] - 0.5 * wf)
-                y1 = float(p_f[1] - 0.5 * hf)
-                x2 = float(p_f[0] + 0.5 * wf)
-                y2 = float(p_f[1] + 0.5 * hf)
-                if frame_width is not None:
-                    x1 = max(0.0, min(float(frame_width) - 1.0, x1))
-                    x2 = max(x1 + 1.0, min(float(frame_width), x2))
-                if frame_height is not None:
-                    y1 = max(0.0, min(float(frame_height) - 1.0, y1))
-                    y2 = max(y1 + 1.0, min(float(frame_height), y2))
-                if x2 > x1 and y2 > y1 and np.isfinite((x1, y1, x2, y2)).all():
-                    extra.append((float(f), float(assigned_id), x1, y1, x2, y2, base_conf))
-
-    if not extra:
+    if not out:
         return np.zeros((0, 7), dtype=np.float64)
-    return np.asarray(extra, dtype=np.float64).reshape(-1, 7)
+    return np.concatenate(out, axis=0)
+
+
+def _smooth_tracks(out: np.ndarray, fps: float, frame_stride: int) -> np.ndarray:
+    """Gaussian-smooth box centre and size along each contiguous run, in image coordinates.
+
+    A smoothed value replaces the observed one only when it stays within `_SMOOTH_GATE` box
+    heights of it, so detector jitter is removed while sharp real manoeuvres are kept.
+    """
+    stride = max(1, int(frame_stride))
+    sigma = _SMOOTH_SIGMA_S * fps / stride
+    if sigma < 0.5 or len(out) == 0:
+        return out
+    order = np.lexsort((out[:, 0], out[:, 1]))
+    srt = out[order]
+    tid = srt[:, 1]
+    fr = np.rint(srt[:, 0]).astype(np.int64)
+    brk = np.nonzero((np.diff(tid) != 0) | (np.diff(fr) != stride))[0] + 1
+    starts = np.concatenate(([0], brk))
+    ends = np.concatenate((brk, [len(srt)]))
+    b = srt[:, 2:6]
+    st = np.column_stack(
+        (0.5 * (b[:, 0] + b[:, 2]), 0.5 * (b[:, 1] + b[:, 3]), b[:, 2] - b[:, 0], b[:, 3] - b[:, 1])
+    )
+    sm = st.copy()
+    for s, e in zip(starts.tolist(), ends.tolist(), strict=True):
+        if e - s >= 5:
+            sm[s:e] = gaussian_filter1d(st[s:e], sigma, axis=0, mode="nearest")
+    h = np.maximum(st[:, 3], 1.0)
+    dev = np.abs(sm - st).max(axis=1) / h
+    use = dev <= _SMOOTH_GATE
+    st[use] = sm[use]
+    nb = np.column_stack(
+        (st[:, 0] - 0.5 * st[:, 2], st[:, 1] - 0.5 * st[:, 3], st[:, 0] + 0.5 * st[:, 2], st[:, 1] + 0.5 * st[:, 3])
+    )
+    ok = np.isfinite(nb).all(axis=1) & (nb[:, 2] - nb[:, 0] >= 1.0) & (nb[:, 3] - nb[:, 1] >= 1.0)
+    srt[ok, 2:6] = nb[ok]
+    res = out.copy()
+    res[order] = srt
+    return res
 
 
 def postprocess_tracks_array(
@@ -1244,10 +1364,22 @@ def postprocess_tracks_array(
 
     # Stage 3: Strictly gated short-gap CMC interpolation
     interp_rows = _gated_cmc_interpolate(
-        tracklets, W, W_inv, use_cmc, fps, frame_stride, frame_width, frame_height
+        tracklets,
+        W,
+        W_inv,
+        use_cmc,
+        fps,
+        frame_stride,
+        frame_width,
+        frame_height,
+        embeddings,
+        emb_valid,
     )
     if len(interp_rows) > 0:
         out = np.vstack((out, interp_rows))
+
+    # Stage 4: Gated image-space smoothing of box jitter
+    out = _smooth_tracks(out, fps, frame_stride)
 
     out_order = np.lexsort((out[:, 1], out[:, 0]))
     return out[out_order]
