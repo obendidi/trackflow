@@ -253,10 +253,12 @@ class _NlTrack:
     class_id: int
     class_name: str
     start_frame: int
+    peak_height: float
     track_id: int = 0
     is_activated: bool = False
     age: int = 1
     hits: int = 1
+    high_hits: int = 1
     time_since_update: int = 0
     state: str = "tracked"  # tracked | lost
     recovered_now: bool = False
@@ -318,26 +320,30 @@ class NonLinearTracker:
         track_buffer: int = 60,
         iou_buffer: float = 0.0,
         use_cmc: bool = True,
-        vel_damp: float = 0.80,
+        vel_damp: float = 0.88,
         delta_t: int = 3,
         inertia: float = 0.15,
         bank_size: int = 15,
         clean_ovl_thresh: float = 0.40,
         emb_weight: float = 3.5,
         softmax_temp: float = 0.13,
+        null_std: float = 1.0,
         margin_weight: float = 0.25,
         ema_blend: float = 0.50,
         occ_exp_max: float = 0.20,
         occ_exp_rate: float = 0.03,
         active_iou_gate: float = 0.20,
         lost_iou_gate: float = 0.18,
-        reid_rescue_z: float = 1.4,
+        reid_active_iou_gate: float = 0.05,
+        reid_rescue_z: float = 1.3,
         reid_rescue_margin: float = 0.25,
         reid_rescue_max_disp: float = 8.0,
         active_low_iou: float = 0.50,
         lost_low_max_tsu: int = 5,
         lost_low_iou: float = 0.55,
         lost_low_conf: float = 0.26,
+        stage2_min_rel_height: float = 0.52,
+        stage2_high_frac: float = 0.92,
         tai_iou_thresh: float = 0.55,
         spawn_overlap_thresh: float = 0.80,
         duplicate_iou: float = 0.85,
@@ -356,12 +362,14 @@ class NonLinearTracker:
         self.clean_ovl_thresh = float(clean_ovl_thresh)
         self.emb_weight = float(emb_weight)
         self.softmax_temp = float(softmax_temp)
+        self.null_std = float(null_std)
         self.margin_weight = float(margin_weight)
         self.ema_blend = float(ema_blend)
         self.occ_exp_max = float(occ_exp_max)
         self.occ_exp_rate = float(occ_exp_rate)
         self.active_iou_gate = float(active_iou_gate)
         self.lost_iou_gate = float(lost_iou_gate)
+        self.reid_active_iou_gate = float(reid_active_iou_gate)
         self.reid_rescue_z = float(reid_rescue_z)
         self.reid_rescue_margin = float(reid_rescue_margin)
         self.reid_rescue_max_disp = float(reid_rescue_max_disp)
@@ -369,6 +377,8 @@ class NonLinearTracker:
         self.lost_low_max_tsu = int(lost_low_max_tsu)
         self.lost_low_iou = float(lost_low_iou)
         self.lost_low_conf = float(lost_low_conf)
+        self.stage2_min_rel_height = float(stage2_min_rel_height)
+        self.stage2_high_frac = float(stage2_high_frac)
         self.tai_iou_thresh = float(tai_iou_thresh)
         self.spawn_overlap_thresh = float(spawn_overlap_thresh)
         self.duplicate_iou = float(duplicate_iou)
@@ -505,7 +515,7 @@ class NonLinearTracker:
             return zeros, zeros, zeros, zeros, no_pair
 
         bg_mean, bg_std = self._bg_mean_std()
-        c_null = bg_mean + 0.5 * bg_std
+        c_null = bg_mean + self.null_std * bg_std
         inv_t = 1.0 / max(self.softmax_temp, 1e-3)
 
         logits = np.where(has_pair, max_cos * inv_t, -1e9)
@@ -657,7 +667,13 @@ class NonLinearTracker:
                 (margin >= self.reid_rescue_margin) | (p_dual >= 0.65)
             )
             reid_lost = is_lost[:, None] & has_pair & h_ok & (min_dist <= max_disp) & reid_strong
-            reid_active = (~is_lost[:, None]) & has_pair & (gate_iou >= 0.08) & h_ok & reid_strong
+            reid_active = (
+                (~is_lost[:, None])
+                & has_pair
+                & (gate_iou >= self.reid_active_iou_gate)
+                & h_ok
+                & reid_strong
+            )
             valid |= reid_lost | reid_active
 
         sim = spatial_hmiou + ocm + self.emb_weight * app_sim
@@ -697,10 +713,20 @@ class NonLinearTracker:
         if update_class:
             tr.class_id = det.class_id
             tr.class_name = det.class_name
+            tr.high_hits += 1
+            tr.peak_height = max(tr.peak_height, float(det.bbox[3] - det.bbox[1]))
         tr.hits += 1
         tr.time_since_update = 0
         if ovl is not None:
             tr.update_embedding(det.embedding, ovl=ovl, clean_ovl_thresh=self.clean_ovl_thresh)
+
+    def _stage2_eligible(self, tr: _NlTrack, med_h: float) -> bool:
+        """Keep persistent low-confidence tiny background tracks out of Stage-2 maintenance."""
+        if self.stage2_min_rel_height <= 0.0 or med_h <= 0.0:
+            return True
+        if tr.peak_height >= self.stage2_min_rel_height * med_h:
+            return True
+        return (tr.high_hits / max(tr.hits, 1)) >= self.stage2_high_frac
 
     def update(
         self,
@@ -723,8 +749,11 @@ class NonLinearTracker:
             else:
                 warp = self._cmc.estimate(frame_bgr, _boxes(detections))
                 if warp is not None:
+                    scale = float(np.sqrt(abs(np.linalg.det(warp[:2, :2]))))
                     for tr in self._tracks:
                         tr.motion.apply_camera_warp(warp)
+                        if scale > 1e-6:
+                            tr.peak_height *= scale
 
         high_dets = [d for d in detections if d.confidence >= self.track_high_thresh]
         low_dets = [
@@ -757,8 +786,18 @@ class NonLinearTracker:
             self._apply_detection(tr, high_dets[di], update_class=True, ovl=float(high_ovl[di]))
             updated.add(tr.uid)
 
+        med_h = (
+            float(np.median([t.bbox[3] - t.bbox[1] for t in confirmed]))
+            if len(confirmed) >= 3
+            else 0.0
+        )
+
         # Stage 2a: remaining active tracks <-> low-score detections.
-        rem_tracked = [pool[i] for i in u_pool if pool[i].state == "tracked"]
+        rem_tracked = [
+            pool[i]
+            for i in u_pool
+            if pool[i].state == "tracked" and self._stage2_eligible(pool[i], med_h)
+        ]
         used_low: set[int] = set()
         if rem_tracked and low_dets:
             t_boxes = np.array([t.motion.box for t in rem_tracked], dtype=np.float64)
@@ -782,6 +821,7 @@ class NonLinearTracker:
                 for i in u_pool
                 if pool[i].state == "lost"
                 and 2 <= pool[i].time_since_update <= self.lost_low_max_tsu
+                and self._stage2_eligible(pool[i], med_h)
             ]
             rem_low_idx = [
                 i
@@ -916,6 +956,7 @@ class NonLinearTracker:
                 class_id=det.class_id,
                 class_name=det.class_name,
                 start_frame=self._frame_id,
+                peak_height=float(det.bbox[3] - det.bbox[1]),
                 emb_bank=deque(maxlen=self.bank_size),
             )
             self._next_uid += 1
