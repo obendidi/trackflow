@@ -37,6 +37,8 @@ _BIS_LOCAL = 0.85
 # Stage 2 temporal prototypes: clean head/tail window length and blend weight in stitching.
 _HT_WIN = 30
 _HT_BLEND = 0.5
+# A trusted-Re-ID link must be within this cosine of the best candidate of its source and target.
+_MUTUAL_COS_TOL = 0.04
 # Stage 4 image-space smoothing: Gaussian sigma in seconds, max accepted shift in box heights.
 _SMOOTH_SIGMA_S = 1.0 / 30.0
 _SMOOTH_GATE = 0.15
@@ -980,6 +982,9 @@ def _stitch_pass(
     sorted_starts = start_f[order_by_start]
 
     edges: dict[tuple[int, int], float] = {}
+    edge_cos: dict[tuple[int, int], float] = {}
+    best_src_cos = np.full(n, -np.inf)
+    best_dst_cos = np.full(n, -np.inf)
     active_src: set[int] = set()
     active_dst: set[int] = set()
 
@@ -1080,6 +1085,7 @@ def _stitch_pass(
         valid = (h_ratio <= 2.3) & (d_ep <= max_ep) & (d_geom <= max_geom)
 
         costs = c_kin.copy()
+        cos_all = np.full(len(cand_j), np.nan)
         if reid_trust >= 0.08 and emb_mat is not None and has_emb[i]:
             both_emb = has_emb[cand_j]
             if np.any(both_emb):
@@ -1092,6 +1098,7 @@ def _stitch_pass(
                 w_app = 0.55 * reid_trust
                 app_term = np.maximum(-0.18, app_dist)
                 costs[both_emb] = w_kin * c_kin[both_emb] + w_app * app_term
+                cos_all[both_emb] = cos
                 if reid_trust >= 0.45:
                     veto = (app_dist > 1.00) | (cos < cos_floor)
                     idx_b = np.where(both_emb)[0]
@@ -1117,6 +1124,11 @@ def _stitch_pass(
             j = int(cand_j[k_pos])
             edges[(i, j)] = float(costs[k_pos])
             active_dst.add(j)
+            c_ij = float(cos_all[k_pos])
+            if np.isfinite(c_ij):
+                edge_cos[(i, j)] = c_ij
+                best_src_cos[i] = max(best_src_cos[i], c_ij)
+                best_dst_cos[j] = max(best_dst_cos[j], c_ij)
 
     if not edges:
         return {}
@@ -1155,6 +1167,15 @@ def _stitch_pass(
             if min(alt_row, alt_col) - cost < margin_gate:
                 continue
 
+        # Mutual-best appearance: reject a link when either end has a clearly better-looking
+        # valid candidate that the assignment gave elsewhere.
+        c_uv = edge_cos.get((u, v))
+        if (
+            reid_trust >= 0.50
+            and c_uv is not None
+            and c_uv < max(best_src_cos[u], best_dst_cos[v]) - _MUTUAL_COS_TOL
+        ):
+            continue
         links[u] = v
 
     if use_sibling_bonus:
