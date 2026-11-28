@@ -684,6 +684,135 @@ class TrackCardIndex:
     def sorted_cards(self) -> list[TrackCard]:
         return sorted(self.cards.values(), key=lambda c: c.track_id)
 
+    def rebuild_from_postprocess(
+        self,
+        records: list[dict[str, Any]],
+        source_row_indices: np.ndarray,
+        raw_track_ids: list[int],
+        *,
+        frame_dt_s: float = 0.0,
+        reid_merges: int = 0,
+    ) -> None:
+        """Rebuild Track Cards from finalized offline post-processed records.
+
+        Carries over saved thumbnails and VLM embeddings from contributing raw cards (averaging
+        embeddings across merged raw IDs), recomputes query scores, and updates each record's
+        ``query_score`` and ``query_match`` fields in place. Never writes crops when
+        ``self.crops_dir`` is ``None`` (anonymized runs).
+        """
+        old_cards = self.cards
+        old_vlm_sum = self._vlm_sum
+
+        by_tid: dict[int, list[tuple[dict[str, Any], int]]] = {}
+        for rec, src_i in zip(records, source_row_indices.tolist(), strict=True):
+            by_tid.setdefault(int(rec["track_id"]), []).append((rec, int(src_i)))
+
+        new_cards: dict[int, TrackCard] = {}
+        new_vlm_sum: dict[int, np.ndarray] = {}
+        new_vlm_emb: dict[int, np.ndarray] = {}
+
+        for tid, items in sorted(by_tid.items()):
+            first_rec = items[0][0]
+            last_rec = items[-1][0]
+            best_rec = first_rec
+            best_src_raw: int | None = None
+            contrib_raw_ids: list[int] = []
+            seen_raw: set[int] = set()
+            zones_visited: list[str] = []
+            dwell_seconds: dict[str, float] = {}
+
+            for rec, src_i in items:
+                if src_i >= 0:
+                    raw_id = raw_track_ids[src_i]
+                    if raw_id not in seen_raw:
+                        seen_raw.add(raw_id)
+                        contrib_raw_ids.append(raw_id)
+                    if best_src_raw is None or float(rec["confidence"]) > float(
+                        best_rec["confidence"]
+                    ):
+                        best_rec = rec
+                        best_src_raw = raw_id
+                elif best_src_raw is None and float(rec["confidence"]) > float(
+                    best_rec["confidence"]
+                ):
+                    best_rec = rec
+
+                zone = rec.get("zone")
+                if zone is not None:
+                    if zone not in zones_visited:
+                        zones_visited.append(zone)
+                    dwell_seconds[zone] = dwell_seconds.get(zone, 0.0) + max(0.0, frame_dt_s)
+
+            # Pick thumbnail from the highest-confidence contributing raw card (only if unanonymized)
+            thumb: str | None = None
+            if self.crops_dir is not None:
+                best_thumb_conf = -1.0
+                for rid in contrib_raw_ids:
+                    oc = old_cards.get(rid)
+                    if (
+                        oc is not None
+                        and oc.thumbnail_relpath
+                        and oc.best_confidence > best_thumb_conf
+                    ):
+                        best_thumb_conf = oc.best_confidence
+                        thumb = oc.thumbnail_relpath
+
+            # Aggregate VLM sums from contributing raw cards
+            v_sum: np.ndarray | None = None
+            for rid in contrib_raw_ids:
+                if rid in old_vlm_sum:
+                    v_sum = old_vlm_sum[rid].copy() if v_sum is None else v_sum + old_vlm_sum[rid]
+
+            emb_list: list[float] | None = None
+            q_score: float | None = None
+            q_match = True
+            if v_sum is not None:
+                v_unit = _l2_normalize(v_sum)
+                new_vlm_sum[tid] = v_sum
+                new_vlm_emb[tid] = v_unit
+                emb_list = [round(float(x), 5) for x in v_unit.tolist()]
+                if self._query_vec is not None:
+                    q_score = cosine_similarity(v_unit, self._query_vec)
+                    q_match = q_score >= self.query_threshold
+            elif self._query_vec is not None:
+                q_match = False
+
+            for rec, _ in items:
+                rec["query_score"] = None if q_score is None else round(float(q_score), 4)
+                rec["query_match"] = bool(q_match)
+
+            new_cards[tid] = TrackCard(
+                track_id=tid,
+                class_name=str(first_rec["class_name"]),
+                first_frame=int(first_rec["frame_idx"]),
+                last_frame=int(last_rec["frame_idx"]),
+                first_timestamp_s=float(first_rec["timestamp_s"]),
+                last_timestamp_s=float(last_rec["timestamp_s"]),
+                frame_count=len(items),
+                best_confidence=float(best_rec["confidence"]),
+                best_frame=int(best_rec["frame_idx"]),
+                best_bbox=(
+                    float(best_rec["x1"]),
+                    float(best_rec["y1"]),
+                    float(best_rec["x2"]),
+                    float(best_rec["y2"]),
+                ),
+                thumbnail_relpath=thumb,
+                embedding=emb_list,
+                query_score=q_score,
+                query_match=q_match,
+                merged_track_ids=[],
+                zones_visited=zones_visited,
+                dwell_seconds=dwell_seconds,
+            )
+
+        self.cards = new_cards
+        self._vlm_sum = new_vlm_sum
+        self._vlm_emb = new_vlm_emb
+        self._reid_sum.clear()
+        self._alias.clear()
+        self.reid_merges = int(reid_merges)
+
     def save_json(
         self, path: Path, *, reid_backend: str = "none", vlm_backend: str = "none"
     ) -> None:

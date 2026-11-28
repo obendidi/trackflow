@@ -82,6 +82,11 @@ class LineCounter:
         self.counts = {name: {"in": 0, "out": 0} for name in names}
         self._sides: dict[tuple[str, int], _TrackSide] = {}
 
+    def forget_track(self, track_id: int) -> None:
+        """Clear saved side state for ``track_id`` (e.g. across a long stitched exit gap)."""
+        for line in self.lines:
+            self._sides.pop((line.name, track_id), None)
+
     def update(self, tracks: Sequence[Track], timestamp_s: float) -> list[dict[str, Any]]:
         """Record this frame's tracks and return a ``line_crossed`` event per new crossing."""
         events: list[dict[str, Any]] = []

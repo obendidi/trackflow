@@ -44,7 +44,7 @@ from trackflow.reid import export_search_prompts, search_track_cards
 
 app = typer.Typer(
     name="trackflow",
-    help="Real-time people and object tracking with ONNX detectors, ByteTrack, BoT-SORT, OC-SORT or BoostTrack, text search, and a local inspector.",
+    help="Real-time people and object tracking with ONNX detectors, ByteTrack, BoT-SORT, OC-SORT, BoostTrack or NLTrack, text search, and a local inspector.",
     no_args_is_help=True,
     pretty_exceptions_show_locals=False,
     rich_markup_mode="rich",
@@ -86,7 +86,9 @@ def run(
     ] = "fp32",
     tracker: Annotated[
         str,
-        typer.Option("--tracker", "-t", help="Tracker: bytetrack, botsort, ocsort, or boosttrack."),
+        typer.Option(
+            "--tracker", "-t", help="Tracker: bytetrack, botsort, ocsort, boosttrack, or nltrack."
+        ),
     ] = "bytetrack",
     device: Annotated[
         str | None,
@@ -107,7 +109,7 @@ def run(
         str,
         typer.Option(
             "--reid",
-            help="Person Re-ID model for BoT-SORT/BoostTrack appearance and --reid-merge: none, osnet, color.",
+            help="Person Re-ID model for BoT-SORT, BoostTrack, or NLTrack appearance and --reid-merge: none, osnet, color.",
         ),
     ] = "none",
     vlm: Annotated[
@@ -144,6 +146,15 @@ def run(
             help="Optional online cap on fraction of video frames dispatched to --mask-fallback (e.g. 0.10).",
         ),
     ] = None,
+    postprocess: Annotated[
+        bool,
+        typer.Option(
+            "--postprocess/--no-postprocess",
+            help="Run offline post-processing (suspect-switch splitting, global CMC/Re-ID "
+            "stitching, gated gap interpolation & adaptive smoothing) on recorded videos. "
+            "Off by default; leaves live stream() untouched.",
+        ),
+    ] = False,
     query: Annotated[
         str | None,
         typer.Option(
@@ -214,6 +225,7 @@ def run(
     console.print(
         f"[bold cyan]Trackflow v{__version__}[/] · model=[bold]{model}[/] ({precision}) · "
         f"tracker=[bold]{tracker}[/] · privacy=[bold]{anonymize}[/]"
+        + (" · [bold green]postprocess[/]" if postprocess else "")
     )
 
     with _user_errors():
@@ -233,6 +245,7 @@ def run(
             reid_merge=reid_merge,
             mask_fallback=mask_fallback,
             mask_fallback_config=mf_cfg,
+            postprocess=postprocess,
             query=query,
             query_threshold=query_threshold,
             anonymize=anonymize,  # type: ignore[arg-type]

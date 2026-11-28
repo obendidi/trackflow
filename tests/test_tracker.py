@@ -215,7 +215,7 @@ def test_xywh_kalman_confidence_one_and_botsort_lost_width_velocity() -> None:
 def test_create_tracker_forwards_new_track_thresh_to_all_trackers() -> None:
     from trackflow.tracker import create_tracker
 
-    for name in ("bytetrack", "botsort", "ocsort", "boosttrack"):
+    for name in ("bytetrack", "botsort", "ocsort", "boosttrack", "nltrack"):
         tr = create_tracker(name, track_high_thresh=0.5, new_track_thresh=0.95)
         assert tr.update([_det(10, 20, 60, 140, 0.60)]) == []
 

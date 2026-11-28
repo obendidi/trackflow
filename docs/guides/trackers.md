@@ -7,11 +7,12 @@ Trackflow separates detection from association so you can swap trackers with `--
 | `--tracker` | Algorithm | Best for | Speed / accuracy tradeoff |
 | :--- | :--- | :--- | :--- |
 | `bytetrack` *(default)* | [ByteTrack](https://arxiv.org/abs/2110.06864) (ECCV 2022) | Fixed cameras, low-CPU devices, browser WebGPU | Fastest matching (~2,900 tracker FPS); no camera compensation or Re-ID |
-| `ocsort` | [OC-SORT](https://arxiv.org/abs/2203.14360) (CVPR 2023) | Fast motion, sports, nonlinear paths without Re-ID overhead | Highest no-Re-ID mean HOTA (`38.4`) and fewest total ID switches (`5,501`) across 4 datasets |
-| `botsort` | [BoT-SORT](https://arxiv.org/abs/2206.14651) (2022) | Moving/panning cameras and crowded scenes; pairs with `--reid osnet` | Highest overall mean HOTA (`38.8`) when paired with `--reid osnet` |
+| `ocsort` | [OC-SORT](https://arxiv.org/abs/2203.14360) (CVPR 2023) | Fast motion, sports, nonlinear paths without Re-ID overhead | Strong no-Re-ID baseline (`38.4` mean HOTA, `5,501` ID switches across 4 datasets) |
+| `botsort` | [BoT-SORT](https://arxiv.org/abs/2206.14651) (2022) | Moving/panning cameras and crowded scenes; pairs with `--reid osnet` | `38.8` mean HOTA when paired with `--reid osnet` |
 | `boosttrack` | [BoostTrack++](https://arxiv.org/abs/2408.13003) (2024) | Crowded occlusions where boxes dip below threshold briefly | Strong MOT17 (`46.9`) and MOT20 (`24.0`) HOTA with camera compensation and optional `--reid osnet` |
+| `nltrack` | NLTrack *(Apache-2.0, zero extra weights)* | Non-linear motion, crossings, uniform outfits, and longer occlusions | Highest accuracy across all 4 datasets: `42.9` mean HOTA (`5,193` ID switches) with `--reid osnet`, and `39.6` without Re-ID |
 
-## Shared behavior across all four trackers
+## Shared behavior across all five trackers
 
 - **Per-class isolation**: A `person` and a `backpack` overlapping at the same coordinates stay separate tracks and never merge.
 - **Multi-frame confirmation**: New detections only receive a confirmed `track_id` once seen across consecutive frames (`min_hits`), filtering single-frame false positives.
@@ -20,21 +21,21 @@ Trackflow separates detection from association so you can swap trackers with `--
 
 ## Camera motion compensation (CMC) and Re-ID
 
-`botsort` and `boosttrack` estimate sparse optical flow between consecutive frames to compensate for panning or handheld camera movement. On a strictly fixed CCTV camera, CMC is unnecessary overhead; you can disable it from Python:
+`botsort`, `boosttrack`, and `nltrack` estimate sparse optical flow between consecutive frames to compensate for panning or handheld camera movement. On a strictly fixed CCTV camera, CMC is unnecessary overhead; you can disable it from Python:
 
 ```python
-from trackflow import BoostTracker, BotSortTracker, TrackflowPipeline
+from trackflow import BoostTracker, BotSortTracker, NonLinearTracker, TrackflowPipeline
 
 pipeline = TrackflowPipeline(
     model="rtdetr-v2-r18",
-    tracker_factory=lambda: BoostTracker(use_cmc=False),
+    tracker_factory=lambda: NonLinearTracker(use_cmc=False),
 )
 ```
 
-To add appearance matching on top of motion matching, pass `--reid osnet` with `botsort` or `boosttrack`:
+To add appearance matching on top of motion matching, pass `--reid osnet` with `nltrack`, `botsort`, or `boosttrack`:
 
 ```bash
-trackflow run crowd.mp4 --tracker botsort --reid osnet
+trackflow run crowd.mp4 --tracker nltrack --reid osnet
 ```
 
 `osnet` extracts 512-dimensional person embeddings (`OSNet-AIN x1.0`, ~9 MB) for every detected person box. It reduces ID switches after crossings, at the cost of running one extra ONNX model per frame. If you want cross-exit re-linking after a person leaves the frame completely and walks back in later, add `--reid-merge` (see [Text Search & Re-ID](search.md#cross-exit-re-identification-reid-merge)).
@@ -68,7 +69,7 @@ pipeline = TrackflowPipeline(
 summary = pipeline.run("court.mp4")
 ```
 
-See the [Python API Reference](../reference/python-api.md#trackers) for every constructor parameter on `ByteTracker`, `BotSortTracker`, `OcSortTracker`, and `BoostTracker`.
+See the [Python API Reference](../reference/python-api.md#trackers) for every constructor parameter on `ByteTracker`, `BotSortTracker`, `OcSortTracker`, `BoostTracker`, and `NonLinearTracker`.
 
 ## Comparing trackers on your own footage
 

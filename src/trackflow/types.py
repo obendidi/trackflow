@@ -202,6 +202,7 @@ class RunSummary:
     precision: str | None = None
     tracking_threshold: float | None = None
     mask_fallback: dict[str, Any] | None = None
+    postprocessed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -211,6 +212,7 @@ class RunSummary:
             "precision": self.precision,
             "tracking_threshold": self.tracking_threshold,
             "tracker": self.tracker,
+            "postprocessed": self.postprocessed,
             "device": self.device,
             "total_frames": self.total_frames,
             "processed_frames": self.processed_frames,

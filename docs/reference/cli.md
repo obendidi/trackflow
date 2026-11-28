@@ -22,11 +22,11 @@ trackflow run crowd.mp4 \
 | :--- | :--- | :--- |
 | `-m, --model` | `rtdetr-v2-r18` | Built-in preset, Hugging Face ONNX repo (`owner/repo`), local `.onnx`, or `hf:owner/repo` (`[transformers]` extra) |
 | `--precision` | `fp32` | ONNX weight precision: `fp32`, `fp16`, or `int8` |
-| `-t, --tracker` | `bytetrack` | `bytetrack`, `botsort`, `ocsort`, or `boosttrack` |
+| `-t, --tracker` | `bytetrack` | `bytetrack`, `botsort`, `ocsort`, `boosttrack`, or `nltrack` |
 | `-d, --device` | `auto` *(or `tensorrt` in tensorrt package)* | ONNX: `auto`, `cpu`, `cuda`, `coreml`, `tensorrt`. Transformers: `auto`, `cpu`, `cuda`, `mps` |
 | `--threshold` | `0.45` | High-confidence tracking threshold (`0.0–1.0`) |
 | `-c, --classes` | `person` | Comma-separated class names, or `all` |
-| `--reid` | `none` | Person Re-ID encoder for BoT-SORT/BoostTrack and `--reid-merge`: `none`, `osnet`, `color` |
+| `--reid` | `none` | Person Re-ID encoder for BoT-SORT, BoostTrack, or NLTrack and `--reid-merge`: `none`, `osnet`, `color` |
 | `--reid-merge / --no-reid-merge` | `--no-reid-merge` | Re-link people who leave the frame and return later (requires `--reid osnet`) |
 | `-q, --query` | `None` | Natural-language query to highlight matching tracks live |
 | `--vlm` | `clip` when `--query` is set, else `none` | Vision-language model: `none`, `clip`, `siglip`, `siglip2`, `embeddinggemma` |

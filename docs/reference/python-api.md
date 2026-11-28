@@ -76,6 +76,8 @@ for result in pipeline.stream(frames(), fps=25.0):
 
 ::: trackflow.BoostTracker
 
+::: trackflow.NonLinearTracker
+
 ---
 
 ## Re-ID & Text Search
