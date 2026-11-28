@@ -31,7 +31,8 @@ from trackflow.benchmark import (
 )
 from trackflow.inspector import serve_inspector
 from trackflow.lines import CountingLine
-from trackflow.models import MODEL_REGISTRY, REID_REGISTRY, VLM_REGISTRY
+from trackflow.mask_fallback import MaskFallbackConfig
+from trackflow.models import MASK_REGISTRY, MODEL_REGISTRY, REID_REGISTRY, VLM_REGISTRY
 from trackflow.pipeline import TrackflowPipeline, fresh_run_dir
 from trackflow.reid import export_search_prompts, search_track_cards
 
@@ -110,6 +111,23 @@ def run(
             "Off by default: look-alikes are left unmerged, but mistakes are still possible.",
         ),
     ] = False,
+    mask_fallback: Annotated[
+        str,
+        typer.Option(
+            "--mask-fallback",
+            help="Optional Apache-2.0 mask model for ambiguous occlusion windows (needs [sam2] extra): "
+            "none, sam2.1-tiny, edgetam, sam2.1-small, sam2.1-base-plus, sam2.1-large.",
+        ),
+    ] = "none",
+    mask_budget: Annotated[
+        float | None,
+        typer.Option(
+            "--mask-budget",
+            min=0.01,
+            max=1.0,
+            help="Optional online cap on fraction of video frames dispatched to --mask-fallback (e.g. 0.10).",
+        ),
+    ] = None,
     query: Annotated[
         str | None,
         typer.Option(
@@ -184,6 +202,9 @@ def run(
 
     with _user_errors():
         lines = [CountingLine.parse(spec, f"line-{i}") for i, spec in enumerate(line or [], 1)]
+        mf_cfg = (
+            MaskFallbackConfig(max_frame_rate=mask_budget) if mask_budget is not None else None
+        )
         pipeline = TrackflowPipeline(
             model=model,
             precision=precision,  # type: ignore[arg-type]
@@ -194,6 +215,8 @@ def run(
             reid=reid,  # type: ignore[arg-type]
             vlm=vlm,  # type: ignore[arg-type]
             reid_merge=reid_merge,
+            mask_fallback=mask_fallback,
+            mask_fallback_config=mf_cfg,
             query=query,
             query_threshold=query_threshold,
             anonymize=anonymize,  # type: ignore[arg-type]
@@ -239,6 +262,13 @@ def run(
         f"[bold]{summary.unique_tracks}[/] (recovered: {summary.recovered_tracks}, Re-ID merges: {summary.reid_merges})",
     )
     table.add_row("Frames", f"{summary.processed_frames} processed / {summary.total_frames} read")
+    if summary.mask_fallback is not None:
+        mf = summary.mask_fallback
+        table.add_row(
+            "Mask Fallback",
+            f"[bold]{mf['backend']}[/] · {mf['windows_dispatched']} win ({mf['pct_frames']:.1f}% frames) · "
+            f"{mf['overrides']} fixes (swaps: {mf['swaps']}, relinks: {mf['relinks']})",
+        )
     for name, counts in summary.line_counts.items():
         table.add_row(f"Line {name}", f"[bold]{counts['in']}[/] in · [bold]{counts['out']}[/] out")
     for k, v in summary.output_files.items():
@@ -482,7 +512,7 @@ def models(
         bool, typer.Option("--json", help="Print the model catalog as JSON.")
     ] = False,
 ) -> None:
-    """List built-in detectors, person Re-ID models, and vision-language models."""
+    """List built-in detectors, person Re-ID, vision-language, and mask fallback models."""
     if as_json:
         typer.echo(
             json.dumps(
@@ -492,6 +522,7 @@ def models(
                     ],
                     "reid": [asdict(s) for s in REID_REGISTRY.values()],
                     "vlm": [asdict(s) for s in VLM_REGISTRY.values()],
+                    "mask_fallback": [asdict(s) for s in MASK_REGISTRY.values()],
                 },
                 indent=2,
             )
@@ -540,6 +571,24 @@ def models(
             vspec.name, f"{vspec.approx_size_mb:.0f} MB", vspec.license, vspec.repo_id
         )
     console.print(vlm_table)
+
+    mask_table = Table(
+        title="Selective Mask Fallback Models (--mask-fallback, optional [sam2] extra)"
+    )
+    mask_table.add_column("Preset", style="bold cyan")
+    mask_table.add_column("Architecture")
+    mask_table.add_column("Download", justify="right")
+    mask_table.add_column("License", style="green")
+    mask_table.add_column("Hugging Face Repo", style="dim")
+    for mspec in MASK_REGISTRY.values():
+        mask_table.add_row(
+            mspec.name,
+            mspec.architecture,
+            f"{mspec.approx_size_mb:.0f} MB",
+            mspec.license,
+            mspec.repo_id,
+        )
+    console.print(mask_table)
 
 
 @app.command()

@@ -498,6 +498,17 @@ class TrackCardIndex:
             self._vlm_emb[dst_id] = _l2_normalize(self._vlm_sum[dst_id])
             dst.embedding = [round(float(x), 5) for x in self._vlm_emb[dst_id].tolist()]
 
+    def reconcile_relink(self, src_id: int, dst_id: int) -> None:
+        """Fold a short-lived fragmented track card into its mask-reconciled destination."""
+        src_cid = self.canonical_id(src_id)
+        dst_cid = self.canonical_id(dst_id)
+        self._pending.pop(src_id, None)
+        self._decided.add(src_id)
+        if src_cid == dst_cid:
+            return
+        if src_cid in self.cards and dst_cid in self.cards:
+            self._fold_card(src_cid, dst_cid)
+
     def update(
         self,
         frame_idx: int,

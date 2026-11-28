@@ -211,7 +211,7 @@ trackflow run crowd.mp4 -m rfdetr-large
 trackflow run crowd.mp4 -m hf:PekingU/rtdetr_v2_r50vd --device mps
 ```
 
-Re-ID and text-search models:
+Re-ID, text-search, and optional mask fallback models:
 
 | Flag | Model | Size | License | Used for |
 | :--- | :--- | ---: | :--- | :--- |
@@ -220,6 +220,11 @@ Re-ID and text-search models:
 | `--vlm siglip` | SigLIP Base (INT8) | ~205 MB | Apache-2.0 | Better on fine clothing/attribute queries |
 | `--vlm siglip2` | SigLIP 2 Base (INT8) | ~378 MB | Apache-2.0 | Strongest pure-ONNX search (no PyTorch) |
 | `--vlm embeddinggemma` | EmbeddingGemma 2 (PyTorch, needs `[transformers]`) | ~1.5 GB | Apache-2.0 | Best on clothing and accessory queries |
+| `--mask-fallback sam2.1-tiny` | SAM 2.1 Hiera-Tiny (needs `[sam2]`) | ~156 MB | Apache-2.0 | Default selective occlusion mask fallback |
+| `--mask-fallback edgetam` | EdgeTAM (needs `[sam2]`) | ~56 MB | Apache-2.0 | Fastest / lowest-VRAM selective mask fallback |
+| `--mask-fallback sam2.1-small` | SAM 2.1 Hiera-Small (needs `[sam2]`) | ~184 MB | Apache-2.0 | Optional SAM 2.1 Small mask fallback |
+| `--mask-fallback sam2.1-base-plus` | SAM 2.1 Hiera-Base+ (needs `[sam2]`) | ~324 MB | Apache-2.0 | Higher-capacity SAM 2.1 Base+ mask fallback |
+| `--mask-fallback sam2.1-large` | SAM 2.1 Hiera-Large (needs `[sam2]`) | ~898 MB | Apache-2.0 | Largest SAM 2.1 mask fallback for GPU |
 
 ## Python API
 

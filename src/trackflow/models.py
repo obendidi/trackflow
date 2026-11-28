@@ -55,6 +55,20 @@ class VlmModelSpec:
     revision: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class MaskModelSpec:
+    """Descriptor for an optional Apache-2.0 video mask model used by ambiguity-triggered fallback."""
+
+    name: str
+    repo_id: str
+    architecture: str
+    license: str
+    approx_size_mb: float
+    description: str
+    revision: str
+    kind: Literal["sam2", "edgetam"] = "sam2"
+
+
 MODEL_REGISTRY: dict[str, ModelSpec] = {
     "rfdetr-nano": ModelSpec(
         name="rfdetr-nano",
@@ -296,6 +310,62 @@ VLM_REGISTRY: dict[str, VlmModelSpec] = {
         text_files={},
         description="EmbeddingGemma 2 text+image embeddings (PyTorch); best on attribute search.",
         revision="f9972ac22e696a105c482202646979e33e4b5a1e",
+    ),
+}
+
+# Optional Apache-2.0 mask propagators for ambiguity-triggered fallback (install `[sam2]`).
+# SAM 3 uses the non-OSI Meta SAM License and is intentionally excluded from this registry;
+# use ``Sam3MaskPropagator`` externally if you accept Meta's terms.
+MASK_REGISTRY: dict[str, MaskModelSpec] = {
+    "sam2.1-tiny": MaskModelSpec(
+        name="sam2.1-tiny",
+        repo_id="facebook/sam2.1-hiera-tiny",
+        architecture="SAM 2.1 Hiera-Tiny",
+        license="Apache-2.0",
+        approx_size_mb=155.9,
+        description="Default mask fallback; strong occlusion resistance in ~1.9 GB peak VRAM.",
+        revision="de431c4043854a71d8101e17995dfe596bf101a5",
+        kind="sam2",
+    ),
+    "edgetam": MaskModelSpec(
+        name="edgetam",
+        repo_id="yonigozlan/EdgeTAM-hf",
+        architecture="EdgeTAM (2D Spatial Perceiver)",
+        license="Apache-2.0",
+        approx_size_mb=55.9,
+        description="Fastest mask fallback (~1.1 GB peak VRAM); lighter memory attention.",
+        revision="c266ce53b3fc00f0f495b583f6a116c4e57f53bb",
+        kind="edgetam",
+    ),
+    "sam2.1-small": MaskModelSpec(
+        name="sam2.1-small",
+        repo_id="facebook/sam2.1-hiera-small",
+        architecture="SAM 2.1 Hiera-Small",
+        license="Apache-2.0",
+        approx_size_mb=184.3,
+        description="SAM 2.1 Small checkpoint via Hugging Face Transformers.",
+        revision="ee5bba1d82bb8749febdf90f45e84b687142ba03",
+        kind="sam2",
+    ),
+    "sam2.1-base-plus": MaskModelSpec(
+        name="sam2.1-base-plus",
+        repo_id="facebook/sam2.1-hiera-base-plus",
+        architecture="SAM 2.1 Hiera-Base+",
+        license="Apache-2.0",
+        approx_size_mb=323.5,
+        description="Higher-capacity SAM 2.1 Base+ mask propagator.",
+        revision="b7320756a13354e7530a63935656d35b2f91a290",
+        kind="sam2",
+    ),
+    "sam2.1-large": MaskModelSpec(
+        name="sam2.1-large",
+        repo_id="facebook/sam2.1-hiera-large",
+        architecture="SAM 2.1 Hiera-Large",
+        license="Apache-2.0",
+        approx_size_mb=897.9,
+        description="Largest SAM 2.1 checkpoint for maximum mask quality on GPU.",
+        revision="665f8e2ad61cf5f53d65644ff27c8ee525124610",
+        kind="sam2",
     ),
 }
 

@@ -63,6 +63,11 @@ transformers = [
   "torchvision>=0.21",
   "sentence-transformers>=6.1,<7",
 ]
+sam2 = [
+  "transformers>=5.18,<6",
+  "torch>=2.6",
+  "torchvision>=0.21",
+]
 cuda = [
   "onnxruntime-gpu>=1.20",
 ]

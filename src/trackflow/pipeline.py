@@ -23,6 +23,11 @@ import numpy as np
 from trackflow.detector import Detector, _allowed_classes, _class_key, create_detector
 from trackflow.homography import FloorplanHomography
 from trackflow.lines import CountingLine, LineCounter
+from trackflow.mask_fallback import (
+    MaskFallbackConfig,
+    MaskFallbackResolver,
+    MaskPropagator,
+)
 from trackflow.models import Precision
 from trackflow.privacy import AnonymizeMode, PrivacyAnonymizer
 from trackflow.reid import (
@@ -241,6 +246,9 @@ class TrackflowPipeline:
         tracker_factory: Callable[[], Tracker] | None = None,
         reid_embedder: ReidEmbedder | None = None,
         vlm_embedder: VlmEmbedder | None = None,
+        mask_fallback: str | None = None,
+        mask_propagator: MaskPropagator | None = None,
+        mask_fallback_config: MaskFallbackConfig | None = None,
         cache_dir: str | Path | None = None,
     ) -> None:
         self.model_name = (
@@ -263,6 +271,39 @@ class TrackflowPipeline:
         self.classes = sorted(self._allowed) if self._allowed is not None else ["all"]
         self.query = query.strip() if query else None
         self.anonymize_mode: AnonymizeMode = anonymize
+
+        # Validate mask fallback options early before loading detectors/embedders.
+        mf_name = mask_fallback.strip() if isinstance(mask_fallback, str) else None
+        if mf_name and mf_name.lower() == "none":
+            mf_name = None
+        if mask_fallback_config is not None and mf_name is None and mask_propagator is None:
+            raise ValueError(
+                "--mask-budget / mask_fallback_config requires --mask-fallback or mask_propagator."
+            )
+        if mask_propagator is not None:
+            if self.anonymize_mode != "none" and getattr(
+                mask_propagator, "writes_frames_to_disk", False
+            ):
+                raise ValueError(
+                    "Cannot use a mask propagator that writes raw frames to disk "
+                    "(such as Sam3MaskPropagator) when anonymize != 'none'. "
+                    "Use an in-memory propagator such as Sam2MaskPropagator."
+                )
+            self.mask_propagator: MaskPropagator | None = mask_propagator
+            self.mask_fallback_backend: str | None = getattr(
+                mask_propagator, "model_name", type(mask_propagator).__name__
+            )
+        elif mf_name is not None:
+            from trackflow.sam2_adapter import create_mask_propagator
+
+            self.mask_propagator = create_mask_propagator(
+                mf_name, device=device, cache_dir=cache_dir
+            )
+            self.mask_fallback_backend = mf_name
+        else:
+            self.mask_propagator = None
+            self.mask_fallback_backend = None
+        self.mask_fallback_config = mask_fallback_config
 
         if reid in ("clip", "siglip"):
             # Pre-0.1 runs used `--reid clip` for queries. CLIP can't tell people apart, so it is
@@ -329,6 +370,11 @@ class TrackflowPipeline:
         self.lines = list(lines)
         LineCounter(self.lines)  # reject duplicate names before any frame is read
 
+    def _new_mask_resolver(self) -> MaskFallbackResolver | None:
+        if self.mask_propagator is None:
+            return None
+        return MaskFallbackResolver(self.mask_propagator, self.mask_fallback_config)
+
     def _new_counter(self) -> LineCounter | None:
         return LineCounter(self.lines) if self.lines else None
 
@@ -376,9 +422,10 @@ class TrackflowPipeline:
         cards: TrackCardIndex | None,
         floorplan: FloorplanHomography | None,
         counter: LineCounter | None = None,
+        mask_resolver: MaskFallbackResolver | None = None,
         *,
         record_floorplan: bool = False,
-    ) -> tuple[FrameResult, list[Detection]]:
+    ) -> tuple[FrameResult, list[Detection], list[int]]:
         start = time.perf_counter()
         raw = self.detector.detect(frame)
         detected = time.perf_counter()
@@ -399,6 +446,10 @@ class TrackflowPipeline:
             ):
                 det.embedding = emb
         tracks = tracker.update(targets, frame_bgr=frame)
+        raw_track_ids = [int(tr.track_id) for tr in tracks]
+        mask_events = (
+            mask_resolver.observe(idx, frame, tracks) if mask_resolver is not None else []
+        )
         tracked = time.perf_counter()
         if floorplan is not None:
             for tr in tracks:
@@ -408,26 +459,35 @@ class TrackflowPipeline:
                     tr.world_xy = floorplan.project(tr.foot_point)
                     tr.zone = floorplan.locate_zone(tr.world_xy)
         events = list(getattr(tracker, "last_events", ()))
+        events.extend(mask_events)
         if counter is not None:
             # Raw tracker IDs: a Re-ID merge would join a track to a point from before it left.
             events.extend(counter.update(tracks, timestamp))
         if cards is not None:
+            for ev in mask_events:
+                for src_id, dst_id in ev.get("relink_pairs", ()):
+                    cards.reconcile_relink(int(src_id), int(dst_id))
             events.extend(cards.update(idx, timestamp, frame, tracks, frame_dt_s=dt))
-        return FrameResult(
-            frame_idx=idx,
-            timestamp_s=timestamp,
-            tracks=tracks,
-            num_detections=len(targets),
-            inference_ms=(detected - start) * 1000,
-            tracking_ms=(tracked - detected) * 1000,
-            events=events,
-        ), raw
+        return (
+            FrameResult(
+                frame_idx=idx,
+                timestamp_s=timestamp,
+                tracks=tracks,
+                num_detections=len(targets),
+                inference_ms=(detected - start) * 1000,
+                tracking_ms=(tracked - detected) * 1000,
+                events=events,
+            ),
+            raw,
+            raw_track_ids,
+        )
 
     def stream(self, frames: Iterable[np.ndarray], *, fps: float = 30.0) -> Iterator[FrameResult]:
         """Yield observations for consecutive BGR uint8 frames without writing any files.
 
-        Each call starts a fresh tracker. With re-entry merging enabled, a merge event
-        reports the new canonical ID; observations already yielded keep their original ID.
+        Each call starts a fresh tracker. With re-entry merging or mask fallback enabled,
+        committed fixes apply to subsequent frames; observations already yielded keep their
+        original ID.
         """
         if not np.isfinite(fps) or fps <= 0:
             raise ValueError("fps must be positive and finite.")
@@ -435,6 +495,7 @@ class TrackflowPipeline:
         tracker = self._new_tracker(dt)
         cards = self._new_cards(tracker, 1) if self.vlm_embedder or self.reid_merge else None
         counter = self._new_counter()
+        mask_resolver = self._new_mask_resolver()
         shape = None
         for idx, frame in enumerate(frames):
             if (
@@ -450,8 +511,8 @@ class TrackflowPipeline:
                     f"Frame {idx} changed size. Start a new stream when geometry changes."
                 )
             shape = frame.shape
-            result, _ = self._process_frame(
-                frame, idx, idx / fps, dt, tracker, cards, self.homography, counter
+            result, _, _ = self._process_frame(
+                frame, idx, idx / fps, dt, tracker, cards, self.homography, counter, mask_resolver
             )
             yield result
 
@@ -499,6 +560,7 @@ class TrackflowPipeline:
             )
             floorplan = self.homography.fresh() if self.homography else None
             counter = self._new_counter()
+            mask_resolver = self._new_mask_resolver()
 
             video_writer: cv2.VideoWriter | None = None
             video_path = out_dir / "annotated.mp4"
@@ -520,12 +582,12 @@ class TrackflowPipeline:
             }
             writer_stack = stack.enter_context(contextlib.ExitStack())
             sink = ObservationWriter(paths, writer_stack)
-            # Re-entry IDs can change retrospectively. Only that mode needs a disk spool.
+            # Re-entry and mask-fallback IDs can change retrospectively. Only those modes need a disk spool.
             spool = (
                 stack.enter_context(
                     tempfile.TemporaryFile(mode="w+", encoding="utf-8", dir=out_dir)
                 )
-                if self.reid_merge and paths
+                if (self.reid_merge or mask_resolver is not None) and paths
                 else None
             )
             trails: dict[int, list[tuple[int, int]]] = defaultdict(list)
@@ -549,7 +611,7 @@ class TrackflowPipeline:
                     if skip > 0 and (frame_idx % (skip + 1) != 0):
                         continue
 
-                    fr, dets = self._process_frame(
+                    fr, dets, raw_track_ids = self._process_frame(
                         frame_bgr,
                         frame_idx,
                         timestamp_s,
@@ -558,6 +620,7 @@ class TrackflowPipeline:
                         card_index,
                         floorplan,
                         counter,
+                        mask_resolver,
                         record_floorplan=True,
                     )
                     tracks = fr.tracks
@@ -570,7 +633,7 @@ class TrackflowPipeline:
                             {"frame_idx": frame_idx, "timestamp_s": round(timestamp_s, 3), **ev}
                         )
 
-                    for tr in tracks:
+                    for tr, raw_tid in zip(tracks, raw_track_ids, strict=True):
                         if tr.recovered:
                             recovered_count += 1
                         if paths:
@@ -578,6 +641,8 @@ class TrackflowPipeline:
                             if spool is None:
                                 sink.append(record)
                             else:
+                                if mask_resolver is not None:
+                                    record["_raw_track_id"] = raw_tid
                                 spool.write(json.dumps(record) + "\n")
                         if save_video or display:
                             fx, fy = tr.foot_point
@@ -598,11 +663,16 @@ class TrackflowPipeline:
                             if hasattr(tracker, "coasting_tracks")
                             else []
                         )
+                        for c in coasting:
+                            cid = (
+                                mask_resolver.resolve_id(frame_idx, c.track_id)
+                                if mask_resolver is not None
+                                else c.track_id
+                            )
+                            c.track_id = card_index.canonical_id(cid)
                         anon_frame = self.anonymizer.apply(
                             frame_bgr, tracks, detections=dets, coasting=coasting
                         )
-                        for c in coasting:
-                            c.track_id = card_index.canonical_id(c.track_id)
                         rendered = draw_tracks(
                             anon_frame,
                             tracks,
@@ -642,7 +712,13 @@ class TrackflowPipeline:
                 spool.seek(0)
                 for line in spool:
                     rec = json.loads(line)
-                    rec["track_id"] = card_index.canonical_id(rec["track_id"])
+                    raw_tid = rec.pop("_raw_track_id", rec["track_id"])
+                    tid = (
+                        mask_resolver.resolve_id(rec["frame_idx"], raw_tid)
+                        if mask_resolver is not None
+                        else rec["track_id"]
+                    )
+                    rec["track_id"] = card_index.canonical_id(tid)
                     sink.append(rec)
             writer_stack.close()
 
@@ -707,6 +783,14 @@ class TrackflowPipeline:
                     dict(floorplan.zone_dwell_totals_s) if floorplan is not None else {}
                 ),
                 line_counts=counter.counts if counter else {},
+                mask_fallback=(
+                    {
+                        "backend": self.mask_fallback_backend,
+                        **mask_resolver.stats.to_dict(),
+                    }
+                    if mask_resolver is not None
+                    else None
+                ),
             )
 
             if "html" in export_set:
