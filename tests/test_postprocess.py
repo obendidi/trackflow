@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 import signal
 from pathlib import Path
 
@@ -675,7 +674,7 @@ def test_pipeline_postprocess_ctrl_c_in_pass1_renders_processed_frames(tmp_path:
             _ = frame_bgr
             self.step += 1
             if self.step == 6:
-                os.kill(os.getpid(), signal.SIGINT)
+                signal.raise_signal(signal.SIGINT)
             return [Detection((40.0, 40.0, 90.0, 190.0), 0.92, 0, "person")]
 
     out_dir = tmp_path / "p1_out"
@@ -711,7 +710,7 @@ def test_pipeline_postprocess_ctrl_c_in_pass2_preserves_artifacts_and_unlinks_em
         nonlocal replay_frames
         replay_frames += 1
         if replay_frames == 5:
-            os.kill(os.getpid(), signal.SIGINT)
+            signal.raise_signal(signal.SIGINT)
         return orig_draw(*args, **kwargs)
 
     monkeypatch.setattr(pipeline_mod, "draw_tracks", _interrupt_mid)
@@ -736,7 +735,7 @@ def test_pipeline_postprocess_ctrl_c_in_pass2_preserves_artifacts_and_unlinks_em
         gen, rate, w, h, total = orig_iter(*args, **kwargs)
         if iter_calls == 2:
             def _wrapped():
-                os.kill(os.getpid(), signal.SIGINT)
+                signal.raise_signal(signal.SIGINT)
                 yield from gen
             return _wrapped(), rate, w, h, total
         return gen, rate, w, h, total
