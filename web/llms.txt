@@ -1,0 +1,93 @@
+# Trackflow
+
+> Apache-2.0 local people and object tracking toolkit (`trackflow-python`) for Python and the browser (WebGPU/WASM). Runs ONNX Runtime detectors (RT-DETRv2, RF-DETR, D-FINE, optional YOLO26/DEIMv2/`hf:` Transformers) with ByteTrack, BoT-SORT, OC-SORT, or BoostTrack++, exports DuckDB-ready Parquet/JSONL/CSV/MOTChallenge/HTML, supports natural-language Track Card search (CLIP, SigLIP, EmbeddingGemma 2), directional line counting, anonymization, and a local visual run inspector with 4-point floorplan homography.
+
+- GitHub: https://github.com/obendidi/trackflow
+- Documentation: https://obendidi.github.io/trackflow/docs/
+- PyPI: https://pypi.org/project/trackflow-python/
+- Browser Playground (WebGPU/WASM, local only): https://obendidi.github.io/trackflow/
+- Coding-agent skills (`npx skills add obendidi/trackflow`): https://skills.sh/obendidi/trackflow
+
+## Quickstart
+
+```bash
+# Zero-install CLI via uvx (choose the build matching your hardware)
+uvx trackflow-python run street.mp4                  # CPU / macOS (auto-pins Apple Silicon P-cores)
+uvx trackflow-python run street.mp4 --device coreml  # macOS Apple Silicon GPU
+uvx trackflow-python-cuda run street.mp4             # NVIDIA CUDA (bundled CUDA + cuDNN)
+uvx trackflow-python-tensorrt run street.mp4         # NVIDIA TensorRT FP16 (Py 3.11+, cached engines)
+
+# Or install library + CLI (never mix CPU onnxruntime and onnxruntime-gpu in one venv)
+pip install trackflow-python           # CPU / macOS
+pip install trackflow-python-cuda      # NVIDIA CUDA
+pip install trackflow-python-tensorrt  # NVIDIA TensorRT FP16
+trackflow run crowd.mp4 --tracker botsort --reid osnet --export parquet,jsonl,mot,html
+trackflow inspect
+```
+
+## CLI Commands (agent-friendly `--json` where supported)
+
+- `trackflow info --json`: system environment, Trackflow version, ONNX Runtime version, and available execution providers (`CPUExecutionProvider`, `CUDAExecutionProvider`, `CoreMLExecutionProvider`, `TensorrtExecutionProvider`).
+- `trackflow models --json`: full catalog of built-in detectors, person Re-ID models, and VLM text-search models with sizes, Hugging Face repo IDs, revisions, and licenses.
+- `trackflow run <source>`: accepts a local video file, image directory (natural sort; pass `--fps`), RTSP/HTTP URL, or camera index (`0`). Key flags: `--model`, `--tracker bytetrack|botsort|ocsort|boosttrack`, `--device cpu|cuda|coreml|tensorrt`, `--classes person,car`, `--reid osnet`, `--reid-merge`, `--query "..."`, `--vlm clip|siglip|embeddinggemma`, `--line "door=x1,y1,x2,y2"`, `--anonymize face-blur|blur|pixelate|skeleton`, `--export parquet,jsonl,csv,mot,html`, `--no-video`, `-o <empty_dir>`.
+- `trackflow search <run_dir> "<query>" --json`: offline natural-language search over saved Track Cards; add `--export-prompts prompts.json` for SAM 3 / VLM handoff windows.
+- `trackflow inspect [run_dir] [--compare <run_b>]`: local web UI showing real video frames behind overlays, recovery/ID-switch markers, Track Card search, 4-point floorplan homography, and tracker diffs.
+- `trackflow compare <source> --trackers bytetrack,botsort --inspect`: run and compare two trackers on the same clip.
+- `trackflow benchmark <source>`: throughput report across detector/tracker pairs.
+
+## Python API
+
+```python
+from trackflow import TrackflowPipeline
+
+# Batch run writing Parquet / JSONL / HTML / Track Cards
+pipeline = TrackflowPipeline(
+    model="rtdetr-v2-r18",   # Apache-2.0 ONNX default
+    tracker="botsort",
+    reid="osnet",
+    classes=["person"],
+)
+summary = pipeline.run("footage.mp4", exports=("parquet", "jsonl"))
+print(summary.output_files["parquet"], summary.unique_tracks)
+```
+
+```python
+# In-memory streaming (nothing written to disk)
+import cv2
+from trackflow import TrackflowPipeline
+
+pipeline = TrackflowPipeline(model="rfdetr-nano", tracker="bytetrack")
+cap = cv2.VideoCapture("rtsp://camera.local/stream")
+
+def frames():
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            return
+        yield frame  # BGR uint8
+
+for result in pipeline.stream(frames(), fps=25):
+    for track in result.tracks:
+        print(result.frame_idx, result.timestamp_s, track.track_id, track.class_name, track.bbox)
+```
+
+## Models & Licenses
+
+Trackflow code is **Apache-2.0**. Check weight licenses before commercial use:
+- Apache-2.0 detectors: `rtdetr-v2-r18` (default, ~81 MB), `rfdetr-nano` / `small` / `medium` / `base` / `large`, `dfine-n` (~15 MB).
+- AGPL-3.0 detectors: `yolo26n`..`yolo26x` (commercial use requires an Ultralytics license).
+- Non-commercial detectors: `deimv2-atto`, `deimv2-s`.
+- Text search (`--vlm`): `clip` (MIT), `siglip` (Apache-2.0), `embeddinggemma` (Apache-2.0, requires `trackflow-python[transformers]`).
+- Person Re-ID (`--reid`): `osnet` (MIT code; MSMT17 weights — check dataset terms for commercial use).
+
+## Parquet / JSONL Schema (`tracks.parquet`, `tracks.jsonl`, `tracks.csv`)
+
+Columns: `frame_idx` (int64), `timestamp_s` (float64), `track_id` (int64), `class_id` (int64), `class_name` (string), `confidence` (float64, 0–1), `x1`, `y1`, `x2`, `y2`, `width`, `height` (float64 pixels), `age` (int64), `hits` (int64), `recovered` (bool), `query_score` (float64), `query_match` (bool), `world_x`, `world_y` (float64), `zone` (string).
+
+## Docs & Migration Guides
+
+- [README](https://raw.githubusercontent.com/obendidi/trackflow/main/README.md): full feature guide, MOT17 benchmarks, and Python API.
+- [Migrating from Google Cloud Video Intelligence (`OBJECT_TRACKING`)](https://raw.githubusercontent.com/obendidi/trackflow/main/docs/migrate-google-video-intelligence.md): field mapping, DuckDB segment query, cost comparison ($9/hr vs $0 local).
+- [Migrating from AWS Rekognition (`StartPersonTracking` / People Pathing)](https://raw.githubusercontent.com/obendidi/trackflow/main/docs/migrate-aws-rekognition.md): `boto3` before/after, field mapping, dwell query, and anonymization.
+- [Trackflow Agent Skill](https://raw.githubusercontent.com/obendidi/trackflow/main/skills/trackflow/SKILL.md): concise playbook for coding agents using Trackflow.
+- [ONNX Vision Deploy Skill](https://raw.githubusercontent.com/obendidi/trackflow/main/skills/onnx-vision-deploy/SKILL.md): empirical checklist for ONNX vision deployment across CPU, CUDA, Apple Silicon CoreML, and WebGPU/WASM.

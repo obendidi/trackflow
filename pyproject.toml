@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "trackflow-python"
-version = "0.6.0"
+version = "0.6.1"
 description = "Stream or export multi-object tracks with ONNX and optional Transformers detectors, ByteTrack, BoT-SORT, OC-SORT or BoostTrack, text search, floorplan projection, and anonymization."
 readme = "README.md"
 license = "Apache-2.0"
@@ -27,6 +27,13 @@ keywords = [
   "d-fine",
   "onnxruntime",
   "computer-vision",
+  "video-tracking",
+  "re-identification",
+  "homography",
+  "parquet",
+  "webgpu",
+  "clip",
+  "siglip",
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -63,15 +70,16 @@ transformers = [
   "torchvision>=0.21",
   "sentence-transformers>=6.1,<7",
 ]
-cuda = [
-  "onnxruntime-gpu>=1.20",
-]
 display = [
   "opencv-python>=4.9",
 ]
 dev = [
   "pytest>=8.0",
   "ruff>=0.6",
+]
+docs = [
+  "mkdocs-material>=9.6",
+  "mkdocstrings[python]>=0.29",
 ]
 
 [project.scripts]
@@ -80,6 +88,7 @@ trackflow-python = "trackflow.cli:app"
 
 [project.urls]
 Homepage = "https://obendidi.github.io/trackflow/"
+Documentation = "https://obendidi.github.io/trackflow/docs/"
 Repository = "https://github.com/obendidi/trackflow"
 Issues = "https://github.com/obendidi/trackflow/issues"
 

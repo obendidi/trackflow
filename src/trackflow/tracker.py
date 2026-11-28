@@ -10,6 +10,7 @@ requires identical IDs and boxes.
 
 from __future__ import annotations
 
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
@@ -749,14 +750,25 @@ class XywhKalmanFilter:
         return np.square(self._std_pos * self._size_scales())
 
     def predict(self) -> None:
-        s = self._size_scales()
-        q = np.square(np.concatenate([self._std_pos * s, self._std_vel * s]))
+        w = max(1.0, float(self.mean[2]))
+        h = max(1.0, float(self.mean[3]))
+        if self.height_scaled:
+            h = max(10.0, h)
+            s0 = s1 = s3 = h
+            s2 = max(10.0, w, 0.35 * h)
+        else:
+            s0 = s2 = w
+            s1 = s3 = h
+        sp2 = self._std_pos * self._std_pos
+        sv2 = self._std_vel * self._std_vel
         m = self.mean
         m[:4] += m[4:]
-        for i in (2, 3):
-            if m[i] < 1.0:
-                m[i] = 1.0
-                m[i + 4] = 0.0
+        if m[2] < 1.0:
+            m[2] = 1.0
+            m[6] = 0.0
+        if m[3] < 1.0:
+            m[3] = 1.0
+            m[7] = 0.0
         # F @ P @ F.T for the constant-velocity F = [[I, I], [0, I]], written out blockwise.
         c = self.cov
         pp, pv, vv = c[:4, :4], c[:4, 4:], c[4:, 4:]
@@ -764,29 +776,60 @@ class XywhKalmanFilter:
         c[:4, :4] = pp + pv + pv.T + vv
         c[:4, 4:] = new_pv
         c[4:, :4] = new_pv.T
-        c[np.diag_indices(8)] += q
+        c[0, 0] += sp2 * s0 * s0
+        c[1, 1] += sp2 * s1 * s1
+        c[2, 2] += sp2 * s2 * s2
+        c[3, 3] += sp2 * s3 * s3
+        c[4, 4] += sv2 * s0 * s0
+        c[5, 5] += sv2 * s1 * s1
+        c[6, 6] += sv2 * s2 * s2
+        c[7, 7] += sv2 * s3 * s3
 
     def update(self, bbox: tuple[float, float, float, float], confidence: float = 1.0) -> None:
         r = self.measurement_var() * max(self.min_nsa, 1e-4, 1.0 - float(confidence))
-        s = self.cov[:4, :4] + np.diag(r)
+        s = self.cov[:4, :4].copy()
+        s[0, 0] += r[0]
+        s[1, 1] += r[1]
+        s[2, 2] += r[2]
+        s[3, 3] += r[3]
         gain = np.linalg.solve(s, self.cov[:, :4].T).T
-        self.mean = self.mean + gain @ (_xyxy_to_xywh(bbox) - self.mean[:4])
+        x1, y1, x2, y2 = bbox
+        w = max(x2 - x1, 1e-3)
+        h = max(y2 - y1, 1e-3)
+        m = self.mean
+        innov = np.array(
+            [x1 + 0.5 * w - m[0], y1 + 0.5 * h - m[1], w - m[2], h - m[3]], dtype=np.float64
+        )
+        self.mean = m + gain @ innov
         self.cov = self.cov - gain @ s @ gain.T
-        np.maximum(self.mean[2:4], 1.0, out=self.mean[2:4])
+        if self.mean[2] < 1.0:
+            self.mean[2] = 1.0
+        if self.mean[3] < 1.0:
+            self.mean[3] = 1.0
 
     def apply_camera_warp(self, warp_2x3: np.ndarray) -> None:
         """Move the state into the current frame: rotate/translate the center, rotate the
         velocity, scale the box size by the warp's zoom, and transform the covariance alike."""
         rot = warp_2x3[:2, :2]
-        scale = float(np.sqrt(abs(np.linalg.det(rot))))
-        t = np.zeros((8, 8), dtype=np.float64)
-        t[0:2, 0:2] = rot
-        t[2, 2] = t[3, 3] = scale
-        t[4:6, 4:6] = rot
-        t[6, 6] = t[7, 7] = scale
-        self.mean = t @ self.mean
-        self.mean[:2] += warp_2x3[:2, 2]
-        self.cov = t @ self.cov @ t.T
+        det = float(rot[0, 0] * rot[1, 1] - rot[0, 1] * rot[1, 0])
+        scale = math.sqrt(abs(det))
+        m = self.mean
+        m[0:2] = rot @ m[0:2] + warp_2x3[:2, 2]
+        m[2:4] *= scale
+        m[4:6] = rot @ m[4:6]
+        m[6:8] *= scale
+        # Block-diagonal T = diag(rot, scale*I, rot, scale*I): compute T @ P @ T.T in two passes.
+        c = self.cov
+        tmp = np.empty_like(c)
+        tmp[0:2] = rot @ c[0:2]
+        tmp[2:4] = scale * c[2:4]
+        tmp[4:6] = rot @ c[4:6]
+        tmp[6:8] = scale * c[6:8]
+        rot_t = rot.T
+        c[:, 0:2] = tmp[:, 0:2] @ rot_t
+        c[:, 2:4] = tmp[:, 2:4] * scale
+        c[:, 4:6] = tmp[:, 4:6] @ rot_t
+        c[:, 6:8] = tmp[:, 6:8] * scale
 
 
 @dataclass

@@ -43,6 +43,12 @@ QUERY_THRESHOLDS: dict[str, float] = {
 
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+_IMAGENET_SCALE = (1.0 / (255.0 * _IMAGENET_STD)).astype(np.float32)
+_IMAGENET_BIAS = (-_IMAGENET_MEAN / _IMAGENET_STD).astype(np.float32)
+# Fixed padded batch size for OSNet on CoreML and TensorRT so the engine compiles once per
+# session instead of stalling on dynamic per-frame crowd counts.
+_STATIC_OSNET_BATCH = 8
+_COREML_OSNET_BATCH = _STATIC_OSNET_BATCH
 
 
 def _l2_normalize(vec: np.ndarray) -> np.ndarray:
@@ -102,22 +108,31 @@ class ReidEmbedder:
         self._sess = None
         self._input_name = ""
         self._input_hw = (256, 128)
+        self._static_batch: int | None = None
         if backend == "osnet":
             spec = REID_REGISTRY["osnet"]
             self._input_hw = spec.input_hw
-            # ONNX Runtime has no MPS provider, and CoreML MLProgram recompiles on each dynamic
-            # per-frame crop batch size and stalls; CPU runs the 8.7 MB graph in a few ms.
-            eff_dev = "cpu" if device.lower().strip() in ("mps", "coreml") else device
-            self._sess, _ = create_onnx_session(
-                resolve_reid_model("osnet", cache_dir=cache_dir), device=eff_dev
+            # ONNX Runtime has no MPS provider; map mps to CPU. CoreML and TensorRT run with a
+            # fixed padded batch size in encode_images so the engine compiles only once.
+            eff_dev = "cpu" if device.lower().strip() == "mps" else device
+            self._sess, active_provider = create_onnx_session(
+                resolve_reid_model("osnet", cache_dir=cache_dir),
+                device=eff_dev,
+                trt_fp16=True,
+                cache_dir=cache_dir,
             )
             self._input_name = self._sess.get_inputs()[0].name
+            if active_provider in ("CoreMLExecutionProvider", "TensorrtExecutionProvider"):
+                self._static_batch = _STATIC_OSNET_BATCH
 
     def _preprocess(self, crop_bgr: np.ndarray) -> np.ndarray:
         h, w = self._input_hw
-        rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-        x = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
-        return ((x - _IMAGENET_MEAN) / _IMAGENET_STD).transpose(2, 0, 1)
+        resized = cv2.resize(crop_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        x = rgb.astype(np.float32)
+        x *= _IMAGENET_SCALE
+        x += _IMAGENET_BIAS
+        return x.transpose(2, 0, 1)
 
     def encode_images(self, crops: list[np.ndarray | None]) -> list[np.ndarray | None]:
         """Embed a batch of BGR crops; ``None``/empty crops map to ``None``."""
@@ -130,10 +145,26 @@ class ReidEmbedder:
                 out[i] = _color_spatial_embedding(crops[i])  # type: ignore[arg-type]
             return out
         assert self._sess is not None
-        batch = np.stack([self._preprocess(crops[i]) for i in valid])  # type: ignore[arg-type]
-        embs = self._sess.run(None, {self._input_name: batch})[0]
-        for i, e in zip(valid, embs, strict=True):
-            out[i] = _l2_normalize(e)
+        if self._static_batch is None:
+            batch = np.stack([self._preprocess(crops[i]) for i in valid])  # type: ignore[arg-type]
+            embs = self._sess.run(None, {self._input_name: batch})[0]
+            for i, e in zip(valid, embs, strict=True):
+                out[i] = _l2_normalize(e)
+            return out
+
+        bs = self._static_batch
+        h, w = self._input_hw
+        buf = np.empty((bs, 3, h, w), dtype=np.float32)
+        for start in range(0, len(valid), bs):
+            chunk = valid[start : start + bs]
+            m = len(chunk)
+            for slot, idx in enumerate(chunk):
+                buf[slot] = self._preprocess(crops[idx])  # type: ignore[arg-type]
+            if m < bs:
+                buf[m:] = 0.0
+            embs = self._sess.run(None, {self._input_name: buf})[0]
+            for slot, idx in enumerate(chunk):
+                out[idx] = _l2_normalize(embs[slot])
         return out
 
     def encode_image(self, crop_bgr: np.ndarray | None) -> np.ndarray | None:
@@ -168,14 +199,21 @@ class VlmEmbedder:
         self._text_cache: dict[str, np.ndarray] = {}
 
         artifacts = resolve_vlm_artifacts(backend=backend, precision=precision, cache_dir=cache_dir)
-        eff_dev = "cpu" if (device == "auto" and precision == "int8") else device
+        req_dev = device.lower().strip()
+        if req_dev == "auto" and precision == "int8":
+            eff_dev = "cpu"
+        elif req_dev == "tensorrt" and precision == "int8":
+            # INT8 VLM graphs run on CUDA in a few ms without a multi-minute TRT engine build.
+            eff_dev = "cuda"
+        else:
+            eff_dev = device
         # ONNX Runtime's default CoreML setup: MLProgram can't load these INT8 graphs, and
         # NeuralNetwork limited to CPU and GPU returns NaN for some CLIP crops.
         self._vision_sess, _ = create_onnx_session(
-            artifacts["vision_onnx"], device=eff_dev, coreml_format=None
+            artifacts["vision_onnx"], device=eff_dev, coreml_format=None, cache_dir=cache_dir
         )
         self._text_sess, _ = create_onnx_session(
-            artifacts["text_onnx"], device=eff_dev, coreml_format=None
+            artifacts["text_onnx"], device=eff_dev, coreml_format=None, cache_dir=cache_dir
         )
         self._tokenizer = Tokenizer.from_file(str(artifacts["tokenizer"]))
         self._load_preprocess(artifacts["preprocessor"], artifacts["config"])

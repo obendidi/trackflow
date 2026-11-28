@@ -9,9 +9,15 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.6.1)"
+        required: true
+        type: string
 
 concurrency:
-  group: publish-${{ github.ref_name }}
+  group: publish-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -19,17 +25,24 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - name: Check the tag, version and changelog
         run: |
-          python3 scripts/release_notes.py "$GITHUB_REF_NAME" > release-notes.md
-          echo "previous=$(python3 scripts/release_notes.py --previous "$GITHUB_REF_NAME")" >> "$GITHUB_OUTPUT"
+          python3 scripts/release_notes.py "$TAG" > release-notes.md
+          echo "previous=$(python3 scripts/release_notes.py --previous "$TAG")" >> "$GITHUB_OUTPUT"
         id: notes
       - name: Install uv
         uses: astral-sh/setup-uv@v5
-      - name: Build distributions
-        run: uv build
+      - name: Build distributions (CPU, CUDA, TensorRT)
+        run: |
+          python3 scripts/build_variants.py --variants cpu --sdist --out-dir dist/cpu
+          python3 scripts/build_variants.py --variants cuda --sdist --out-dir dist/cuda
+          python3 scripts/build_variants.py --variants tensorrt --sdist --out-dir dist/tensorrt
       - uses: actions/upload-artifact@v4
         with:
           name: dist
@@ -55,21 +68,60 @@ jobs:
         with:
           name: dist
           path: dist/
-      - name: Publish to PyPI
+      - name: Publish trackflow-python to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
+          packages-dir: dist/cpu/
           # A re-run after a failed release step finds the files already uploaded.
           skip-existing: true
 
+  pypi-cuda:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-cuda
+      url: https://pypi.org/p/trackflow-python-cuda
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish trackflow-python-cuda to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/cuda/
+          skip-existing: true
+
+  pypi-tensorrt:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-tensorrt
+      url: https://pypi.org/p/trackflow-python-tensorrt
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Publish trackflow-python-tensorrt to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/tensorrt/
+          skip-existing: true
+
   github-release:
-    needs: [build, pypi]
+    needs: [build, pypi, pypi-cuda, pypi-tensorrt]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ inputs.tag || github.ref_name }}
       PREVIOUS: ${{ needs.build.outputs.previous }}
     steps:
       - uses: actions/download-artifact@v4
@@ -81,12 +133,13 @@ jobs:
           name: release-notes
       - name: Create or update the GitHub release
         run: |
-          printf '\n\nInstall with `pip install trackflow-python==%s`.\n' "${TAG#v}" >> release-notes.md
+          VER="${TAG#v}"
+          printf '\n\nInstall with `pip install trackflow-python==%s` (CPU/macOS), `pip install trackflow-python-cuda==%s` (NVIDIA CUDA), or `pip install trackflow-python-tensorrt==%s` (NVIDIA TensorRT).\n' "$VER" "$VER" "$VER" >> release-notes.md
           if gh release view "$TAG" > /dev/null 2>&1; then
             gh release edit "$TAG" --title "$TAG" --notes-file release-notes.md
-            gh release upload "$TAG" dist/* --clobber
+            gh release upload "$TAG" dist/*/*.whl dist/*/*.tar.gz --clobber
           else
-            gh release create "$TAG" dist/* --verify-tag --title "$TAG" \
+            gh release create "$TAG" dist/*/*.whl dist/*/*.tar.gz --verify-tag --title "$TAG" \
               --notes-file release-notes.md --generate-notes \
               ${PREVIOUS:+--notes-start-tag "$PREVIOUS"}
           fi

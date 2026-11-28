@@ -2,7 +2,7 @@
 
 Google Cloud Video Intelligence was deprecated on **2026-09-14** with full shutdown scheduled for **2027-09-14**. At list price, `OBJECT_TRACKING` costs **$0.15/minute ($9.00/video-hour)** for stored video and **$0.17/minute ($10.20/video-hour)** for streaming (~$7,344/month per 24/7 camera over 30 days).
 
-If your pipeline only needed persistent per-object bounding boxes (`Feature.OBJECT_TRACKING`) written to a table or JSON stream, [Trackflow](../README.md) replaces it locally on CPU, CUDA, Apple Silicon CoreML, or TensorRT under an **Apache-2.0** license (both code and default ONNX DETR weights).
+If your pipeline only needed persistent per-object bounding boxes (`Feature.OBJECT_TRACKING`) written to a table or JSON stream, [Trackflow](index.md) replaces it locally on CPU, CUDA, Apple Silicon CoreML, or TensorRT under an **Apache-2.0** license (both code and default ONNX DETR weights).
 
 ## 1. One-command CLI replacement
 

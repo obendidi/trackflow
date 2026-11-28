@@ -9,6 +9,22 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 - Opt-in `--postprocess` offline pass (`TrackflowPipeline(..., postprocess=True)` and `postprocess_records` / `postprocess_tracks_array`) for recorded videos and image directories: splits suspect track switches, links fragmented tracklets with camera-motion-compensated kinematics and self-calibrated OSNet appearance, fills short supported occlusion gaps, and smooths jitter with motion-adaptive two-scale Gaussian filtering. Lifts 4-dataset mean HOTA across all 81 official validation videos by **+3.2 HOTA** on `botsort --reid osnet` (`38.8 → 42.0`: DanceTrack `+3.4`, SportsMOT `+5.3`, MOT17 `+2.8`, MOT20 `+1.2`) and **+0.7 to +1.1 HOTA** without Re-ID, in `~64–265 ms/video` (max `397 ms`), while leaving live `stream()` and `ByteTracker` web parity untouched.
 - `--postprocess` flag in `scripts/eval_benchmarks.py` and `last_cmc_warp` exposure on `BotSortTracker`, `OcSortTracker`, and `BoostTracker`.
 
+## [0.6.1] - 2026-11-27
+
+### Added
+
+- Dedicated one-command GPU packages published alongside `trackflow-python`: `trackflow-python-cuda` (bundles `onnxruntime-gpu[cuda,cudnn]`) and `trackflow-python-tensorrt` (bundles `onnxruntime-gpu[cuda,cudnn]>=1.28` + `tensorrt-cu13-libs>=10,<11` and defaults `--device` to `tensorrt`), plus a multi-target `Dockerfile` (`cpu`, `cuda`, `tensorrt`).
+- Automatic CUDA, cuDNN, and TensorRT shared-library preloading (`preload_gpu_libraries`) so pip/uv installs work without installing system CUDA Toolkit/TensorRT or setting `LD_LIBRARY_PATH`.
+- Persistent TensorRT FP16 engine and timing caches under `~/.cache/trackflow/trt_cache/` (cutting warm startup from ~3–4 minutes to <1 s, with `2.6–3.2x` higher FPS over CUDA on an NVIDIA T4) and automatic FP32 fallback on `rfdetr-*` presets whose DINOv2 activations overflow FP16.
+- Hardware diagnostics in `trackflow info [--json]` (NVIDIA GPU detection, Apple Silicon P-core count, preloaded TensorRT libs, and copy-paste GPU commands), `--device` flag on `trackflow compare`, `trackflow search --json`, and `web/llms.txt`.
+
+### Changed
+
+- Pinned ONNX Runtime CPU threads on Apple Silicon to performance cores (`hw.perflevel0.physicalcpu`), speeding up CPU DETR detectors by 17–27% without setting `OMP_NUM_THREADS`.
+- Enabled static-batch (`8`) OSNet Re-ID on both CoreML and TensorRT (1.8x faster than CUDA on T4, 5–24x faster than CPU on Apple Silicon with 0.99996–1.00000 cosine parity).
+- Overlapped local frame decoding and MP4 rendering/encoding on bounded worker threads in `TrackflowPipeline.run()` (`1.29–1.41x` faster end-to-end 1080p tracking on Apple M4 Pro), resized BGR before RGB conversion in `OnnxDetrDetector.preprocess()`, and removed temporary allocations in `XywhKalmanFilter` and `ocsort._direction`.
+- Removed the broken `[cuda]` optional extra from `trackflow-python` (which installed both `onnxruntime` and `onnxruntime-gpu` in the same environment and silently broke GPU providers).
+
 ## [0.6.0] - 2026-11-26
 
 ### Added
@@ -172,7 +188,9 @@ First release of Trackflow, a rewrite of the 2017 Tracking-with-darkflow project
 
 - `trackflow run` crashes with an `AttributeError` from the progress bar. Use 0.1.1 or later.
 
-[Unreleased]: https://github.com/obendidi/trackflow/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/obendidi/trackflow/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/obendidi/trackflow/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/obendidi/trackflow/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/obendidi/trackflow/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/obendidi/trackflow/compare/v0.4.3...v0.5.0
 [0.4.3]: https://github.com/obendidi/trackflow/compare/v0.4.2...v0.4.3
