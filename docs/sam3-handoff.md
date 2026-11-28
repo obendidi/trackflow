@@ -54,3 +54,36 @@ for item in manifest["prompts"]:
     })
     # Propagate masks only over the shortlisted window instead of the entire 2-hour video.
 ```
+
+## Live ambiguity-triggered mask fallback (SAM 2.1 Apache-2.0 or external SAM 3)
+
+For crowded dance or sports scenes where two people cross behind an occluder and box trackers swap IDs, Trackflow exposes an online ambiguity monitor (`MaskFallbackResolver`) with a bounded in-RAM frame ring buffer. It runs the fast ONNX box tracker on normal frames and dispatches only short transient-occlusion windows to a `MaskPropagator`, reconciling identities with a collision-free bijective permutation. By default it uses the conservative transient-occlusion-recovery gate (`include_fragmentation=False`) for zero-regression safety on unseen crowds; pass `MaskFallbackConfig(include_fragmentation=True)` to also relink occlusion-split newborn tracks.
+
+### Option A: Built-in Apache-2.0 SAM 2.1 / EdgeTAM (`[sam2]` extra)
+
+Install the optional Apache-2.0 extra (Hugging Face Transformers + PyTorch; zero Meta SAM License):
+
+```bash
+pip install "trackflow-python[sam2]"
+trackflow run dance.mp4 --tracker ocsort --mask-fallback sam2.1-tiny --mask-budget 0.10
+```
+
+Available presets (`trackflow models`): `sam2.1-tiny` (default), `edgetam`, `sam2.1-small`, `sam2.1-base-plus`, `sam2.1-large`. All five are pinned to exact Apache-2.0 Hugging Face revisions.
+
+### Option B: External SAM 3 adapter (keeps Meta SAM License out of Trackflow)
+
+If you have approved access to `facebook/sam3` in your own GPU environment, wrap your SAM 3 video predictor (`handle_request` + `handle_stream_request`) with `Sam3MaskPropagator` and pass it into `TrackflowPipeline`. Note that SAM 3's `start_session` reads JPEG frames from a temporary directory on disk, so `Sam3MaskPropagator` cannot be combined with `--anonymize` (use in-memory `Sam2MaskPropagator` when anonymization is active):
+
+```python
+from sam3.model_builder import build_sam3_video_predictor
+from trackflow import MaskFallbackConfig, Sam3MaskPropagator, TrackflowPipeline
+
+predictor = build_sam3_video_predictor()
+pipe = TrackflowPipeline(
+    tracker="ocsort",
+    mask_propagator=Sam3MaskPropagator(predictor),
+    mask_fallback_config=MaskFallbackConfig(max_frame_rate=0.10),
+)
+summary = pipe.run("match.mp4", save_video=False)
+print(summary.mask_fallback)
+```

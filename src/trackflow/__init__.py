@@ -6,7 +6,21 @@ from trackflow.boosttrack import BoostTracker
 from trackflow.detector import Detector, OnnxDetrDetector, create_detector
 from trackflow.homography import DwellZone, FloorplanHomography
 from trackflow.lines import CountingLine
-from trackflow.models import MODEL_REGISTRY, REID_REGISTRY, VLM_REGISTRY, ModelSpec
+from trackflow.mask_fallback import (
+    MaskFallbackConfig,
+    MaskFallbackResolver,
+    MaskFallbackStats,
+    MaskPropagator,
+    Sam3MaskPropagator,
+)
+from trackflow.models import (
+    MASK_REGISTRY,
+    MODEL_REGISTRY,
+    REID_REGISTRY,
+    VLM_REGISTRY,
+    MaskModelSpec,
+    ModelSpec,
+)
 from trackflow.nltrack import NonLinearTracker
 from trackflow.ocsort import OcSortTracker
 from trackflow.pipeline import TrackflowPipeline
@@ -47,7 +61,13 @@ __all__ = [
     "FloorplanHomography",
     "FrameResult",
     "HomographyPoint",
+    "MASK_REGISTRY",
     "MODEL_REGISTRY",
+    "MaskFallbackConfig",
+    "MaskFallbackResolver",
+    "MaskFallbackStats",
+    "MaskModelSpec",
+    "MaskPropagator",
     "ModelSpec",
     "NonLinearTracker",
     "OcSortTracker",
@@ -57,6 +77,7 @@ __all__ = [
     "REID_REGISTRY",
     "ReidEmbedder",
     "RunSummary",
+    "Sam3MaskPropagator",
     "Track",
     "TrackCard",
     "TRACKER_NAMES",

@@ -201,10 +201,11 @@ class RunSummary:
     model_revision: str | None = None
     precision: str | None = None
     tracking_threshold: float | None = None
+    mask_fallback: dict[str, Any] | None = None
     postprocessed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "source": self.source,
             "model": self.model,
             "model_revision": self.model_revision,
@@ -235,3 +236,6 @@ class RunSummary:
             "zone_dwell_totals_s": {k: round(v, 2) for k, v in self.zone_dwell_totals_s.items()},
             "line_counts": self.line_counts,
         }
+        if self.mask_fallback is not None:
+            out["mask_fallback"] = self.mask_fallback
+        return out
