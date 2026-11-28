@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import queue
 import re
 import signal
 import tempfile
@@ -120,6 +121,143 @@ def _is_stream_url(source: str | Path | int) -> bool:
     )
 
 
+def _is_camera_source(source: str | Path | int) -> bool:
+    return isinstance(source, int) or (
+        isinstance(source, str)
+        and (source.isdigit() or source.lower() == "camera")
+        and not Path(source).exists()
+    )
+
+
+def _is_live_source(source: str | Path | int) -> bool:
+    return _is_camera_source(source) or _is_stream_url(source)
+
+
+_WRITER_STOP = object()
+
+
+@contextlib.contextmanager
+def _prefetch_frames(
+    frame_iter: Generator[tuple[int, float, np.ndarray], None, None],
+    *,
+    maxsize: int = 2,
+) -> Iterator[Iterator[tuple[int, float, np.ndarray]]]:
+    """Decode frames one step ahead on a worker thread so file I/O overlaps inference."""
+    q: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=maxsize)
+    cancel = threading.Event()
+
+    def _put(item: tuple[str, Any]) -> bool:
+        while not cancel.is_set():
+            try:
+                q.put(item, timeout=0.05)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _reader() -> None:
+        try:
+            for item in frame_iter:
+                if not _put(("frame", item)):
+                    return
+            _put(("eof", None))
+        except BaseException as exc:
+            _put(("error", exc))
+        finally:
+            frame_iter.close()
+
+    thread = threading.Thread(target=_reader, name="trackflow-frame-reader", daemon=True)
+    thread.start()
+
+    def _consume() -> Iterator[tuple[int, float, np.ndarray]]:
+        while True:
+            kind, payload = q.get()
+            if kind == "frame":
+                yield payload
+            elif kind == "eof":
+                return
+            else:
+                raise payload
+
+    try:
+        yield _consume()
+    finally:
+        cancel.set()
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+        thread.join()
+
+
+class _AsyncVideoWriter:
+    """Render annotations and encode video frames on a worker thread with bounded backpressure."""
+
+    def __init__(
+        self,
+        video_writer: cv2.VideoWriter,
+        render_fn: Callable[..., np.ndarray],
+        *,
+        maxsize: int = 2,
+    ) -> None:
+        self._video_writer = video_writer
+        self._render_fn = render_fn
+        self._queue: queue.Queue[Any] = queue.Queue(maxsize=maxsize)
+        self._abort = threading.Event()
+        self._error: BaseException | None = None
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._worker, name="trackflow-video-writer", daemon=True
+        )
+        self._thread.start()
+
+    def _worker(self) -> None:
+        try:
+            while True:
+                item = self._queue.get()
+                if item is _WRITER_STOP:
+                    return
+                if self._abort.is_set():
+                    continue
+                rendered = self._render_fn(*item)
+                self._video_writer.write(rendered)
+        except BaseException as exc:
+            self._error = exc
+            self._abort.set()
+
+    def submit(self, *args: Any) -> None:
+        while True:
+            if self._error is not None:
+                raise self._error
+            try:
+                self._queue.put(args, timeout=0.05)
+                return
+            except queue.Full:
+                continue
+
+    def close(self, *, abort: bool = False) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if abort:
+            self._abort.set()
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+        while self._thread.is_alive():
+            try:
+                self._queue.put(_WRITER_STOP, timeout=0.05)
+                break
+            except queue.Full:
+                continue
+        self._thread.join()
+        if not abort and self._error is not None:
+            raise self._error
+
+
 def _source_label(source: str | Path | int) -> str:
     if not _is_stream_url(source):
         return str(source)
@@ -136,11 +274,7 @@ def _iter_frames(
     """Open files, image sequences, OpenCV network streams or cameras."""
     if fps is not None and (not np.isfinite(fps) or fps <= 0):
         raise ValueError("fps must be positive and finite.")
-    is_camera = isinstance(source, int) or (
-        isinstance(source, str)
-        and (source.isdigit() or source.lower() == "camera")
-        and not Path(source).exists()
-    )
+    is_camera = _is_camera_source(source)
     if is_camera:
         capture_source = 0 if str(source).lower() == "camera" else int(source)
     elif _is_stream_url(source):
@@ -602,9 +736,45 @@ class TrackflowPipeline:
             processed = 0
             seen_frames = 0
 
+            def _render_frame(
+                frame_bgr: np.ndarray,
+                tracks: list[Any],
+                dets: list[Detection],
+                coasting: list[Any],
+                trails_snap: dict[int, list[tuple[int, int]]],
+                live_fps: float,
+                line_counts_snap: dict[str, dict[str, int]] | None,
+            ) -> np.ndarray:
+                anon_frame = self.anonymizer.apply(
+                    frame_bgr, tracks, detections=dets, coasting=coasting
+                )
+                return draw_tracks(
+                    anon_frame,
+                    tracks,
+                    coasting=coasting,
+                    trails=trails_snap,
+                    fps=live_fps,
+                    query=self.query,
+                    anonymize_mode=self.anonymize_mode,
+                    lines=self.lines,
+                    line_counts=line_counts_snap,
+                )
+
+            frames: Iterator[tuple[int, float, np.ndarray]] = (
+                capture_stack.enter_context(_prefetch_frames(frame_iter))
+                if not _is_live_source(source) and total_frames != 1
+                else frame_iter
+            )
+            async_writer = (
+                _AsyncVideoWriter(video_writer, _render_frame)
+                if video_writer is not None and not display
+                else None
+            )
+
             stop = stack.enter_context(_stop_on_interrupt())
+            aborted = False
             try:
-                for frame_idx, timestamp_s, frame_bgr in frame_iter:
+                for frame_idx, timestamp_s, frame_bgr in frames:
                     if stop.is_set():
                         break
                     seen_frames += 1
@@ -670,37 +840,54 @@ class TrackflowPipeline:
                                 else c.track_id
                             )
                             c.track_id = card_index.canonical_id(cid)
-                        anon_frame = self.anonymizer.apply(
-                            frame_bgr, tracks, detections=dets, coasting=coasting
-                        )
-                        rendered = draw_tracks(
-                            anon_frame,
-                            tracks,
-                            coasting=coasting,
-                            trails=trails,
-                            fps=live_fps,
-                            query=self.query,
-                            anonymize_mode=self.anonymize_mode,
-                            lines=self.lines,
-                            line_counts=counter.counts if counter else None,
-                        )
-                        if video_writer is not None:
-                            video_writer.write(rendered)
-                        if display:
-                            try:
-                                cv2.imshow("Trackflow", rendered)
-                                if cv2.waitKey(1) & 0xFF == ord("q"):
-                                    break
-                            except cv2.error:
-                                display = False
+                        if async_writer is not None:
+                            trails_snap = {tr.track_id: trails[tr.track_id][-32:] for tr in tracks}
+                            line_counts_snap = (
+                                {k: dict(v) for k, v in counter.counts.items()} if counter else None
+                            )
+                            async_writer.submit(
+                                frame_bgr,
+                                tracks,
+                                dets,
+                                coasting,
+                                trails_snap,
+                                live_fps,
+                                line_counts_snap,
+                            )
+                        else:
+                            rendered = _render_frame(
+                                frame_bgr,
+                                tracks,
+                                dets,
+                                coasting,
+                                trails,
+                                live_fps,
+                                counter.counts if counter else None,
+                            )
+                            if video_writer is not None:
+                                video_writer.write(rendered)
+                            if display:
+                                try:
+                                    cv2.imshow("Trackflow", rendered)
+                                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                                        break
+                                except cv2.error:
+                                    display = False
 
                     if progress_callback is not None:
                         progress_callback(processed, (total_frames + skip) // stride, live_fps)
+            except BaseException:
+                aborted = True
+                raise
             finally:
-                capture_stack.close()
-                if display:
-                    with contextlib.suppress(cv2.error):
-                        cv2.destroyAllWindows()
+                try:
+                    if async_writer is not None:
+                        async_writer.close(abort=aborted)
+                finally:
+                    capture_stack.close()
+                    if display:
+                        with contextlib.suppress(cv2.error):
+                            cv2.destroyAllWindows()
 
             # Merges are decided a few frames into a returning person's new track; relabel the
             # observations recorded before that so exports use one ID per person.

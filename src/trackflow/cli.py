@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import onnxruntime as ort
 import typer
@@ -28,6 +29,11 @@ from trackflow.benchmark import (
     LEGACY_2017_BASELINE,
     generate_synthetic_crowd_video,
     run_benchmark_suite,
+)
+from trackflow.detector import (
+    _apple_p_cores,
+    detect_nvidia_gpu,
+    preload_gpu_libraries,
 )
 from trackflow.inspector import serve_inspector
 from trackflow.lines import CountingLine
@@ -54,6 +60,16 @@ def _user_errors() -> Iterator[None]:
         raise typer.BadParameter(str(exc)) from exc
 
 
+def _default_device() -> str:
+    return os.environ.get("TRACKFLOW_DEFAULT_DEVICE", "").strip() or "auto"
+
+
+def app_tensorrt() -> None:
+    """Entrypoint for the ``trackflow-python-tensorrt`` package (defaults --device to tensorrt)."""
+    os.environ.setdefault("TRACKFLOW_DEFAULT_DEVICE", "tensorrt")
+    app()
+
+
 @app.command()
 def run(
     source: Annotated[
@@ -73,13 +89,13 @@ def run(
         typer.Option("--tracker", "-t", help="Tracker: bytetrack, botsort, ocsort, or boosttrack."),
     ] = "bytetrack",
     device: Annotated[
-        str,
+        str | None,
         typer.Option(
             "--device",
             "-d",
             help="ONNX: auto, cpu, cuda, coreml, tensorrt. Transformers: auto, cpu, cuda, mps.",
         ),
-    ] = "auto",
+    ] = None,
     threshold: Annotated[
         float,
         typer.Option("--threshold", min=0.0, max=1.0, help="High-confidence tracking threshold."),
@@ -209,7 +225,7 @@ def run(
             model=model,
             precision=precision,  # type: ignore[arg-type]
             tracker=tracker,
-            device=device,
+            device=device or _default_device(),
             threshold=threshold,
             classes=class_list,
             reid=reid,  # type: ignore[arg-type]
@@ -306,12 +322,22 @@ def search(
             help="Seconds of context to pad before/after each hit window in --export-prompts.",
         ),
     ] = 0.0,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print search results as JSON.")
+    ] = False,
 ) -> None:
     """Search saved Track Cards in a completed run using natural language."""
     with _user_errors():
         hits = search_track_cards(run_dir, query, top_k=top_k, min_score=min_score)
+        out_path: Path | None = None
         if export_prompts is not None:
             out_path = export_search_prompts(run_dir, query, hits, export_prompts, pad_s=pad_s)
+    if as_json:
+        payload: dict[str, Any] = {"query": query, "results": hits}
+        if out_path is not None:
+            payload["exported_prompts"] = str(out_path)
+        typer.echo(json.dumps(payload, indent=2))
+        return
     table = Table(title=f'Track Card Search: "{query}"')
     table.add_column("Track ID", style="bold cyan")
     table.add_column("Score", justify="right", style="bold green")
@@ -383,6 +409,10 @@ def compare(
         typer.Option("--trackers", help="Two comma-separated trackers, e.g. bytetrack,botsort."),
     ] = "bytetrack,botsort",
     model: Annotated[str, typer.Option("--model", "-m", help="Detector preset.")] = "rtdetr-v2-r18",
+    device: Annotated[
+        str | None,
+        typer.Option("--device", "-d", help="Device: auto, cpu, coreml, cuda, tensorrt."),
+    ] = None,
     max_frames: Annotated[
         int | None, typer.Option("--max-frames", help="Limit frames for quick comparison.")
     ] = None,
@@ -406,11 +436,12 @@ def compare(
         )
 
     runs: list[tuple[str, Path, object]] = []
+    resolved_device = device or _default_device()
     with _user_errors():
         parent = output if output is not None else fresh_run_dir("compare")
         for tname in names[:2]:
             sub = parent / tname
-            pipe = TrackflowPipeline(model=model, tracker=tname)
+            pipe = TrackflowPipeline(model=model, tracker=tname, device=resolved_device)
             summary = pipe.run(source, output_dir=sub, max_frames=max_frames, save_video=False)
             runs.append((tname, sub, summary))
 
@@ -445,8 +476,8 @@ def benchmark(
         str, typer.Option("--trackers", help="Comma-separated trackers to benchmark.")
     ] = "bytetrack,botsort",
     device: Annotated[
-        str, typer.Option("--device", help="Device: auto, coreml, cuda, cpu.")
-    ] = "auto",
+        str | None, typer.Option("--device", help="Device: auto, coreml, cuda, tensorrt, cpu.")
+    ] = None,
     max_frames: Annotated[int, typer.Option("--max-frames", help="Max frames per run.")] = 90,
     output: Annotated[
         Path | None,
@@ -475,7 +506,7 @@ def benchmark(
             output_dir=output,
             models=[m.strip() for m in models.split(",") if m.strip()],
             trackers=[t.strip() for t in trackers.split(",") if t.strip()],
-            device=device,
+            device=device or _default_device(),
             max_frames=max_frames,
             split_screen=split_screen,
         )
@@ -592,14 +623,54 @@ def models(
 
 
 @app.command()
-def info() -> None:
+def info(
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Print environment details as JSON.")
+    ] = False,
+) -> None:
     """Display system environment, Python version, and ONNX Runtime acceleration providers."""
+    providers = ort.get_available_providers()
+    trt_libs = list(preload_gpu_libraries())
+    nvidia_gpu = detect_nvidia_gpu()
+    apple_p_cores = _apple_p_cores()
+    recommended_command: str | None = None
+    if nvidia_gpu and "CUDAExecutionProvider" not in providers:
+        recommended_command = (
+            "uvx trackflow-python-cuda run <video>  # or uvx trackflow-python-tensorrt run <video>"
+        )
+    if as_json:
+        typer.echo(
+            json.dumps(
+                {
+                    "version": __version__,
+                    "python": platform.python_version(),
+                    "platform": f"{platform.system()} {platform.machine()}",
+                    "onnxruntime": ort.__version__,
+                    "available_providers": providers,
+                    "nvidia_gpu": nvidia_gpu,
+                    "apple_p_cores": apple_p_cores,
+                    "tensorrt_libs": trt_libs,
+                    "default_device": _default_device(),
+                    "recommended_command": recommended_command,
+                },
+                indent=2,
+            )
+        )
+        return
     table = Table(title="Trackflow Environment Info", show_header=False)
     table.add_row("Trackflow Version", f"[bold cyan]{__version__}[/]")
     table.add_row("Python", platform.python_version())
     table.add_row("Platform", f"{platform.system()} {platform.machine()}")
+    if apple_p_cores is not None:
+        table.add_row("Apple Silicon P-cores", str(apple_p_cores))
+    if nvidia_gpu is not None:
+        table.add_row("NVIDIA GPU", nvidia_gpu)
     table.add_row("ONNX Runtime", ort.__version__)
-    table.add_row("Available EPs", ", ".join(ort.get_available_providers()))
+    table.add_row("Available EPs", ", ".join(providers))
+    if trt_libs:
+        table.add_row("TensorRT Libs", ", ".join(trt_libs))
+    if recommended_command is not None:
+        table.add_row("GPU Acceleration", f"[bold yellow]{recommended_command}[/]")
     console.print(table)
 
 

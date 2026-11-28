@@ -2,7 +2,7 @@
 
 AWS Rekognition shut down **People Pathing** on **2025-10-31** and moved **Streaming Video Analysis** to maintenance (closed to new accounts on **2026-04-30**). Stored `StartPersonTracking` / `GetPersonTracking` bills at **$0.10/minute ($6.00/video-hour)** with a 1-minute minimum per video.
 
-If you need persistent person IDs, bounding boxes, trajectories, line-crossing counts, or floorplan coordinates without uploading footage to S3, [Trackflow](../README.md) runs locally under **Apache-2.0** (code and default ONNX DETR weights) on CPU, CUDA, Apple Silicon CoreML, or TensorRT.
+If you need persistent person IDs, bounding boxes, trajectories, line-crossing counts, or floorplan coordinates without uploading footage to S3, [Trackflow](index.md) runs locally under **Apache-2.0** (code and default ONNX DETR weights) on CPU, CUDA, Apple Silicon CoreML, or TensorRT.
 
 ## 1. One-command CLI replacement
 

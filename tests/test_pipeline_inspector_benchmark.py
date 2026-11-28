@@ -318,3 +318,115 @@ def test_inspector_serves_source_frames_and_respects_anonymization(tmp_path: Pat
         server.shutdown()
         server.server_close()
         handler.frame_store.close()
+
+
+def test_agent_cli_json_and_llms_txt(tmp_path: Path, monkeypatch) -> None:
+    runner = CliRunner()
+
+    info_res = runner.invoke(app, ["info", "--json"])
+    assert info_res.exit_code == 0, info_res.output
+    info_data = json.loads(info_res.output)
+    assert {
+        "version",
+        "python",
+        "platform",
+        "onnxruntime",
+        "available_providers",
+        "nvidia_gpu",
+        "apple_p_cores",
+        "tensorrt_libs",
+        "default_device",
+        "recommended_command",
+    } <= set(info_data)
+    assert isinstance(info_data["available_providers"], list)
+
+    # When an NVIDIA GPU is present on a CPU-only ORT install, `info` prints the 1-line GPU command.
+    monkeypatch.setattr("trackflow.cli.detect_nvidia_gpu", lambda: "Tesla T4, 580.82")
+    monkeypatch.setattr("trackflow.cli.ort.get_available_providers", lambda: ["CPUExecutionProvider"])
+    gpu_info = json.loads(runner.invoke(app, ["info", "--json"]).output)
+    assert gpu_info["nvidia_gpu"] == "Tesla T4, 580.82"
+    assert "trackflow-python-cuda" in gpu_info["recommended_command"]
+
+    # TRACKFLOW_DEFAULT_DEVICE flows into `trackflow run` when --device is omitted.
+    seen_device: list[str] = []
+
+    def fake_create_det(**kwargs):
+        seen_device.append(kwargs["device"])
+        return _SyntheticMotionDetector()
+
+    vid = generate_synthetic_crowd_video(tmp_path / "env_dev.mp4", num_frames=4)
+    monkeypatch.setenv("TRACKFLOW_DEFAULT_DEVICE", "tensorrt")
+    monkeypatch.setattr("trackflow.pipeline.create_detector", fake_create_det)
+    run_res = runner.invoke(
+        app,
+        ["run", str(vid), "--no-video", "--export", "jsonl", "-o", str(tmp_path / "env_out")],
+    )
+    assert run_res.exit_code == 0, run_res.output
+    assert seen_device == ["tensorrt"]
+
+    fake_hits = [
+        {
+            "track_id": 1,
+            "class_name": "person",
+            "first_frame": 0,
+            "last_frame": 20,
+            "duration_s": 0.8,
+            "search_score": 0.312,
+            "thumbnail": "crops/track_1.jpg",
+        }
+    ]
+    monkeypatch.setattr("trackflow.cli.search_track_cards", lambda *_a, **_kw: fake_hits)
+    search_res = runner.invoke(app, ["search", str(tmp_path), "person in white shirt", "--json"])
+    assert search_res.exit_code == 0, search_res.output
+    search_data = json.loads(search_res.output)
+    assert search_data == {"query": "person in white shirt", "results": fake_hits}
+
+    repo_root = Path(__file__).resolve().parent.parent
+    llms_txt = repo_root / "web" / "llms.txt"
+    assert llms_txt.is_file() and "trackflow-python" in llms_txt.read_text(encoding="utf-8")
+    assert 'href="llms.txt"' in (repo_root / "web" / "index.html").read_text(encoding="utf-8")
+
+
+def test_async_pipeline_flushes_video_on_ctrl_c_and_propagates_worker_errors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    vid_path = generate_synthetic_crowd_video(tmp_path / "crowd.mp4", num_frames=16)
+
+    # 1. Single Ctrl-C with save_video=True flushes every processed frame into a valid MP4.
+    run_ctrlc = tmp_path / "run_ctrlc"
+    pipe_ctrlc = TrackflowPipeline(model="synthetic", detector=_InterruptingDetector(at_frame=5))
+    summary = pipe_ctrlc.run(
+        str(vid_path), output_dir=run_ctrlc, save_video=True, exports=("jsonl",)
+    )
+    assert summary.processed_frames == 6
+    cap = cv2.VideoCapture(str(run_ctrlc / "annotated.mp4"))
+    written = 0
+    while cap.read()[0]:
+        written += 1
+    cap.release()
+    assert written == 6
+
+    # 2. Exception raised inside the background writer thread propagates to the caller.
+    pipe_werr = TrackflowPipeline(model="synthetic", detector=_SyntheticMotionDetector())
+    seen_calls = 0
+
+    def failing_apply(frame, tracks, *, detections, coasting):
+        nonlocal seen_calls
+        seen_calls += 1
+        if seen_calls == 3:
+            raise RuntimeError("writer-boom")
+        return frame
+
+    monkeypatch.setattr(pipe_werr.anonymizer, "apply", failing_apply)
+    with pytest.raises(RuntimeError, match="writer-boom"):
+        pipe_werr.run(str(vid_path), output_dir=tmp_path / "run_werr", save_video=True, exports=())
+
+    # 3. Exception raised inside the background frame reader thread propagates cleanly.
+    img_dir = tmp_path / "bad_frames"
+    img_dir.mkdir()
+    cv2.imwrite(str(img_dir / "0.png"), np.zeros((64, 64, 3), dtype=np.uint8))
+    cv2.imwrite(str(img_dir / "1.png"), np.zeros((64, 64, 3), dtype=np.uint8))
+    cv2.imwrite(str(img_dir / "2.png"), np.zeros((80, 64, 3), dtype=np.uint8))  # wrong height
+    pipe_rerr = TrackflowPipeline(model="synthetic", detector=_SyntheticMotionDetector())
+    with pytest.raises(ValueError, match="Expected a readable 64x64 image"):
+        pipe_rerr.run(str(img_dir), output_dir=tmp_path / "run_rerr", save_video=False, exports=())

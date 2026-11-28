@@ -242,3 +242,38 @@ def test_boosttrack_duplicate_removal_preserves_matched_confirmed_track() -> Non
     for x in (50, 30, 11):
         out = tr.update([emb_det(x, [0.0, 1.0])])
         assert [t.track_id for t in out] == [2]
+
+
+def test_xywh_kalman_camera_warp_matches_matrix_form_and_ocsort_direction() -> None:
+    from trackflow.ocsort import _direction
+    from trackflow.tracker import XywhKalmanFilter
+
+    theta = 0.04
+    scale = 1.03
+    rot = scale * np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]])
+    warp = np.hstack([rot, np.array([[12.5], [-4.25]])])
+
+    for height_scaled in (False, True):
+        kf = XywhKalmanFilter((100.0, 80.0, 160.0, 220.0), height_scaled=height_scaled)
+        kf.predict()
+        kf.update((106.0, 83.0, 168.0, 226.0), confidence=0.82)
+        kf.predict()
+
+        # Reference explicit 8x8 matrix transform before calling apply_camera_warp.
+        mean_before = kf.mean.copy()
+        cov_before = kf.cov.copy()
+        t = np.zeros((8, 8), dtype=np.float64)
+        t[0:2, 0:2] = rot
+        t[2, 2] = t[3, 3] = scale
+        t[4:6, 4:6] = rot
+        t[6, 6] = t[7, 7] = scale
+        ref_mean = t @ mean_before
+        ref_mean[:2] += warp[:2, 2]
+        ref_cov = t @ cov_before @ t.T
+
+        kf.apply_camera_warp(warp)
+        assert np.allclose(kf.mean, ref_mean, atol=1e-12)
+        assert np.allclose(kf.cov, ref_cov, atol=1e-12)
+
+    assert np.allclose(_direction((0, 0, 10, 10), (3, 4, 13, 14)), [0.8, 0.6], atol=1e-6)
+    assert np.allclose(_direction((5, 5, 15, 15), (5, 5, 15, 15)), [0.0, 0.0], atol=1e-6)

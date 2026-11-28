@@ -1,6 +1,6 @@
 ---
 name: trackflow
-description: Run local Apache-2.0 people and object tracking on video, image folders, or streams with Trackflow (ONNX detectors + ByteTrack/BoT-SORT/OC-SORT/BoostTrack), export Parquet/JSONL/MOTChallenge, count line crossings, search tracks by text, project onto a floorplan, or anonymize footage. Use when the user asks to track objects/people in video, count crossings, search video tracks, or inspect tracking runs locally.
+description: Run local Apache-2.0 people and object tracking on video, image folders, or streams with Trackflow (ONNX detectors + ByteTrack/BoT-SORT/OC-SORT/BoostTrack), export Parquet/JSONL/MOTChallenge, count line crossings, search tracks by text, project onto a floorplan, or anonymize footage. Use when the user asks to track objects/people in video, count crossings, search video tracks, inspect tracking runs locally, or replace Google Cloud Video Intelligence / AWS Rekognition person tracking without AGPL licenses.
 ---
 
 # Trackflow
@@ -9,14 +9,17 @@ Local people and object tracking via `trackflow-python` (Apache-2.0 CLI, Python 
 
 ## Quickstart
 
-Run without installing via `uvx`, or install once with `pip`/`uv`:
+Run without installing via `uvx`, or install once with `pip`/`uv` (never keep both CPU `onnxruntime` and `onnxruntime-gpu` in the same environment):
 
 ```bash
-uvx trackflow-python run street.mp4
+uvx trackflow-python run street.mp4                  # CPU / macOS (auto-pins Apple P-cores)
+uvx trackflow-python run street.mp4 --device coreml  # macOS Apple Silicon GPU
+uvx trackflow-python-cuda run street.mp4             # NVIDIA CUDA (bundled CUDA + cuDNN)
+uvx trackflow-python-tensorrt run street.mp4         # NVIDIA TensorRT FP16 (Py 3.11+, cached engines)
 # or
-pip install trackflow-python
+pip install trackflow-python                         # or trackflow-python-cuda / trackflow-python-tensorrt
 trackflow run street.mp4
-trackflow inspect          # opens local web UI on the latest run
+trackflow inspect                                    # opens local web UI on the latest run
 ```
 
 - Each run writes to a fresh directory (`runs/run-1`, `runs/run-2`, ...). `-o <dir>` must be empty so runs never mix.
@@ -25,7 +28,7 @@ trackflow inspect          # opens local web UI on the latest run
 
 ## Choosing Detector, Tracker, and Device
 
-Check available presets anytime with `trackflow models --json` and local acceleration with `trackflow info`.
+Check available presets anytime with `trackflow models --json` and local acceleration with `trackflow info --json`.
 
 | Need | Flags | Notes |
 | :--- | :--- | :--- |
