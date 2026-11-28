@@ -4,6 +4,11 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in `--postprocess` offline pass (`TrackflowPipeline(..., postprocess=True)` and `postprocess_records` / `postprocess_tracks_array`) for recorded videos and image directories: splits suspect track switches, links fragmented tracklets with camera-motion-compensated kinematics and self-calibrated OSNet appearance, fills short supported occlusion gaps, and smooths jitter with motion-adaptive two-scale Gaussian filtering. Lifts 4-dataset mean HOTA across all 81 official validation videos by **+3.2 HOTA** on `botsort --reid osnet` (`38.8 → 42.0`: DanceTrack `+3.4`, SportsMOT `+5.3`, MOT17 `+2.8`, MOT20 `+1.2`) and **+0.7 to +1.1 HOTA** without Re-ID, in `~64–265 ms/video` (max `397 ms`), while leaving live `stream()` and `ByteTracker` web parity untouched.
+- `--postprocess` flag in `scripts/eval_benchmarks.py` and `last_cmc_warp` exposure on `BotSortTracker`, `OcSortTracker`, and `BoostTracker`.
+
 ## [0.6.1] - 2026-11-27
 
 ### Added

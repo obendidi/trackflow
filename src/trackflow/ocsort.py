@@ -241,10 +241,12 @@ class OcSortTracker(_SortStyleTracker):
     def reset(self) -> None:
         super().reset()
         self._cmc = SparseOpticalFlowCMC() if self.use_cmc else None
+        self.last_cmc_warp: np.ndarray | None = None
 
     def _compensate(self, frame: np.ndarray, detections: list[Detection]) -> None:
         assert self._cmc is not None
         warp = self._cmc.estimate(frame, _boxes(detections))
+        self.last_cmc_warp = warp
         if warp is None:
             return
         linear = warp[:, :2]
@@ -286,6 +288,7 @@ class OcSortTracker(_SortStyleTracker):
         """Advance the tracker by one frame and return the tracks reported on it."""
         self._frame_id += 1
         events: list[dict[str, Any]] = []
+        self.last_cmc_warp = None
         if self._cmc is not None:
             if frame_bgr is None:
                 self._cmc = SparseOpticalFlowCMC()

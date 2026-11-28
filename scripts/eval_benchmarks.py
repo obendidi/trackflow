@@ -350,8 +350,11 @@ def run_trackflow_tracker(
     embs_by_seq: dict[str, list[list[np.ndarray | None]]] | None,
     pred_dir: Path,
     threshold: float = 0.45,
+    postprocess: bool = False,
 ) -> float:
     """Run a Trackflow tracker across sequences and return tracker-only FPS."""
+    from trackflow.pipeline import _match_track_embeddings, _pack_postprocess_embeddings
+    from trackflow.postprocess import postprocess_records
     from trackflow.tracker import create_tracker
 
     tracker_name, _, reid_name = tracker_spec.partition("+")
@@ -362,48 +365,111 @@ def run_trackflow_tracker(
     total_trk_s = 0.0
 
     for seq in seqs:
-        fps = frame_rate(seq)
+        info = configparser.ConfigParser()
+        info.read(seq / "seqinfo.ini")
+        fps = float(info["Sequence"]["frameRate"])
+        seq_w = int(info["Sequence"]["imWidth"])
+        seq_h = int(info["Sequence"]["imHeight"])
         tracker = create_tracker(
             tracker_name,
             track_high_thresh=threshold,
             track_low_thresh=min(threshold, max(0.10, threshold * 0.35)),
             new_track_thresh=max(threshold, min(0.95, threshold + 0.05)),
         )
-        # Some trackers scale buffer by fps or expose embedding_min_confidence
-        _ = fps
         min_conf = getattr(tracker, "embedding_min_confidence", None)
         img_paths = sorted((seq / "img1").glob("*.jpg"))
         seq_dets = dets_by_seq[seq.name]
         seq_embs = embs_by_seq[seq.name] if (embs_by_seq and reid_name) else None
 
         mot_rows: list[tuple[int, int, float, float, float, float, float]] = []
+        pp_records: list[dict] = []
+        obs_embs: list[np.ndarray | None] = []
+        cmc_warps = np.broadcast_to(
+            np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+            (len(img_paths), 2, 3),
+        ).copy()
+        cmc_valid = np.zeros((len(img_paths),), dtype=bool)
         for f_idx, (img_p, raw_dets) in enumerate(zip(img_paths, seq_dets, strict=True), start=1):
             frame_bgr = cv2.imread(str(img_p)) if need_frames else None
             # Fresh Detection objects with optional cached embeddings attached
             frame_dets: list[Detection] = []
+            emb_dets: list[Detection] = []
             f_embs = seq_embs[f_idx - 1] if seq_embs is not None else None
             for d_i, d in enumerate(raw_dets):
-                emb = None
-                if f_embs is not None and min_conf is not None and d.confidence >= min_conf:
-                    e = f_embs[d_i]
-                    if e is not None:
-                        emb = e.astype(np.float32)
-                frame_dets.append(
-                    Detection(
-                        bbox=d.bbox,
-                        confidence=d.confidence,
-                        class_id=d.class_id,
-                        class_name=d.class_name,
-                        embedding=emb,
-                    )
+                raw_e = f_embs[d_i] if f_embs is not None else None
+                emb = (
+                    raw_e.astype(np.float32)
+                    if (raw_e is not None and min_conf is not None and d.confidence >= min_conf)
+                    else None
                 )
+                det_obj = Detection(
+                    bbox=d.bbox,
+                    confidence=d.confidence,
+                    class_id=d.class_id,
+                    class_name=d.class_name,
+                    embedding=emb,
+                )
+                frame_dets.append(det_obj)
+                if postprocess and raw_e is not None:
+                    emb_dets.append(
+                        det_obj
+                        if emb is not None
+                        else Detection(
+                            bbox=d.bbox,
+                            confidence=d.confidence,
+                            class_id=d.class_id,
+                            class_name=d.class_name,
+                            embedding=raw_e.astype(np.float32),
+                        )
+                    )
             t0 = time.perf_counter()
             tracks = tracker.update(frame_dets, frame_bgr=frame_bgr)
             total_trk_s += time.perf_counter() - t0
             total_frames += 1
-            for tr in tracks:
+            warp = getattr(tracker, "last_cmc_warp", None)
+            if warp is not None:
+                cmc_warps[f_idx - 1] = np.asarray(warp, dtype=np.float32)
+                cmc_valid[f_idx - 1] = True
+            matched_embs = (
+                _match_track_embeddings(tracks, emb_dets, None, None)
+                if postprocess
+                else [None] * len(tracks)
+            )
+            for tr, m_emb in zip(tracks, matched_embs, strict=True):
                 x1, y1, x2, y2 = tr.bbox
                 mot_rows.append((f_idx, tr.track_id, x1, y1, x2, y2, tr.confidence))
+                if postprocess:
+                    rec = tr.to_record(f_idx - 1, (f_idx - 1) / fps)
+                    rec["x1"], rec["y1"], rec["x2"], rec["y2"] = tr.bbox
+                    pp_records.append(rec)
+                    obs_embs.append(m_emb)
+        if postprocess and pp_records:
+            emb_dense, emb_valid = _pack_postprocess_embeddings(obs_embs)
+            t0 = time.perf_counter()
+            pp_res = postprocess_records(
+                pp_records,
+                fps=fps,
+                frame_width=seq_w,
+                frame_height=seq_h,
+                embeddings=emb_dense,
+                emb_valid=emb_valid,
+                cmc_warps=cmc_warps if cmc_valid.any() else None,
+                cmc_valid=cmc_valid if cmc_valid.any() else None,
+                frame_stride=1,
+            )
+            total_trk_s += time.perf_counter() - t0
+            mot_rows = [
+                (
+                    int(r["frame_idx"]) + 1,
+                    int(r["track_id"]),
+                    float(r["x1"]),
+                    float(r["y1"]),
+                    float(r["x2"]),
+                    float(r["y2"]),
+                    float(r["confidence"]),
+                )
+                for r in pp_res.records
+            ]
         write_mot_txt(pred_dir / f"{seq.name}.txt", mot_rows)
 
     return total_frames / max(total_trk_s, 1e-6)
@@ -613,6 +679,11 @@ def main() -> None:
     parser.add_argument("--device", default="coreml", help="detector/reid device")
     parser.add_argument("--threshold", type=float, default=0.45, help="tracking high threshold")
     parser.add_argument("--data", type=Path, default=DEFAULT_DATA_ROOT)
+    parser.add_argument(
+        "--postprocess",
+        action="store_true",
+        help="apply Trackflow offline post-processing pass after tracking",
+    )
     parser.add_argument("--json-out", type=Path, default=None, help="write raw JSON results here")
     args = parser.parse_args()
 
@@ -692,6 +763,7 @@ def main() -> None:
                             seq_embs,
                             pred_dir,
                             threshold=args.threshold,
+                            postprocess=args.postprocess,
                         )
                     metrics = eval_mot_predictions(
                         gt_dir, pred_dir, seqs, class_cfg, run_dir / "scores.json"
