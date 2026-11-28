@@ -108,17 +108,27 @@ Every tracker below receives the exact same detections from Trackflow's default 
 
 | Tracker | DanceTrack (25) | SportsMOT (45) | MOT17 (7) | MOT20 (4) | Mean HOTA | Total ID switches | Tracker FPS | End-to-End FPS |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **`nltrack --reid osnet`** | **47.1** | **50.2** | **48.1** | 26.1 | **42.9** | **5,193** | 133 | 5.4 |
-| **`nltrack`** *(no Re-ID)* | 39.0 | 45.6 | 47.3 | **26.3** | **39.6** | 6,209 | 143 | 9.0 |
-| **`botsort --reid osnet`** | 39.0 | 45.0 | 46.9 | 24.4 | **38.8** | 6,435 | 205 | 5.5 |
-| **`ocsort`** *(no Re-ID)* | 37.9 | 46.0 | 46.3 | 23.3 | **38.4** | 5,501 | 203 | 9.2 |
-| **`boosttrack`** *(no Re-ID)* | 37.5 | 44.4 | 46.9 | 24.0 | **38.2** | 5,549 | 201 | 9.2 |
-| **`botsort`** *(no Re-ID)* | 36.7 | 44.3 | 46.5 | 24.3 | **37.9** | 6,475 | 221 | 9.3 |
+| **`nltrack --reid osnet --postprocess`** *(offline)* | **47.5** | **52.5** | **50.8** | **27.9** | **44.7** | **4,294** | 131 | 5.4\* |
+| **`nltrack --reid osnet`** | 47.1 | 50.2 | 48.1 | 26.1 | **42.9** | 5,193 | 133 | 5.4 |
+| **`botsort --reid osnet --postprocess`** *(offline)* | 42.4 | 50.3 | 49.7 | 25.7 | **42.0** | 4,748 | 198 | 5.5\* |
+| **`nltrack`** *(no Re-ID)* | 39.0 | 45.6 | 47.3 | 26.3 | **39.6** | 6,209 | 143 | 9.0 |
+| **`botsort --reid osnet`** | 39.0 | 45.0 | 46.9 | 24.4 | 38.8 | 6,435 | 205 | 5.5 |
+| **`ocsort`** *(no Re-ID)* | 37.9 | 46.0 | 46.3 | 23.3 | 38.4 | 5,501 | 203 | 9.2 |
+| **`boosttrack`** *(no Re-ID)* | 37.5 | 44.4 | 46.9 | 24.0 | 38.2 | 5,549 | 201 | 9.2 |
+| **`botsort`** *(no Re-ID)* | 36.7 | 44.3 | 46.5 | 24.3 | 37.9 | 6,475 | 221 | 9.3 |
 | `bytetrack` *(also in browser)* | 33.1 | 39.8 | 45.1 | 23.5 | 35.4 | 7,038 | **2,900** | **9.7** |
 | *Roboflow `cbiou` (`0.45/0.50`)* | 36.0 | 43.4 | 46.4 | 24.2 | 37.5 | 7,533 | 2,072 | 9.6 |
 | *Roboflow `botsort` (`0.45/0.50`)* | 35.9 | 43.6 | 46.3 | 24.0 | 37.4 | 6,922 | 194 | 9.2 |
 | *Roboflow `ocsort+cmc` (`0.45`)* | 33.4 | 43.8 | 44.2 | 15.9 | 34.3 | 8,057 | 196 | 9.2 |
 | *Roboflow `botsort` (defaults `0.60/0.70`)* | 39.6 | 50.0 | 42.6 | 13.6 | 36.4 | 4,349 | 207 | 9.2 |
+
+#### Offline post-processing (`--postprocess`)
+
+```bash
+trackflow run game.mp4 --tracker botsort --reid osnet --postprocess
+```
+
+For recorded video files and image folders, `--postprocess` runs a pure NumPy/SciPy pass after tracking finishes: it splits high-confidence mid-track swaps, stitches broken tracklets globally with camera-motion-compensated kinematics and sequence-calibrated OSNet similarity, fills short supported occlusion gaps, and smooths box jitter on steady tracks. Across all 81 validation videos, it improves every dataset and tracker (`+3.2` mean HOTA and `-1,687` ID switches vs the online table row on `botsort --reid osnet`; `+0.7` to `+1.1` without Re-ID) in `~64–265 ms/video` (max `397 ms`). It is opt-in, rejects live camera/RTSP streams, buffers track records and float16 Re-ID embeddings in memory (`~1 KB/observation` when `--reid osnet` is active — split multi-hour crowded clips or omit `--reid` if RAM is tight), and leaves `stream()` and browser ByteTrack untouched. \*Table End-to-End FPS (`5.5`) measures detection + tracking + postprocess (`--no-video`); saving `annotated.mp4` adds a second decode/render pass. Benchmarks used `frame_stride=1` on 14–30 fps footage; time horizons are expressed in seconds and frame stride. Combine with `--reid-merge` to also link long cross-exit re-entries in the same offline pass.
 
 **How to read this chart and table:**
 - **HOTA (0–100, higher is better)**: Overall tracking accuracy. It combines two halves equally: finding the right people in each frame and keeping the same ID on each person as they move and cross paths.

@@ -128,6 +128,15 @@ def run(
             "Off by default: look-alikes are left unmerged, but mistakes are still possible.",
         ),
     ] = False,
+    postprocess: Annotated[
+        bool,
+        typer.Option(
+            "--postprocess/--no-postprocess",
+            help="Run offline post-processing (suspect-switch splitting, global CMC/Re-ID "
+            "stitching, gated gap interpolation & adaptive smoothing) on recorded videos. "
+            "Off by default; leaves live stream() untouched.",
+        ),
+    ] = False,
     query: Annotated[
         str | None,
         typer.Option(
@@ -198,6 +207,7 @@ def run(
     console.print(
         f"[bold cyan]Trackflow v{__version__}[/] · model=[bold]{model}[/] ({precision}) · "
         f"tracker=[bold]{tracker}[/] · privacy=[bold]{anonymize}[/]"
+        + (" · [bold green]postprocess[/]" if postprocess else "")
     )
 
     with _user_errors():
@@ -212,6 +222,7 @@ def run(
             reid=reid,  # type: ignore[arg-type]
             vlm=vlm,  # type: ignore[arg-type]
             reid_merge=reid_merge,
+            postprocess=postprocess,
             query=query,
             query_threshold=query_threshold,
             anonymize=anonymize,  # type: ignore[arg-type]
