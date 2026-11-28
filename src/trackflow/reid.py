@@ -43,8 +43,8 @@ QUERY_THRESHOLDS: dict[str, float] = {
 
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-_IMAGENET_SCALE = (1.0 / (255.0 * _IMAGENET_STD)).astype(np.float32)
-_IMAGENET_BIAS = (-_IMAGENET_MEAN / _IMAGENET_STD).astype(np.float32)
+_IMAGENET_MEAN_RGB_255 = (0.485 * 255.0, 0.456 * 255.0, 0.406 * 255.0)
+_IMAGENET_INV_STD = (1.0 / _IMAGENET_STD).reshape(1, 3, 1, 1).astype(np.float32)
 # Fixed padded batch size for OSNet on CoreML and TensorRT so the engine compiles once per
 # session instead of stalling on dynamic per-frame crowd counts.
 _STATIC_OSNET_BATCH = 8
@@ -125,14 +125,24 @@ class ReidEmbedder:
             if active_provider in ("CoreMLExecutionProvider", "TensorrtExecutionProvider"):
                 self._static_batch = _STATIC_OSNET_BATCH
 
-    def _preprocess(self, crop_bgr: np.ndarray) -> np.ndarray:
+    def _preprocess_batch(self, crops_bgr: list[np.ndarray]) -> np.ndarray:
+        """Convert a non-empty list of BGR uint8 crops to an NCHW float32 ImageNet batch."""
         h, w = self._input_hw
-        resized = cv2.resize(crop_bgr, (w, h), interpolation=cv2.INTER_LINEAR)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        x = rgb.astype(np.float32)
-        x *= _IMAGENET_SCALE
-        x += _IMAGENET_BIAS
-        return x.transpose(2, 0, 1)
+        # cv2.dnn.blobFromImages(..., swapRB=True) swaps mean[0]/mean[2] internally,
+        # so pass ImageNet mean in RGB order scaled to [0, 255].
+        blob = cv2.dnn.blobFromImages(
+            crops_bgr,
+            scalefactor=1.0 / 255.0,
+            size=(w, h),
+            mean=_IMAGENET_MEAN_RGB_255,
+            swapRB=True,
+            crop=False,
+        )
+        blob *= _IMAGENET_INV_STD
+        return blob
+
+    def _preprocess(self, crop_bgr: np.ndarray) -> np.ndarray:
+        return self._preprocess_batch([crop_bgr])[0]
 
     def encode_images(self, crops: list[np.ndarray | None]) -> list[np.ndarray | None]:
         """Embed a batch of BGR crops; ``None``/empty crops map to ``None``."""
@@ -146,7 +156,7 @@ class ReidEmbedder:
             return out
         assert self._sess is not None
         if self._static_batch is None:
-            batch = np.stack([self._preprocess(crops[i]) for i in valid])  # type: ignore[arg-type]
+            batch = self._preprocess_batch([crops[i] for i in valid])  # type: ignore[misc]
             embs = self._sess.run(None, {self._input_name: batch})[0]
             for i, e in zip(valid, embs, strict=True):
                 out[i] = _l2_normalize(e)
@@ -158,8 +168,7 @@ class ReidEmbedder:
         for start in range(0, len(valid), bs):
             chunk = valid[start : start + bs]
             m = len(chunk)
-            for slot, idx in enumerate(chunk):
-                buf[slot] = self._preprocess(crops[idx])  # type: ignore[arg-type]
+            buf[:m] = self._preprocess_batch([crops[idx] for idx in chunk])  # type: ignore[misc]
             if m < bs:
                 buf[m:] = 0.0
             embs = self._sess.run(None, {self._input_name: buf})[0]

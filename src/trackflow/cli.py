@@ -155,6 +155,14 @@ def run(
             "Off by default; leaves live stream() untouched.",
         ),
     ] = False,
+    cmc: Annotated[
+        bool,
+        typer.Option(
+            "--cmc/--no-cmc",
+            help="Enable camera motion compensation for BoT-SORT, OC-SORT, BoostTrack++, "
+            "and NLTrack. Pass --no-cmc on fixed cameras to save ~5-6 ms/frame.",
+        ),
+    ] = True,
     query: Annotated[
         str | None,
         typer.Option(
@@ -237,6 +245,7 @@ def run(
             model=model,
             precision=precision,  # type: ignore[arg-type]
             tracker=tracker,
+            use_cmc=cmc,
             device=device or _default_device(),
             threshold=threshold,
             classes=class_list,

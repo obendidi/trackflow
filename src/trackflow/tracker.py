@@ -38,16 +38,16 @@ def compute_iou_matrix(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
     if len(boxes_a) == 0 or len(boxes_b) == 0:
         return np.zeros((len(boxes_a), len(boxes_b)), dtype=np.float64)
 
-    ax1, ay1, ax2, ay2 = np.split(boxes_a, 4, axis=1)
-    bx1, by1, bx2, by2 = np.split(boxes_b, 4, axis=1)
+    ax1, ay1, ax2, ay2 = boxes_a[:, 0:1], boxes_a[:, 1:2], boxes_a[:, 2:3], boxes_a[:, 3:4]
+    bx1, by1, bx2, by2 = boxes_b[:, 0], boxes_b[:, 1], boxes_b[:, 2], boxes_b[:, 3]
 
-    inter_w = np.maximum(0.0, np.minimum(ax2, bx2.T) - np.maximum(ax1, bx1.T))
-    inter_h = np.maximum(0.0, np.minimum(ay2, by2.T) - np.maximum(ay1, by1.T))
+    inter_w = np.maximum(0.0, np.minimum(ax2, bx2) - np.maximum(ax1, bx1))
+    inter_h = np.maximum(0.0, np.minimum(ay2, by2) - np.maximum(ay1, by1))
     inter_area = inter_w * inter_h
 
     area_a = np.maximum(0.0, ax2 - ax1) * np.maximum(0.0, ay2 - ay1)
     area_b = np.maximum(0.0, bx2 - bx1) * np.maximum(0.0, by2 - by1)
-    union = np.maximum(area_a + area_b.T - inter_area, 1e-6)
+    union = np.maximum(area_a + area_b - inter_area, 1e-6)
     return inter_area / union
 
 
@@ -58,10 +58,10 @@ def compute_ioa_matrix(boxes_a: np.ndarray, boxes_b: np.ndarray) -> np.ndarray:
     if len(boxes_a) == 0 or len(boxes_b) == 0:
         return np.zeros((len(boxes_a), len(boxes_b)), dtype=np.float64)
 
-    ax1, ay1, ax2, ay2 = np.split(boxes_a, 4, axis=1)
-    bx1, by1, bx2, by2 = np.split(boxes_b, 4, axis=1)
-    inter_w = np.maximum(0.0, np.minimum(ax2, bx2.T) - np.maximum(ax1, bx1.T))
-    inter_h = np.maximum(0.0, np.minimum(ay2, by2.T) - np.maximum(ay1, by1.T))
+    ax1, ay1, ax2, ay2 = boxes_a[:, 0:1], boxes_a[:, 1:2], boxes_a[:, 2:3], boxes_a[:, 3:4]
+    bx1, by1, bx2, by2 = boxes_b[:, 0], boxes_b[:, 1], boxes_b[:, 2], boxes_b[:, 3]
+    inter_w = np.maximum(0.0, np.minimum(ax2, bx2) - np.maximum(ax1, bx1))
+    inter_h = np.maximum(0.0, np.minimum(ay2, by2) - np.maximum(ay1, by1))
     area_a = np.maximum(np.maximum(0.0, ax2 - ax1) * np.maximum(0.0, ay2 - ay1), 1e-6)
     return (inter_w * inter_h) / area_a
 
@@ -1180,6 +1180,7 @@ def create_tracker(
     new_track_thresh: float = 0.55,
     track_buffer: int = 30,
     iou_buffer: float = 0.0,
+    use_cmc: bool = True,
 ) -> Tracker:
     """Factory for the built-in multi-object trackers, named as in :data:`TRACKER_NAMES`."""
     key = tracker_name.lower().strip().replace("-", "_")
@@ -1198,6 +1199,7 @@ def create_tracker(
             new_track_thresh=new_track_thresh,
             track_buffer=max(track_buffer, 45),
             iou_buffer=iou_buffer,
+            use_cmc=use_cmc,
         )
     if key in ("ocsort", "oc_sort"):
         from trackflow.ocsort import OcSortTracker
@@ -1208,6 +1210,7 @@ def create_tracker(
             new_track_thresh=new_track_thresh,
             max_age=track_buffer,
             iou_buffer=iou_buffer,
+            use_cmc=use_cmc,
         )
     if key in ("boosttrack", "boost_track", "boosttrack++", "boosttrackpp"):
         from trackflow.boosttrack import BoostTracker
@@ -1217,6 +1220,7 @@ def create_tracker(
             new_track_thresh=new_track_thresh,
             max_age=track_buffer,
             iou_buffer=iou_buffer,
+            use_cmc=use_cmc,
         )
     if key in ("nltrack", "nl_track"):
         from trackflow.nltrack import NonLinearTracker
@@ -1227,6 +1231,7 @@ def create_tracker(
             new_track_thresh=new_track_thresh,
             track_buffer=max(track_buffer, 60),
             iou_buffer=iou_buffer,
+            use_cmc=use_cmc,
         )
     raise ValueError(
         f"Unknown tracker '{tracker_name}'. Choose one of: {', '.join(TRACKER_NAMES)}."

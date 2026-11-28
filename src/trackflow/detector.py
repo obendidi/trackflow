@@ -468,10 +468,14 @@ def postprocess_detr_outputs(
     if softmax:
         exp = np.exp(logits - logits.max(axis=-1, keepdims=True))
         probs = (exp / exp.sum(axis=-1, keepdims=True))[:, :-1]  # trailing no-object class
+        class_ids = np.argmax(probs, axis=-1)
+        scores = probs[np.arange(probs.shape[0]), class_ids]
     else:
-        probs = sigmoid(logits)
-    class_ids = np.argmax(probs, axis=-1)
-    scores = probs[np.arange(probs.shape[0]), class_ids]
+        # Sigmoid is monotone on [-60, 60]; pick the top class logit per query first so
+        # exp() runs once per query instead of once per (query, class).
+        class_ids = np.argmax(logits, axis=-1)
+        max_logits = logits[np.arange(logits.shape[0]), class_ids]
+        scores = sigmoid(max_logits)
 
     keep = (scores >= threshold) & np.isfinite(pred_boxes).all(axis=-1)
     if not np.any(keep):
@@ -665,17 +669,32 @@ class OnnxDetrDetector:
     def preprocess(self, frame_bgr: np.ndarray) -> np.ndarray:
         """Convert OpenCV BGR uint8 frame to NCHW float tensor."""
         target_h, target_w = self.input_hw
-        # Resize before BGR->RGB so 1080p/4K frames color-convert 5-20x fewer pixels.
-        resized = cv2.resize(frame_bgr, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        arr = rgb.astype(np.float32)
-        if self.do_rescale:
-            arr *= 1.0 / 255.0
+        scale = (1.0 / 255.0) if self.do_rescale else 1.0
         if self.do_normalize:
-            arr -= self.mean.reshape(1, 1, 3)
-            arr /= self.std.reshape(1, 1, 3)
-        chw = np.transpose(arr, (2, 0, 1))
-        return np.ascontiguousarray(np.expand_dims(chw, axis=0), dtype=self.input_dtype)
+            mean_rgb = self.mean.reshape(3)
+            # cv2.dnn.blobFromImage(..., swapRB=True) swaps mean[0]/mean[2] internally,
+            # so pass mean in RGB order scaled to input uint8 domain when rescaling.
+            mean_scale = 255.0 if self.do_rescale else 1.0
+            blob_mean = (
+                float(mean_rgb[0] * mean_scale),
+                float(mean_rgb[1] * mean_scale),
+                float(mean_rgb[2] * mean_scale),
+            )
+        else:
+            blob_mean = (0.0, 0.0, 0.0)
+        blob = cv2.dnn.blobFromImage(
+            frame_bgr,
+            scalefactor=scale,
+            size=(target_w, target_h),
+            mean=blob_mean,
+            swapRB=True,
+            crop=False,
+        )
+        if self.do_normalize:
+            blob /= self.std.reshape(1, 3, 1, 1)
+        if self.input_dtype != np.float32:
+            return np.ascontiguousarray(blob, dtype=self.input_dtype)
+        return blob
 
     def detect(self, frame_bgr: np.ndarray, threshold: float | None = None) -> list[Detection]:
         """Run object detection on a single BGR frame."""
