@@ -352,7 +352,7 @@ class NonLinearTracker:
         self.track_high_thresh = float(track_high_thresh)
         self.track_low_thresh = float(track_low_thresh)
         self.new_track_thresh = float(new_track_thresh)
-        self.track_buffer = max(int(track_buffer), 60)
+        self.track_buffer = int(track_buffer)
         self.iou_buffer = float(iou_buffer)
         self.use_cmc = bool(use_cmc)
         self.vel_damp = float(vel_damp)
@@ -392,6 +392,7 @@ class NonLinearTracker:
         self._frame_id = 0
         self._tracks: list[_NlTrack] = []
         self.last_events: list[dict[str, Any]] = []
+        self.last_cmc_warp: np.ndarray | None = None
         self._cmc = SparseOpticalFlowCMC(drop_foreground_flow=True) if self.use_cmc else None
         self._bg_count: float = 10.0
         self._bg_mean: float = 0.55
@@ -743,12 +744,14 @@ class NonLinearTracker:
             tr.age += 1
             tr.time_since_update += 1
 
+        self.last_cmc_warp = None
         if self._cmc is not None:
             if frame_bgr is None:
                 self._cmc = SparseOpticalFlowCMC(drop_foreground_flow=True)
             else:
                 warp = self._cmc.estimate(frame_bgr, _boxes(detections))
                 if warp is not None:
+                    self.last_cmc_warp = warp
                     scale = float(np.sqrt(abs(np.linalg.det(warp[:2, :2]))))
                     for tr in self._tracks:
                         tr.motion.apply_camera_warp(warp)
@@ -786,17 +789,19 @@ class NonLinearTracker:
             self._apply_detection(tr, high_dets[di], update_class=True, ovl=float(high_ovl[di]))
             updated.add(tr.uid)
 
-        med_h = (
-            float(np.median([t.bbox[3] - t.bbox[1] for t in confirmed]))
-            if len(confirmed) >= 3
-            else 0.0
-        )
+        heights_by_cls: dict[int, list[float]] = defaultdict(list)
+        for t in confirmed:
+            heights_by_cls[t.class_id].append(float(t.bbox[3] - t.bbox[1]))
+        med_h_by_cls = {
+            cid: float(np.median(hs)) for cid, hs in heights_by_cls.items() if len(hs) >= 3
+        }
 
         # Stage 2a: remaining active tracks <-> low-score detections.
         rem_tracked = [
             pool[i]
             for i in u_pool
-            if pool[i].state == "tracked" and self._stage2_eligible(pool[i], med_h)
+            if pool[i].state == "tracked"
+            and self._stage2_eligible(pool[i], med_h_by_cls.get(pool[i].class_id, 0.0))
         ]
         used_low: set[int] = set()
         if rem_tracked and low_dets:
@@ -821,7 +826,7 @@ class NonLinearTracker:
                 for i in u_pool
                 if pool[i].state == "lost"
                 and 2 <= pool[i].time_since_update <= self.lost_low_max_tsu
-                and self._stage2_eligible(pool[i], med_h)
+                and self._stage2_eligible(pool[i], med_h_by_cls.get(pool[i].class_id, 0.0))
             ]
             rem_low_idx = [
                 i

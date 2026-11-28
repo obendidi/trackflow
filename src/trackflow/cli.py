@@ -43,7 +43,7 @@ from trackflow.reid import export_search_prompts, search_track_cards
 
 app = typer.Typer(
     name="trackflow",
-    help="Real-time people and object tracking with ONNX detectors, ByteTrack, BoT-SORT, OC-SORT or BoostTrack, text search, and a local inspector.",
+    help="Real-time people and object tracking with ONNX detectors, ByteTrack, BoT-SORT, OC-SORT, BoostTrack or NLTrack, text search, and a local inspector.",
     no_args_is_help=True,
     pretty_exceptions_show_locals=False,
     rich_markup_mode="rich",
@@ -85,7 +85,9 @@ def run(
     ] = "fp32",
     tracker: Annotated[
         str,
-        typer.Option("--tracker", "-t", help="Tracker: bytetrack, botsort, ocsort, or boosttrack."),
+        typer.Option(
+            "--tracker", "-t", help="Tracker: bytetrack, botsort, ocsort, boosttrack, or nltrack."
+        ),
     ] = "bytetrack",
     device: Annotated[
         str | None,
@@ -106,7 +108,7 @@ def run(
         str,
         typer.Option(
             "--reid",
-            help="Person Re-ID model for BoT-SORT/BoostTrack appearance and --reid-merge: none, osnet, color.",
+            help="Person Re-ID model for BoT-SORT, BoostTrack, or NLTrack appearance and --reid-merge: none, osnet, color.",
         ),
     ] = "none",
     vlm: Annotated[

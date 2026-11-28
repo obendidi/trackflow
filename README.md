@@ -3,7 +3,7 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/obendidi/trackflow/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://pypi.org/project/trackflow-python/)
 
-Real-time people and object tracking in Python and in the browser. Trackflow runs current detectors (RF-DETR, RT-DETRv2, D-FINE, DEIMv2, YOLO26) with ByteTrack, BoT-SORT, OC-SORT or BoostTrack, streams or exports track data (Parquet, JSONL, CSV, MOTChallenge, HTML), and includes text-based track search, a local run inspector with 4-point floorplan projection, and anonymization.
+Real-time people and object tracking in Python and in the browser. Trackflow runs current detectors (RF-DETR, RT-DETRv2, D-FINE, DEIMv2, YOLO26) with ByteTrack, BoT-SORT, OC-SORT, BoostTrack or NLTrack, streams or exports track data (Parquet, JSONL, CSV, MOTChallenge, HTML), and includes text-based track search, a local run inspector with 4-point floorplan projection, and anonymization.
 
 ![Trackflow tracking people crossing Yonge and Dundas in Toronto, with an ID, box and trail on each person](https://raw.githubusercontent.com/obendidi/trackflow/main/docs/demo.webp)
 
@@ -96,8 +96,9 @@ GROUP BY track_id ORDER BY frames DESC;
 | `botsort` | [BoT-SORT](https://arxiv.org/abs/2206.14651) (2022) | ByteTrack plus camera-motion compensation, and appearance matching with `--reid osnet`. |
 | `ocsort` | [OC-SORT](https://arxiv.org/abs/2203.14360) (CVPR 2023) | Trusts detections over motion predictions: after an occlusion it re-matches a track to its last observed box and corrects the motion model along the gap. |
 | `boosttrack` | [BoostTrack++](https://arxiv.org/abs/2408.13003) (2024) | Raises the confidence of weak detections that fit a track or look like a new object, and matches with motion, shape and, with `--reid osnet`, appearance. Compensates for camera motion. |
+| `nltrack` | NLTrack *(pure Apache-2.0, zero extra weights)* | Non-linear motion tracker with damped dual-anchor prediction, observation-centric re-update, scene-calibrated clean-bank Re-ID (`--reid osnet`), and guarded lost-track recovery. Highest accuracy across all four benchmarks. |
 
-All four keep a person and a bag in the same box as separate tracks, and only give out an ID once a track has been seen on more than one frame. OC-SORT and BoostTrack report a track again after a miss once it has matched three frames in a row; in between, the annotated video shows it as a coasting box. The browser playground uses ByteTrack.
+All five keep a person and a bag in the same box as separate tracks, and only give out an ID once a track has been seen on more than one frame. OC-SORT and BoostTrack report a track again after a miss once it has matched three frames in a row; in between, the annotated video shows it as a coasting box. The browser playground uses ByteTrack.
 
 #### Benchmarks across 4 official datasets (81 videos, ~59,800 frames)
 
@@ -107,9 +108,11 @@ Every tracker below receives the exact same detections from Trackflow's default 
 
 | Tracker | DanceTrack (25) | SportsMOT (45) | MOT17 (7) | MOT20 (4) | Mean HOTA | Total ID switches | Tracker FPS | End-to-End FPS |
 | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **`botsort --reid osnet`** | **39.0** | 45.0 | **46.9** | **24.4** | **38.8** | 6,435 | 205 | 5.5 |
-| **`ocsort`** *(no Re-ID)* | 37.9 | **46.0** | 46.3 | 23.3 | **38.4** | **5,501** | 203 | 9.2 |
-| **`boosttrack`** *(no Re-ID)* | 37.5 | 44.4 | **46.9** | 24.0 | **38.2** | 5,549 | 201 | 9.2 |
+| **`nltrack --reid osnet`** | **47.1** | **50.2** | **48.1** | 26.1 | **42.9** | **5,193** | 133 | 5.4 |
+| **`nltrack`** *(no Re-ID)* | 39.0 | 45.6 | 47.3 | **26.3** | **39.6** | 6,209 | 143 | 9.0 |
+| **`botsort --reid osnet`** | 39.0 | 45.0 | 46.9 | 24.4 | **38.8** | 6,435 | 205 | 5.5 |
+| **`ocsort`** *(no Re-ID)* | 37.9 | 46.0 | 46.3 | 23.3 | **38.4** | 5,501 | 203 | 9.2 |
+| **`boosttrack`** *(no Re-ID)* | 37.5 | 44.4 | 46.9 | 24.0 | **38.2** | 5,549 | 201 | 9.2 |
 | **`botsort`** *(no Re-ID)* | 36.7 | 44.3 | 46.5 | 24.3 | **37.9** | 6,475 | 221 | 9.3 |
 | `bytetrack` *(also in browser)* | 33.1 | 39.8 | 45.1 | 23.5 | 35.4 | 7,038 | **2,900** | **9.7** |
 | *Roboflow `cbiou` (`0.45/0.50`)* | 36.0 | 43.4 | 46.4 | 24.2 | 37.5 | 7,533 | 2,072 | 9.6 |
@@ -244,7 +247,7 @@ Re-ID and text-search models:
 
 | Flag | Model | Size | License | Used for |
 | :--- | :--- | ---: | :--- | :--- |
-| `--reid osnet` | OSNet-AIN x1.0 person Re-ID | ~9 MB | MIT code; weights trained on MSMT17 (check dataset terms for commercial use) | BoT-SORT and BoostTrack appearance, and `--reid-merge` |
+| `--reid osnet` | OSNet-AIN x1.0 person Re-ID | ~9 MB | MIT code; weights trained on MSMT17 (check dataset terms for commercial use) | BoT-SORT, BoostTrack, and NLTrack appearance, and `--reid-merge` |
 | `--vlm clip` | CLIP ViT-B/32 (INT8) | ~153 MB | MIT | Default for `--query` and `search` |
 | `--vlm siglip` | SigLIP Base (INT8) | ~205 MB | Apache-2.0 | Better on fine clothing/attribute queries |
 | `--vlm siglip2` | SigLIP 2 Base (INT8) | ~378 MB | Apache-2.0 | Strongest pure-ONNX search (no PyTorch) |

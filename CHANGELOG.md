@@ -4,6 +4,10 @@ Notable changes in each release. The format follows [Keep a Changelog](https://k
 
 ## [Unreleased]
 
+### Added
+
+- `--tracker nltrack` (`NonLinearTracker`), a pure Apache-2.0, zero-weight non-linear tracker combining damped dual-anchor motion (`XywhKalmanFilter` + CMC + ORU/OCM), scene-calibrated clean-bank Re-ID (`--reid osnet`), iterative mutual-best matching, guarded lost-track recovery, and duplicate-spawn suppression. Across all 81 official validation videos (`rtdetr-v2-r18`, `--threshold 0.45`), `nltrack --reid osnet` reaches `42.9` mean HOTA (`47.1` DanceTrack, `50.2` SportsMOT, `48.1` MOT17, `26.1` MOT20; `+4.1` mean HOTA and `1,242` fewer ID switches than `botsort --reid osnet`), and zero-ReID `nltrack` reaches `39.6` mean HOTA (`+1.2` over `ocsort`).
+
 ## [0.6.1] - 2026-11-27
 
 ### Added

@@ -356,7 +356,7 @@ def run_trackflow_tracker(
 
     tracker_name, _, reid_name = tracker_spec.partition("+")
     pred_dir.mkdir(parents=True, exist_ok=True)
-    need_frames = tracker_name in ("botsort", "boosttrack", "ocsort")
+    need_frames = tracker_name in ("botsort", "boosttrack", "ocsort", "nltrack")
 
     total_frames = 0
     total_trk_s = 0.0

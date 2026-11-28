@@ -1214,7 +1214,7 @@ def create_tracker(
             max_age=track_buffer,
             iou_buffer=iou_buffer,
         )
-    if key in ("nltrack", "nl_track", "nonlinear", "non_linear"):
+    if key in ("nltrack", "nl_track"):
         from trackflow.nltrack import NonLinearTracker
 
         return NonLinearTracker(
