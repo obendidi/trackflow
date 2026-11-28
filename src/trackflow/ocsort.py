@@ -7,6 +7,7 @@ the IoU gate.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import numpy as np
@@ -50,9 +51,10 @@ def _centers(boxes: np.ndarray) -> np.ndarray:
 
 def _direction(a: Box, b: Box) -> np.ndarray:
     """Unit vector ``(dy, dx)`` from the center of ``a`` to the center of ``b``."""
-    (ca, cb) = _centers(np.array([a, b], dtype=np.float64))
-    d = np.array([cb[1] - ca[1], cb[0] - ca[0]])
-    return d / (float(np.hypot(d[0], d[1])) + 1e-6)
+    dx = 0.5 * ((b[0] + b[2]) - (a[0] + a[2]))
+    dy = 0.5 * ((b[1] + b[3]) - (a[1] + a[3]))
+    inv = 1.0 / (math.hypot(dy, dx) + 1e-6)
+    return np.array([dy * inv, dx * inv], dtype=np.float64)
 
 
 def _transition(n: int) -> np.ndarray:

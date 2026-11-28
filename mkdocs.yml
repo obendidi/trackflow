@@ -1,0 +1,113 @@
+site_name: Trackflow
+site_description: >-
+  Apache-2.0 local people and object tracking toolkit in Python and the browser
+  with ONNX detectors, ByteTrack, BoT-SORT, OC-SORT, BoostTrack++, text search,
+  floorplan homography, and anonymization.
+site_url: https://obendidi.github.io/trackflow/docs/
+repo_url: https://github.com/obendidi/trackflow
+repo_name: obendidi/trackflow
+edit_uri: edit/main/docs/
+docs_dir: docs
+site_dir: _site/docs
+validation:
+  nav:
+    omitted_files: warn
+    not_found: warn
+    absolute_links: info
+  links:
+    not_found: warn
+    anchors: warn
+    unrecognized_links: warn
+
+theme:
+  name: material
+  logo: assets/logo.svg
+  favicon: assets/logo.svg
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          paths: [src]
+          options:
+            docstring_style: google
+            show_source: false
+            show_root_heading: true
+            show_root_full_path: false
+            heading_level: 3
+            members_order: source
+            merge_init_into_class: true
+            separate_signature: true
+            show_signature_annotations: true
+            signature_crossrefs: false
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/obendidi/trackflow
+      name: GitHub
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/trackflow-python/
+      name: PyPI
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation & Hardware: getting-started/installation.md
+  - Guides:
+      - Trackers: guides/trackers.md
+      - Models & Licenses: guides/models.md
+      - Text Search & Re-ID: guides/search.md
+      - Analytics, Inspector & Privacy: guides/analytics.md
+      - SAM 3 Handoff: sam3-handoff.md
+  - Benchmarks: benchmarks.md
+  - Migration:
+      - From Google Cloud Video Intelligence: migrate-google-video-intelligence.md
+      - From AWS Rekognition: migrate-aws-rekognition.md
+  - Reference:
+      - CLI & Output Schema: reference/cli.md
+      - Python API: reference/python-api.md
+  - Browser Demo ↗: https://obendidi.github.io/trackflow/

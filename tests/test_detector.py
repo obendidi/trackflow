@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -204,3 +206,123 @@ def test_postprocess_deduplicates_overlapping_queries() -> None:
         nms_iou=0.65,
     )
     assert len(dets) == 1
+
+
+def test_onnx_session_pins_apple_p_cores_and_honors_omp_env(monkeypatch, tmp_path) -> None:
+    from trackflow import detector as detector_module
+
+    seen = {}
+
+    class Session:
+        def __init__(self, path, sess_options=None, providers=None, provider_options=None):
+            seen["opts"] = sess_options
+            self._providers = providers
+
+        def get_providers(self):
+            return self._providers
+
+    monkeypatch.setattr(
+        detector_module.ort, "get_available_providers", lambda: ["CPUExecutionProvider"]
+    )
+    monkeypatch.setattr(detector_module.ort, "InferenceSession", Session)
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+
+    monkeypatch.setattr(detector_module, "_apple_p_cores", lambda: 8)
+    detector_module.create_onnx_session(tmp_path / "m.onnx", device="cpu")
+    assert seen["opts"].intra_op_num_threads == 8
+    assert seen["opts"].inter_op_num_threads == 1
+
+    # Non-Apple platforms leave intra_op_num_threads at ORT's physical-core default (0).
+    monkeypatch.setattr(detector_module, "_apple_p_cores", lambda: None)
+    detector_module.create_onnx_session(tmp_path / "m.onnx", device="cpu")
+    assert seen["opts"].intra_op_num_threads == 0
+    assert seen["opts"].inter_op_num_threads == 1
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "6")
+    detector_module.create_onnx_session(tmp_path / "m.onnx", device="cpu")
+    assert seen["opts"].intra_op_num_threads == 6
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "not-a-number")
+    detector_module.create_onnx_session(tmp_path / "m.onnx", device="cpu")
+    assert seen["opts"].intra_op_num_threads == 0
+
+
+def test_cuda_and_tensorrt_provider_options_and_actionable_errors(
+    monkeypatch, tmp_path, capsys
+) -> None:
+    from trackflow import detector as detector_module
+    from trackflow.models import MODEL_REGISTRY
+
+    # RF-DETR presets must keep TensorRT FP16 disabled (DINOv2 overflows FP16); RT-DETR/D-FINE enable it.
+    for name in ("rfdetr-nano", "rfdetr-small", "rfdetr-medium", "rfdetr-base"):
+        assert MODEL_REGISTRY[name].trt_fp16 is False
+    for name in ("rtdetr-v2-r18", "dfine-s", "dfine-m", "yolo26n"):
+        assert MODEL_REGISTRY[name].trt_fp16 is True
+
+    seen: dict[str, object] = {}
+    preload_calls = 0
+
+    def fake_preload():
+        nonlocal preload_calls
+        preload_calls += 1
+        return ("libnvinfer.so.10",)
+
+    class Session:
+        def __init__(self, path, sess_options=None, providers=None, provider_options=None):
+            seen["providers"] = providers
+            seen["provider_options"] = provider_options
+            self._active = seen.get("force_active", providers)
+
+        def get_providers(self):
+            return self._active
+
+    monkeypatch.setattr(detector_module, "preload_gpu_libraries", fake_preload)
+    monkeypatch.setattr(detector_module.ort, "InferenceSession", Session)
+    monkeypatch.setattr(
+        detector_module.ort,
+        "get_available_providers",
+        lambda: ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    model_path = tmp_path / "rtdetr.onnx"
+    model_path.write_bytes(b"fake-onnx")
+
+    # 1. CUDA EP sets HEURISTIC cuDNN search and triggers GPU library preload.
+    _, active = detector_module.create_onnx_session(model_path, device="cuda")
+    assert active == "CUDAExecutionProvider"
+    assert preload_calls == 1
+    assert seen["provider_options"] == [{"cudnn_conv_algo_search": "HEURISTIC"}, {}]
+
+    # 2. TensorRT EP enables FP16 + persistent engine/timing cache and prints first-run notice.
+    _, active = detector_module.create_onnx_session(
+        model_path, device="tensorrt", trt_fp16=True, cache_dir=tmp_path
+    )
+    assert active == "TensorrtExecutionProvider"
+    trt_opts = seen["provider_options"][0]
+    assert trt_opts["trt_engine_cache_enable"] is True
+    assert trt_opts["trt_timing_cache_enable"] is True
+    assert trt_opts["trt_fp16_enable"] is True
+    assert Path(trt_opts["trt_engine_cache_path"]).is_dir()
+    assert "Building TensorRT FP16 engine" in capsys.readouterr().err
+
+    # Once a cached .engine exists, no first-run build notice is emitted.
+    (Path(trt_opts["trt_engine_cache_path"]) / "cached.engine").write_bytes(b"eng")
+    detector_module.create_onnx_session(
+        model_path, device="tensorrt", trt_fp16=True, cache_dir=tmp_path
+    )
+    assert capsys.readouterr().err == ""
+
+    # 3. Silent TRT->CUDA fallback when device='tensorrt' fails loudly with actionable install hint.
+    seen["force_active"] = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    with pytest.raises(RuntimeError, match="trackflow-python-tensorrt"):
+        detector_module.create_onnx_session(model_path, device="tensorrt", cache_dir=tmp_path)
+    seen.pop("force_active", None)
+
+    # 4. Requesting CUDA or TensorRT on CPU-only ORT gives exact copy-paste GPU command.
+    monkeypatch.setattr(
+        detector_module.ort, "get_available_providers", lambda: ["CPUExecutionProvider"]
+    )
+    with pytest.raises(ValueError, match="trackflow-python-cuda"):
+        detector_module.select_providers("cuda")
+    with pytest.raises(ValueError, match="trackflow-python-tensorrt"):
+        detector_module.select_providers("tensorrt")
