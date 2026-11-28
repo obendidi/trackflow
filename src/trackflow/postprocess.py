@@ -1937,21 +1937,19 @@ def postprocess_records(
             reid_merge_events=[],
         )
 
-    n = len(records)
-    rows = np.empty((n, 7), dtype=np.float64)
-    class_ids = np.empty(n, dtype=np.int64)
+    rows = np.array(
+        [
+            (r["frame_idx"], r["track_id"], r["x1"], r["y1"], r["x2"], r["y2"], r["confidence"])
+            for r in records
+        ],
+        dtype=np.float64,
+    )
+    class_ids = np.array([r["class_id"] for r in records], dtype=np.int64)
     class_name_by_id: dict[int, str] = {}
-    for i, r in enumerate(records):
-        rows[i, 0] = float(r["frame_idx"])
-        rows[i, 1] = float(r["track_id"])
-        rows[i, 2] = float(r["x1"])
-        rows[i, 3] = float(r["y1"])
-        rows[i, 4] = float(r["x2"])
-        rows[i, 5] = float(r["y2"])
-        rows[i, 6] = float(r["confidence"])
+    for r in records:
         cid = int(r["class_id"])
-        class_ids[i] = cid
-        class_name_by_id.setdefault(cid, str(r["class_name"]))
+        if cid not in class_name_by_id:
+            class_name_by_id[cid] = str(r["class_name"])
 
     out_rows, src_idx, stats = _postprocess_tracks_core(
         rows,
@@ -1968,60 +1966,76 @@ def postprocess_records(
         min_exit_gap_frames=min_exit_gap_frames,
     )
 
+    src_list = src_idx.tolist()
+    f_list = np.rint(out_rows[:, 0]).astype(np.int64).tolist()
+    tid_list = np.rint(out_rows[:, 1]).astype(np.int64).tolist()
+    box_conf = out_rows[:, 2:7].tolist()
+
     # Determine each finalized track's class from its observed source rows
     tid_class: dict[int, tuple[int, str]] = {}
-    for r_row, si in zip(out_rows, src_idx.tolist(), strict=True):
-        if si >= 0:
-            tid = int(round(r_row[1]))
-            if tid not in tid_class:
-                orig = records[si]
-                tid_class[tid] = (int(orig["class_id"]), str(orig["class_name"]))
+    for tid, si in zip(tid_list, src_list, strict=True):
+        if si >= 0 and tid not in tid_class:
+            orig = records[si]
+            tid_class[tid] = (int(orig["class_id"]), str(orig["class_name"]))
 
     fps_safe = max(float(fps), 1e-6)
     stride = max(1, int(frame_stride))
     first_frame_by_tid: dict[int, int] = {}
     hits_by_tid: dict[int, int] = {}
     out_records: list[dict[str, Any]] = []
+    append = out_records.append
+    _round = round
+    default_cls = (0, class_name_by_id.get(0, "object"))
 
-    for r_row, si in zip(out_rows, src_idx.tolist(), strict=True):
-        f_idx = int(round(r_row[0]))
-        tid = int(round(r_row[1]))
-        x1, y1, x2, y2 = float(r_row[2]), float(r_row[3]), float(r_row[4]), float(r_row[5])
-        conf = float(r_row[6])
-        first_f = first_frame_by_tid.setdefault(tid, f_idx)
-        age = max(1, (f_idx - first_f) // stride + 1)
+    for f_idx, tid, (x1, y1, x2, y2, conf), si in zip(
+        f_list, tid_list, box_conf, src_list, strict=True
+    ):
+        first_f = first_frame_by_tid.get(tid)
+        if first_f is None:
+            first_frame_by_tid[tid] = f_idx
+            first_f = f_idx
+        age = (f_idx - first_f) // stride + 1
+        if age < 1:
+            age = 1
         if si >= 0:
-            hits_by_tid[tid] = hits_by_tid.get(tid, 0) + 1
+            hits = hits_by_tid.get(tid, 0) + 1
+            hits_by_tid[tid] = hits
             orig = records[si]
-            cid, cname = int(orig["class_id"]), str(orig["class_name"])
-            ts = float(orig["timestamp_s"])
+            cid = int(orig["class_id"])
+            cname = str(orig["class_name"])
+            ts = _round(float(orig["timestamp_s"]), 4)
             recovered = bool(orig.get("recovered", False))
             q_score = orig.get("query_score")
             q_match = bool(orig.get("query_match", True))
         else:
-            hits_by_tid.setdefault(tid, 1)
-            cid, cname = tid_class.get(tid, (0, class_name_by_id.get(0, "object")))
-            ts = round(f_idx / fps_safe, 4)
+            hits = hits_by_tid.get(tid)
+            if hits is None:
+                hits_by_tid[tid] = 1
+                hits = 1
+            cid, cname = tid_class.get(tid, default_cls)
+            ts = _round(f_idx / fps_safe, 4)
             recovered = False
             q_score = None
             q_match = True
 
-        out_records.append(
+        w = x2 - x1
+        h = y2 - y1
+        append(
             {
                 "frame_idx": f_idx,
-                "timestamp_s": round(ts, 4),
+                "timestamp_s": ts,
                 "track_id": tid,
                 "class_id": cid,
                 "class_name": cname,
-                "confidence": round(conf, 4),
-                "x1": round(x1, 2),
-                "y1": round(y1, 2),
-                "x2": round(x2, 2),
-                "y2": round(y2, 2),
-                "width": round(max(0.0, x2 - x1), 2),
-                "height": round(max(0.0, y2 - y1), 2),
-                "age": int(age),
-                "hits": int(hits_by_tid[tid]),
+                "confidence": _round(conf, 4),
+                "x1": _round(x1, 2),
+                "y1": _round(y1, 2),
+                "x2": _round(x2, 2),
+                "y2": _round(y2, 2),
+                "width": _round(w if w > 0.0 else 0.0, 2),
+                "height": _round(h if h > 0.0 else 0.0, 2),
+                "age": age,
+                "hits": hits,
                 "recovered": recovered,
                 "query_score": q_score,
                 "query_match": q_match,

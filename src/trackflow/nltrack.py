@@ -502,11 +502,11 @@ class NonLinearTracker:
         if not t_idx_with_emb:
             return zeros, zeros, zeros, zeros, no_pair
 
-        all_bank = np.vstack(bank_rows)
+        all_bank = np.asarray(bank_rows, dtype=np.float64)
         raw_sims = all_bank @ d_emb.T
         max_per_t = np.maximum.reduceat(raw_sims, offsets, axis=0)
         if self.ema_blend > 0.0:
-            ema_sims = np.vstack(ema_rows) @ d_emb.T
+            ema_sims = np.asarray(ema_rows, dtype=np.float64) @ d_emb.T
             max_per_t = (1.0 - self.ema_blend) * max_per_t + self.ema_blend * ema_sims
 
         max_cos = np.full((n, m), -1.0, dtype=np.float64)
@@ -842,16 +842,18 @@ class NonLinearTracker:
                     if t.uid in updated:
                         upd_by_cls[t.class_id].append(t.bbox)
                 low_ok = np.ones(len(cand_low), dtype=bool)
+                cand_by_cls: dict[int, list[int]] = defaultdict(list)
                 for j, d in enumerate(cand_low):
-                    same_upd = upd_by_cls.get(d.class_id)
-                    if same_upd:
-                        upd_arr = np.array(same_upd, dtype=np.float64)
-                        d_arr = l_boxes[j : j + 1]
-                        if (
-                            float(compute_ioa_matrix(d_arr, upd_arr).max()) >= 0.70
-                            or float(compute_iou_matrix(d_arr, upd_arr).max()) >= 0.55
-                        ):
-                            low_ok[j] = False
+                    if d.class_id in upd_by_cls:
+                        cand_by_cls[d.class_id].append(j)
+                for cid, j_idxs in cand_by_cls.items():
+                    upd_arr = np.asarray(upd_by_cls[cid], dtype=np.float64)
+                    d_sub = l_boxes[j_idxs]
+                    blocked = (compute_ioa_matrix(d_sub, upd_arr).max(axis=1) >= 0.70) | (
+                        compute_iou_matrix(d_sub, upd_arr).max(axis=1) >= 0.55
+                    )
+                    if blocked.any():
+                        low_ok[np.asarray(j_idxs, dtype=np.intp)[blocked]] = False
 
                 if bool(low_ok.any()):
                     pred_b = np.array([t.motion.box for t in rem_lost_rec], dtype=np.float64)
@@ -930,29 +932,65 @@ class NonLinearTracker:
         for t in self._tracks:
             if t.uid in updated:
                 occupied[t.class_id].append(t.bbox)
+
+        sorted_rem = sorted(rem_high_idx, key=lambda i: high_dets[i].confidence, reverse=True)
+        # Pre-check leftover detections against static occupied tracks in one batch per class.
+        blocked_by_static_occ: set[int] = set()
+        if sorted_rem and occupied:
+            cand_by_cls_spawn: dict[int, list[int]] = defaultdict(list)
+            for idx in sorted_rem:
+                det = high_dets[idx]
+                if det.confidence >= self.new_track_thresh and det.class_id in occupied:
+                    cand_by_cls_spawn[det.class_id].append(idx)
+            for cid, c_idxs in cand_by_cls_spawn.items():
+                occ_arr = np.asarray(occupied[cid], dtype=np.float64)
+                c_boxes = high_boxes[c_idxs]
+                bad = (compute_iou_matrix(c_boxes, occ_arr).max(axis=1) >= self.tai_iou_thresh) | (
+                    compute_ioa_matrix(c_boxes, occ_arr).max(axis=1) >= self.spawn_overlap_thresh
+                )
+                for pos in np.flatnonzero(bad).tolist():
+                    blocked_by_static_occ.add(c_idxs[pos])
+
+        spawned_occ: dict[int, list[Box]] = defaultdict(list)
         higher_leftovers: dict[int, list[Box]] = defaultdict(list)
 
-        for idx in sorted(rem_high_idx, key=lambda i: high_dets[i].confidence, reverse=True):
+        for idx in sorted_rem:
             det = high_dets[idx]
-            if det.confidence < self.new_track_thresh:
+            if det.confidence < self.new_track_thresh or idx in blocked_by_static_occ:
                 higher_leftovers[det.class_id].append(det.bbox)
                 continue
-            d_arr = high_boxes[idx : idx + 1]
-            same_occ = occupied[det.class_id]
-            if same_occ:
-                occ_arr = np.array(same_occ, dtype=np.float64)
-                if (
-                    float(compute_iou_matrix(d_arr, occ_arr).max()) >= self.tai_iou_thresh
-                    or float(compute_ioa_matrix(d_arr, occ_arr).max()) >= self.spawn_overlap_thresh
-                ):
-                    higher_leftovers[det.class_id].append(det.bbox)
-                    continue
-            same_left = higher_leftovers[det.class_id]
-            if same_left:
-                left_arr = np.array(same_left, dtype=np.float64)
-                if float(compute_iou_matrix(d_arr, left_arr).max()) >= self.tai_iou_thresh:
-                    higher_leftovers[det.class_id].append(det.bbox)
-                    continue
+            bx1, by1, bx2, by2 = det.bbox
+            area_a = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+            area_a_safe = area_a if area_a > 1e-6 else 1e-6
+
+            blocked = False
+            for ox1, oy1, ox2, oy2 in spawned_occ[det.class_id]:
+                iw = min(bx2, ox2) - max(bx1, ox1)
+                ih = min(by2, oy2) - max(by1, oy1)
+                if iw > 0.0 and ih > 0.0:
+                    inter = iw * ih
+                    area_b = max(0.0, ox2 - ox1) * max(0.0, oy2 - oy1)
+                    union = area_a + area_b - inter
+                    if (
+                        inter / (union if union > 1e-6 else 1e-6) >= self.tai_iou_thresh
+                        or inter / area_a_safe >= self.spawn_overlap_thresh
+                    ):
+                        blocked = True
+                        break
+            if not blocked:
+                for lx1, ly1, lx2, ly2 in higher_leftovers[det.class_id]:
+                    iw = min(bx2, lx2) - max(bx1, lx1)
+                    ih = min(by2, ly2) - max(by1, ly1)
+                    if iw > 0.0 and ih > 0.0:
+                        inter = iw * ih
+                        area_b = max(0.0, lx2 - lx1) * max(0.0, ly2 - ly1)
+                        union = area_a + area_b - inter
+                        if inter / (union if union > 1e-6 else 1e-6) >= self.tai_iou_thresh:
+                            blocked = True
+                            break
+            if blocked:
+                higher_leftovers[det.class_id].append(det.bbox)
+                continue
 
             tr = _NlTrack(
                 uid=self._next_uid,
@@ -970,7 +1008,7 @@ class NonLinearTracker:
             )
             self._tracks.append(tr)
             updated.add(tr.uid)
-            same_occ.append(tr.bbox)
+            spawned_occ[det.class_id].append(tr.bbox)
             higher_leftovers[det.class_id].append(det.bbox)
             if self._frame_id == 1:
                 self._activate(tr, events)

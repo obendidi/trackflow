@@ -483,6 +483,7 @@ class TrackflowPipeline:
         model: str | Path | None = None,
         precision: Precision = "fp32",
         tracker: str = "bytetrack",
+        use_cmc: bool = True,
         device: str = "auto",
         threshold: float = 0.45,
         classes: Sequence[str] | None = ("person",),
@@ -514,9 +515,10 @@ class TrackflowPipeline:
             )
         )
         self.tracker_name = tracker
+        self.use_cmc = bool(use_cmc)
         self.tracker_factory = tracker_factory
         if tracker_factory is None:
-            create_tracker(tracker)  # reject an unknown name before any model loads
+            create_tracker(tracker, use_cmc=self.use_cmc)  # reject an unknown name before any model loads
         self.threshold = float(threshold)
         if not 0 <= self.threshold <= 1:
             raise ValueError("threshold must be between 0 and 1.")
@@ -641,6 +643,7 @@ class TrackflowPipeline:
             track_low_thresh=min(self.threshold, max(0.10, self.threshold * 0.35)),
             new_track_thresh=max(self.threshold, min(0.95, self.threshold + 0.05)),
             iou_buffer=iou_buffer_for_interval(frame_dt),
+            use_cmc=self.use_cmc,
         )
 
     def _new_cards(

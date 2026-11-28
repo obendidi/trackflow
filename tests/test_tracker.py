@@ -220,6 +220,18 @@ def test_create_tracker_forwards_new_track_thresh_to_all_trackers() -> None:
         assert tr.update([_det(10, 20, 60, 140, 0.60)]) == []
 
 
+def test_create_tracker_forwards_use_cmc_to_cmc_trackers() -> None:
+    from trackflow.tracker import create_tracker
+
+    for name in ("botsort", "ocsort", "boosttrack", "nltrack"):
+        tr = create_tracker(name, use_cmc=False)
+        assert tr.use_cmc is False  # type: ignore[attr-defined]
+        assert tr._cmc is None  # type: ignore[attr-defined]
+    # ByteTracker has no CMC and accepts use_cmc=False cleanly.
+    bt = create_tracker("bytetrack", use_cmc=False)
+    assert bt.update([_det(10, 20, 60, 140, 0.90)])[0].track_id == 1
+
+
 def test_boosttrack_duplicate_removal_preserves_matched_confirmed_track() -> None:
     from trackflow.boosttrack import BoostTracker
 
