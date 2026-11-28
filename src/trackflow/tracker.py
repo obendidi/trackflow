@@ -1169,7 +1169,7 @@ class _SortStyleTracker:
         return out
 
 
-TRACKER_NAMES = ("bytetrack", "botsort", "ocsort", "boosttrack")
+TRACKER_NAMES = ("bytetrack", "botsort", "ocsort", "boosttrack", "nltrack")
 
 
 def create_tracker(
@@ -1216,6 +1216,16 @@ def create_tracker(
             det_thresh=track_high_thresh,
             new_track_thresh=new_track_thresh,
             max_age=track_buffer,
+            iou_buffer=iou_buffer,
+        )
+    if key in ("nltrack", "nl_track"):
+        from trackflow.nltrack import NonLinearTracker
+
+        return NonLinearTracker(
+            track_high_thresh=track_high_thresh,
+            track_low_thresh=track_low_thresh,
+            new_track_thresh=new_track_thresh,
+            track_buffer=max(track_buffer, 60),
             iou_buffer=iou_buffer,
         )
     raise ValueError(

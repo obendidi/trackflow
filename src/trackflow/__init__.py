@@ -7,6 +7,7 @@ from trackflow.detector import Detector, OnnxDetrDetector, create_detector
 from trackflow.homography import DwellZone, FloorplanHomography
 from trackflow.lines import CountingLine
 from trackflow.models import MODEL_REGISTRY, REID_REGISTRY, VLM_REGISTRY, ModelSpec
+from trackflow.nltrack import NonLinearTracker
 from trackflow.ocsort import OcSortTracker
 from trackflow.pipeline import TrackflowPipeline
 from trackflow.postprocess import (
@@ -48,6 +49,7 @@ __all__ = [
     "HomographyPoint",
     "MODEL_REGISTRY",
     "ModelSpec",
+    "NonLinearTracker",
     "OcSortTracker",
     "OnnxDetrDetector",
     "PostprocessResult",
